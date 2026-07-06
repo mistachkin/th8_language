@@ -142,9 +142,9 @@ clang -Isrc -o demo demo.c bin/libth8.a -lpthread -ldl
 ```
 
 The full embedding walkthrough lives in
-[`docs/public/quickstart_embedding.md`](docs/public/quickstart_embedding.md).
+[`docs/public/quickstart_embedding.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/quickstart_embedding.md).
 The scripting-side walkthrough is
-[`docs/public/quickstart_scripting.md`](docs/public/quickstart_scripting.md).
+[`docs/public/quickstart_scripting.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/quickstart_scripting.md).
 
 ---
 
@@ -170,7 +170,7 @@ source source.tcl
 ## Getting it built
 
 ```
-git clone --recurse-submodules https://github.com/<owner>/th8.git
+git clone --recurse-submodules https://github.com/mistachkin/th8.git
 cd th8
 make fresh           # release: clean build + audit + tests/all.tcl
 make ENABLE_TEST_KEY=1 clean debug   # debug build (for hacking)
@@ -202,7 +202,7 @@ nmake /f Makefile.msc
 ```
 
 The CI matrix in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the
+[`.github/workflows/ci.yml`](https://github.com/mistachkin/th8/blob/trunk/.github/workflows/ci.yml) is the
 authoritative build recipe and runs nightly.
 
 ---
@@ -255,10 +255,10 @@ signed).  Concretely:
     or your own home-grown agent: all are welcome, as long as the
     final output meets the project's quality bar.  We do not gate
     on tool choice; we gate on outcome.  See
-    [`CLAUDE.md`](CLAUDE.md) for the kind of standing-rules document
+    [`CLAUDE.md`](https://github.com/mistachkin/th8/blob/trunk/CLAUDE.md) for the kind of standing-rules document
     that helps an agent stay aligned.
   * **Bug fixes** are always welcome.  See
-    [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow, the
+    [`CONTRIBUTING.md`](https://github.com/mistachkin/th8/blob/trunk/CONTRIBUTING.md) for the workflow, the
     R-marker / signing dance, and the audit / coverage gates a
     change has to pass before merge.
   * **New features** are welcome too, as long as they follow
@@ -271,7 +271,7 @@ signed).  Concretely:
     accepted in finished form, with tests, with documentation, and
     with the same formatting discipline as the rest of the tree.
   * **Discussion of the Tcl Language Standard itself is welcome.**
-    [`docs/public/tcl_language_standard_v1.md`](docs/public/tcl_language_standard_v1.md)
+    [`docs/public/tcl_language_standard_v1.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/tcl_language_standard_v1.md)
     is the working text that the conformance suite tests against.
     We want it to be of the highest possible quality before we
     submit it to ISO.  Proposals -- clarifications, additional
@@ -285,7 +285,7 @@ whether a contribution lands, and on how the project's rules
 apply to any individual case.  He is generally fair-minded; he is
 not infinitely patient with rule-bending or with changes that
 treat formatting, documentation, or test coverage as
-afterthoughts.  Reading [`CONTRIBUTING.md`](CONTRIBUTING.md) before
+afterthoughts.  Reading [`CONTRIBUTING.md`](https://github.com/mistachkin/th8/blob/trunk/CONTRIBUTING.md) before
 your first pull request makes the review go faster.
 
 ---
@@ -343,35 +343,35 @@ that lets an agent stay aligned across hundreds of iterations.
 
 ## Where to read next
 
-  * [`CLAUDE.md`](CLAUDE.md) -- AI-agent guide; also the densest
+  * [`CLAUDE.md`](https://github.com/mistachkin/th8/blob/trunk/CLAUDE.md) -- AI-agent guide; also the densest
     single-document tour of the codebase for any new human reader.
-  * [`docs/public/quickstart_embedding.md`](docs/public/quickstart_embedding.md)
+  * [`docs/public/quickstart_embedding.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/quickstart_embedding.md)
     -- "I want to embed TH8 in my C app."
-  * [`docs/public/quickstart_scripting.md`](docs/public/quickstart_scripting.md)
+  * [`docs/public/quickstart_scripting.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/quickstart_scripting.md)
     -- "I want to write TH8 scripts."
-  * [`docs/public/security_model.md`](docs/public/security_model.md)
+  * [`docs/public/security_model.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/security_model.md)
     -- the threat model and what TH8 will and will not defend
     against.
-  * [`docs/public/tcl_language_standard_v1.md`](docs/public/tcl_language_standard_v1.md)
+  * [`docs/public/tcl_language_standard_v1.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/tcl_language_standard_v1.md)
     -- the language standard, with R-marker requirements for every
     behaviour the conformance suite tests.
-  * [`docs/public/th8_api.3`](docs/public/th8_api.3) -- the full C
+  * [`docs/public/th8_api.3`](https://github.com/mistachkin/th8/blob/trunk/docs/public/th8_api.3) -- the full C
     embedding API in one man page.
-  * [`docs/public/th8_public_c_api_specification.md`](docs/public/th8_public_c_api_specification.md)
+  * [`docs/public/th8_public_c_api_specification.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/th8_public_c_api_specification.md)
     -- the normative `TH8_API` specification, with R-marker
     requirements.  Companion:
-    [`docs/public/th8_internal_api_specification.md`](docs/public/th8_internal_api_specification.md)
+    [`docs/public/th8_internal_api_specification.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/th8_internal_api_specification.md)
     documents the `TH8_INTERNAL` helpers exposed to test code
     and stub-linked extensions via `Th8_GetInternalStubs`.
-  * [`docs/public/th8.1`](docs/public/th8.1) -- the `th8sh` shell man
+  * [`docs/public/th8.1`](https://github.com/mistachkin/th8/blob/trunk/docs/public/th8.1) -- the `th8sh` shell man
     page.
-  * [`docs/public/RELEASE_NOTES.md`](docs/public/RELEASE_NOTES.md) --
+  * [`docs/public/RELEASE_NOTES.md`](https://github.com/mistachkin/th8/blob/trunk/docs/public/RELEASE_NOTES.md) --
     what is in 1.0.0, what is intentionally deferred, what is
     Tier-1 vs Tier-2 supported.
-  * [`CONTRIBUTING.md`](CONTRIBUTING.md) -- how to build, how the
+  * [`CONTRIBUTING.md`](https://github.com/mistachkin/th8/blob/trunk/CONTRIBUTING.md) -- how to build, how the
     test suite is organised, how R-markers and signed scripts work,
     how to file a useful bug report.
-  * [`SECURITY.md`](SECURITY.md) -- how to report a security issue
+  * [`SECURITY.md`](https://github.com/mistachkin/th8/blob/trunk/SECURITY.md) -- how to report a security issue
     responsibly.
 
 ---
@@ -380,7 +380,7 @@ that lets an agent stay aligned across hundreds of iterations.
 
 TH8 is distributed under a Tcl/BSD-style permissive license with an
 explicit commercial-use transparency clause.  See
-[`license.terms`](license.terms) for the exact wording.
+[`license.terms`](https://github.com/mistachkin/th8/blob/trunk/license.terms) for the exact wording.
 
 Short version: use it, modify it, ship it.  If you are a large
 commercial operator building a substantial commercial product on
