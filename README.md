@@ -1,4 +1,4 @@
-# TH8
+# [TH8](https://github.com/mistachkin/th8/)
 
 **A small, embeddable, security-hardened Tcl-compatible scripting
 language for production use.**
