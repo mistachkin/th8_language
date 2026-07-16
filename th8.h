@@ -5489,6 +5489,64 @@ struct Th8_FaultFilter {
  *	Th8_FaultInstall.  Counters are updated in place during
  *	execution.
  */
+/*
+ * OpenSSL fault-injection op IDs.  Each names a distinct OpenSSL
+ * call site in th8_snk.c that has a failure-handling arm.  Used as
+ * bit positions in Th8_FaultConfig.nFailOsslMask (64-bit) and by
+ * the OSSL_CALL / OSSL_CALL_PTR wrappers in th8_snk.c.  Extend by
+ * appending; keep below 64.  The RSA verify path (th8RsaVerify)
+ * uses the *_V_* ids; the RSA sign path (th8RsaSign) uses *_S_*.
+ */
+/* --- RSA verify path (th8RsaVerify) --- */
+#  define TH8_OSSL_OP_FROMDATA_INIT 0 /* verify: EVP_PKEY_fromdata_init */
+#  define TH8_OSSL_OP_FROMDATA      1 /* verify: EVP_PKEY_fromdata */
+#  define TH8_OSSL_OP_V_BN_N        2 /* verify: BN_bin2bn (modulus) */
+#  define TH8_OSSL_OP_V_BN_E        3 /* verify: BN_new (pub exp) */
+#  define TH8_OSSL_OP_V_BLD         4 /* verify: OSSL_PARAM_BLD_new */
+#  define TH8_OSSL_OP_V_PUSH_N      5 /* verify: push_BN N */
+#  define TH8_OSSL_OP_V_PUSH_E      6 /* verify: push_BN E */
+#  define TH8_OSSL_OP_V_TOPARAM     7 /* verify: OSSL_PARAM_BLD_to_param */
+#  define TH8_OSSL_OP_V_CTX         8 /* verify: EVP_PKEY_CTX_new_from_name */
+#  define TH8_OSSL_OP_V_MDCTX       9 /* verify: EVP_MD_CTX_new */
+#  define TH8_OSSL_OP_V_DVINIT      10 /* verify: EVP_DigestVerifyInit */
+#  define TH8_OSSL_OP_V_DVUPDATE    11 /* verify: EVP_DigestVerifyUpdate */
+/* --- RSA sign path (th8RsaSign) --- */
+#  define TH8_OSSL_OP_S_BN_N    12 /* sign: BN_bin2bn (modulus) */
+#  define TH8_OSSL_OP_S_BN_E    13 /* sign: BN_new (pub exp) */
+#  define TH8_OSSL_OP_S_BN_D    14 /* sign: BN_bin2bn (priv exp) */
+#  define TH8_OSSL_OP_S_BN_P    15 /* sign: BN_bin2bn (prime1) */
+#  define TH8_OSSL_OP_S_BN_Q    16 /* sign: BN_bin2bn (prime2) */
+#  define TH8_OSSL_OP_S_BLD     17 /* sign: OSSL_PARAM_BLD_new */
+#  define TH8_OSSL_OP_S_PUSH_N  18 /* sign: push_BN N */
+#  define TH8_OSSL_OP_S_PUSH_E  19 /* sign: push_BN E */
+#  define TH8_OSSL_OP_S_PUSH_D  20 /* sign: push_BN D */
+#  define TH8_OSSL_OP_S_PUSH_P  21 /* sign: push_BN FACTOR1 */
+#  define TH8_OSSL_OP_S_PUSH_Q  22 /* sign: push_BN FACTOR2 */
+#  define TH8_OSSL_OP_S_PUSH_DP 23 /* sign: push_BN EXPONENT1 */
+#  define TH8_OSSL_OP_S_PUSH_DQ 24 /* sign: push_BN EXPONENT2 */
+#  define TH8_OSSL_OP_S_PUSH_QI 25 /* sign: push_BN COEFFICIENT */
+#  define TH8_OSSL_OP_S_TOPARAM 26 /* sign: OSSL_PARAM_BLD_to_param */
+#  define TH8_OSSL_OP_S_CTX     27 /* sign: EVP_PKEY_CTX_new_from_name */
+#  define TH8_OSSL_OP_S_FROMDATA_INIT 28 /* sign: EVP_PKEY_fromdata_init */
+#  define TH8_OSSL_OP_S_FROMDATA      29 /* sign: EVP_PKEY_fromdata */
+#  define TH8_OSSL_OP_S_MDCTX         30 /* sign: EVP_MD_CTX_new */
+#  define TH8_OSSL_OP_S_DSINIT        31 /* sign: EVP_DigestSignInit */
+#  define TH8_OSSL_OP_S_DSUPDATE      32 /* sign: EVP_DigestSignUpdate */
+#  define TH8_OSSL_OP_S_DSFINAL1      33 /* sign: EVP_DigestSignFinal (len) */
+#  define TH8_OSSL_OP_S_DSFINAL2      34 /* sign: EVP_DigestSignFinal (sig) */
+
+/*
+ * POSIX syscall fault-injection op IDs.  Each names a raw syscall
+ * site in th8_posix.c whose failure arm is otherwise unreachable
+ * in normal test runs (files exist, reads succeed, ...).  Used as
+ * bit positions in Th8_FaultConfig.nFailPosixMask (64-bit) and by
+ * the POSIX_CALL / POSIX_CALL_PTR wrappers in th8_posix.c.  Extend
+ * by appending; keep below 64.
+ */
+#  define TH8_POSIX_OP_GETDATA_OPEN  0 /* th8PosixGetData: open() */
+#  define TH8_POSIX_OP_GETDATA_FSTAT 1 /* th8PosixGetData: fstat() */
+#  define TH8_POSIX_OP_GETDATA_READ  2 /* th8PosixGetData: read() */
+
 typedef struct Th8_FaultConfig Th8_FaultConfig;
 struct Th8_FaultConfig {
     /* Allocation faults. */
@@ -5513,6 +5571,23 @@ struct Th8_FaultConfig {
     int bFailChannelEOF; /* Synth 0-byte read (no error). */
     int bFailChannelWrite; /* Fail TH8_CHANCTL_WRITE. */
     int bFailChannelOpen; /* Fail TH8_CHANCTL_OPEN. */
+
+    /* Embedded-key getter forced-failure modes.  Each field
+     * controls the result observed by th8_policy.c's
+     * Th8_GetPublicKeyZero/Root/Test lazy-init paths at the
+     * `if (!zData || nData == 0)` guard sites (L2091/L2190/
+     * L2295) so MC/DC tests can drive the C1 (NULL ptr) and C2
+     * (zero size) vectors that the always-valid embedded blobs
+     * otherwise never produce.  Values:
+     *   0 -- no override (real getter result used).
+     *   1 -- force NULL pointer (drives C1=T).
+     *   2 -- force zero-size (drives C1=F, C2=T).
+     * Cache reset (th8PolicyResetCachedKeys via internal stubs)
+     * is required before each fault scenario so the lazy-init
+     * guard runs again. */
+    int nFailEmbeddedKey0;
+    int nFailEmbeddedKeyRoot;
+    int nFailEmbeddedKeyTest;
 
     /* Per-cacheType lookup-failure mask.  When bit
      * (1u << cacheType) is set, Th8_FindInCache returns NULL
@@ -5586,6 +5661,32 @@ struct Th8_FaultConfig {
      * eval'd script accordingly. */
     const char **azNullCallbacks;
     int nNullCallbacks;
+
+    /*
+     * OpenSSL fault injection (crypto MC/DC).  A bitmask of
+     * TH8_OSSL_OP_* op IDs (below); when bit (1u << op) is set,
+     * the OSSL_CALL()/OSSL_CALL_PTR() wrappers in th8_snk.c force
+     * the corresponding OpenSSL call to report failure (0 / NULL)
+     * WITHOUT invoking OpenSSL, so that call's error-handling arm
+     * executes.  The wrapper leaves the surrounding decision's
+     * condition text unchanged, keeping MC/DC counts honest, and
+     * compiles to the bare call when TH8_ENABLE_FAULT_INJECTION
+     * is off.  64-bit so there is room for one bit per wrapped
+     * OpenSSL call across the verify and sign paths.
+     */
+    th8_uint64_t nFailOsslMask;
+
+    /*
+     * POSIX syscall fault injection (platform MC/DC).  A bitmask of
+     * TH8_POSIX_OP_* op IDs; when bit (1 << op) is set, the
+     * POSIX_CALL()/POSIX_CALL_PTR() wrappers in th8_posix.c force
+     * the corresponding raw syscall to report failure (-1 / NULL)
+     * WITHOUT invoking it, so that syscall's error-handling arm
+     * executes.  Same design and honesty guarantee as
+     * nFailOsslMask; compiled out when TH8_ENABLE_FAULT_INJECTION
+     * is off.
+     */
+    th8_uint64_t nFailPosixMask;
 
     /* Counters (updated by fault layer). */
     th8_int64_t nAllocCount;
