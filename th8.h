@@ -1818,9 +1818,15 @@ struct Th8_Platform {
  *	substituted word value and must produce a list of elements to
  *	splice into the argument vector.
  *
- *	The callback must allocate azOut and anOut via Th8_Malloc;
- *	the caller will free them.  Return TH8_OK on success or
- *	TH8_ERROR (with an error message in the interp result).
+ *	Ownership: the callback must return *pazOut, *panOut and the
+ *	element bytes as a SINGLE Th8_Malloc'd block, with *panOut and
+ *	every *pazOut[i] pointing INTO the *pazOut allocation -- exactly
+ *	the layout Th8_SplitList produces (the built-in expansion simply
+ *	delegates to it).  TH8 releases the result with one
+ *	Th8_Free(*pazOut); it never frees *panOut separately, so a second
+ *	allocation for the lengths would leak.  Set *pazOut and *panOut to
+ *	NULL for zero elements.  Return TH8_OK on success or TH8_ERROR
+ *	(with an error message in the interp result).
  *
  *----------------------------------------------------------------------
  */
@@ -4387,12 +4393,28 @@ TH8_API int Th8_ListAppend(
 /*
  * Th8_SplitList --
  *	Parse the string zList (nList bytes, or TH8_NOLEN) as a Tcl
- *	list and split it into elements.  On success, sets *pazElem to
- *	a newly-allocated array of element strings, *panElem to a
- *	parallel array of element lengths, and *pnCount to the number
- *	of elements.  Returns TH8_OK on success, TH8_ERROR on malformed
- *	list syntax.  The caller must free *pazElem (and the strings it
- *	points to) and *panElem with Th8_Free when done.
+ *	list and split it into elements.  Returns TH8_OK on success,
+ *	TH8_ERROR on malformed list syntax.  On success:
+ *
+ *	  *  *pnCount receives the number of elements.
+ *	  *  *pazElem receives a pointer to a SINGLE heap allocation that
+ *	     holds, contiguously, the element-pointer array followed by
+ *	     the parallel length array followed by the element bytes.
+ *	     Each *pazElem[i] is a NUL-terminated element.
+ *	  *  *panElem receives a pointer to the length array, which lies
+ *	     INSIDE the *pazElem allocation (it is not a separate block).
+ *
+ *	FREEING: release the entire result with a SINGLE call,
+ *	Th8_Free(interp, *pazElem).  Do NOT free *panElem or any
+ *	*pazElem[i] separately -- they are interior pointers into the
+ *	*pazElem block, and freeing them is an invalid free.  For a list
+ *	of zero elements (including the empty string) *pazElem and
+ *	*panElem are both set to NULL; Th8_Free(interp, NULL) is a safe
+ *	no-op, so callers can free unconditionally.
+ *
+ *	pazElem and/or panElem may be NULL if the caller only wants the
+ *	other array or just the count (e.g. pass both NULL to count
+ *	elements without allocating).
  *
  *	Pass TH8_LIST_NONE for flags in the common case.  Pass
  *	TH8_LIST_NO_CACHE when zList points to memory that will be
