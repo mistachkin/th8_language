@@ -323,7 +323,9 @@ typedef unsigned long long th8_uint64_t;
  *
  *	TH8 limits strings to TH8_MX_STRLEN bytes (100 MB).  The
  *	top bit is the sign bit.  The next three bits are reserved;
- *	one of those (the 0x10000000 bit) marks tainted strings.
+ *	two of those tag the string's classification: the 0x10000000
+ *	bit marks tainted (untrusted-origin) strings and the
+ *	0x20000000 bit marks sensitive (secret) strings.
  *
  *	TH8_LEN_MASK --
  *		Bitmask for extracting the raw byte length from a
@@ -383,6 +385,8 @@ typedef unsigned long long th8_uint64_t;
 #define TH8_MX_ALLOC          (256 * 1024 * 1024)
 #define TH8_MAX_LIST_ELEMENTS (1000000)
 #define TH8_TAINT_BIT         (0x10000000)
+#define TH8_SENSITIVE_BIT     (0x20000000)
+#define TH8_TAG_BITS          (TH8_TAINT_BIT | TH8_SENSITIVE_BIT)
 #define TH8_NOLEN             ((size_t)-1)
 
 #define TH8_LEN(X) ((size_t)((X) & TH8_LEN_MASK))
@@ -391,6 +395,32 @@ typedef unsigned long long th8_uint64_t;
 #define TH8_RM_TAINT(X)      ((X) & ~TH8_TAINT_BIT)
 #define TH8_ADD_TAINT(X)     ((X) | TH8_TAINT_BIT)
 #define TH8_XFER_TAINT(A, B) (A) |= (TH8_TAINT_BIT & (B))
+
+/*
+ * Sensitivity is a second value-level classification, orthogonal to taint.
+ * Taint marks untrusted-origin data (may be rendered only through an encoded
+ * form); sensitivity marks secret plaintext from the `secure` subsystem (must
+ * never be rendered, exported, or detached, and is securely zeroed when its
+ * backing result is released).  Like taint, it rides in the high bits of the
+ * size_t length (bit 29) so it travels WITH the value through every value-
+ * preserving operation.  TH8_LEN() already strips it (the mask is the low 28
+ * bits), so no length arithmetic changes.
+ */
+#define TH8_SENSITIVE(X)         (((X) & TH8_SENSITIVE_BIT) != 0)
+#define TH8_RM_SENSITIVE(X)      ((X) & ~TH8_SENSITIVE_BIT)
+#define TH8_ADD_SENSITIVE(X)     ((X) | TH8_SENSITIVE_BIT)
+#define TH8_XFER_SENSITIVE(A, B) (A) |= (TH8_SENSITIVE_BIT & (B))
+
+/*
+ * Combined tag propagation.  Both classifications are "sticky" and must
+ * travel together, so value-preserving operations (concatenation, command
+ * and variable substitution, list building, result/variable storage) carry
+ * TH8_TAG_BITS rather than the taint bit alone.  Carrying the sensitivity bit
+ * is purely additive: TH8_TAINTED() and TH8_LEN() are unaffected, and only
+ * the sensitivity boundaries (rendering, export, Th8_TakeResult) act on it.
+ */
+#define TH8_TAGS(X)         ((X) & TH8_TAG_BITS)
+#define TH8_XFER_TAGS(A, B) (A) |= (TH8_TAG_BITS & (B))
 
 #define TH8_SIZECHECK(I, N)                                                  \
     if ((N) > TH8_MX_STRLEN) {                                               \
