@@ -1816,6 +1816,33 @@ struct Th8_Platform {
 
     /*
      *------------------------------------------------------------------
+     * Diagnostics (added in nVersion 5)
+     *------------------------------------------------------------------
+     */
+
+    /*
+     * xStackBackTrace --
+     *	Capture up to nMaxFrames return-address program counters into
+     *	the caller-provided apFrames[] array, skipping the innermost
+     *	nSkip frames (the caller's own tracker frames).  Returns the
+     *	number of frames captured, or 0 if unsupported.
+     *
+     *	Used ONLY by the TH8_MEM_DEBUG allocation tracker to attribute
+     *	each allocation to its originating call stack.  MUST be
+     *	allocation-free and MUST NOT fail hard (a platform without a
+     *	stack unwinder returns 0).  A caller checks the pointer is
+     *	non-NULL before use and otherwise falls back to the immediate
+     *	return address.
+     */
+    int (*xStackBackTrace)(
+        Th8_Interp *interp,
+        void *pCtx,
+        void **apFrames,
+        int nMaxFrames,
+        int nSkip);
+
+    /*
+     *------------------------------------------------------------------
      * Host context pointer
      *------------------------------------------------------------------
      */

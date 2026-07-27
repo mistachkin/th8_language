@@ -125,8 +125,8 @@ typedef struct {
 #define TH8_RC_PATCH_LEVEL   1.0.0.0
 #define TH8_RC_VERSION       1,0,0,0
 
-#define TH8_SOURCE_ID        "781bb619b88d25ba"
-#define TH8_SOURCE_TIMESTAMP "2026-07-24 04:07:40"
+#define TH8_SOURCE_ID        "d69e2ac90a1998a3"
+#define TH8_SOURCE_TIMESTAMP "2026-07-26 19:46:18"
 #define TH8_SOURCE_TAGS      "trunk"
 #define TH8_SOURCE_VCS       "Fossil"
 #endif
@@ -1438,6 +1438,7 @@ TH8_INTERNAL int th8NtpQuery(
     int nServers,
     int timeoutMs,
     int maxDisagreeSec,
+    int attempts,
     th8_int64_t *pEpochSec);
 /*
  * Validate a received NTP packet (const void * = 48-byte
@@ -1460,6 +1461,34 @@ TH8_INTERNAL void th8SetLastNtpSec(Th8_Interp *interp, th8_int64_t sec);
 TH8_INTERNAL th8_int64_t th8GetLastLocalMs(Th8_Interp *interp);
 TH8_INTERNAL void th8SetLastLocalMs(Th8_Interp *interp, th8_int64_t ms);
 #endif
+
+/*
+ * Compiler-runtime (unwind) platform (th8_unwind.c).  Supplies the
+ * xStackBackTrace callback via _Unwind_Backtrace; merged by
+ * Th8_UseDefaultPlatform.  Internal -- not part of the public
+ * Th8_Get*Platform surface.
+ */
+TH8_INTERNAL const Th8_Platform *th8GetUnwindPlatform(void);
+
+/*
+ * Allocation-site memory tracker (th8_memtrack.c).  The Alloc/Realloc/
+ * Free hooks exist only under TH8_MEM_DEBUG and are invoked from the
+ * allocation funnel in th8_core.c under the same gate.  th8MemTrackDump
+ * and th8MemTrackReset are always declared: in a non-TH8_MEM_DEBUG build
+ * they are fail-soft stubs, so the test-library commands resolve (the dump
+ * reports that a debug build is required; the reset is a successful no-op).
+ * See docs/internal/design_notes_memtrack.md.
+ */
+#if defined(TH8_MEM_DEBUG)
+TH8_INTERNAL void
+th8MemTrackAlloc(Th8_Interp *interp, void *pAddr, size_t nByte);
+TH8_INTERNAL void
+th8MemTrackRealloc(Th8_Interp *interp, void *pOld, void *pNew, size_t nByte);
+TH8_INTERNAL void th8MemTrackFree(Th8_Interp *interp, void *pAddr);
+#endif
+TH8_INTERNAL int
+th8MemTrackDump(Th8_Interp *interp, const char *zPath, size_t nPath);
+TH8_INTERNAL int th8MemTrackReset(Th8_Interp *interp);
 
 #endif /* TH8_INT_H */
 
@@ -6726,6 +6755,7 @@ typedef struct Th8InternalStubsTable {
         int nServers,
         int timeoutMs,
         int maxDisagreeSec,
+        int attempts,
         th8_int64_t *pEpochSec);
     int (*th8_ProtectedAlloc)(
         Th8_Interp *interp,
@@ -7104,6 +7134,25 @@ typedef struct Th8InternalStubsTable {
         th8_int64_t *pEpochSec);
 #endif
 
+    /*
+     * th8_memtrack.c allocation-tracker dump, exposed so the test
+     * library's "th8_test_memory_dump" command can drive it.  Always
+     * present (never gated): in a non-TH8_MEM_DEBUG build the target is
+     * a fail-soft stub that reports a debug build is required.
+     */
+    int (*th8_MemTrackDump)(
+        Th8_Interp *interp,
+        const char *zPath,
+        size_t nPath);
+
+    /*
+     * th8_memtrack.c reset: frees all tracker bookkeeping and zeroes the
+     * static tables.  Exposed for the test library's
+     * "th8_test_memory_reset" command.  Always present; a no-op success
+     * off-debug.
+     */
+    int (*th8_MemTrackReset)(Th8_Interp *interp);
+
 } Th8InternalStubsTable;
 
 /*
@@ -7112,7 +7161,7 @@ typedef struct Th8InternalStubsTable {
  */
 
 #define TH8_INTERNAL_STUBS_MAGIC   (0x54483849)  /* "TH8I" */
-#define TH8_INTERNAL_STUBS_VERSION (52)
+#define TH8_INTERNAL_STUBS_VERSION (55)
 
 /*
  * Optional macro-redirection for plugins.  When
@@ -14445,6 +14494,9 @@ th8MallocCommon(
 	} else {
 	    interp->nAllocBytes += nByte;
 	}
+#if defined(TH8_MEM_DEBUG)
+	th8MemTrackAlloc(interp, p, nByte);
+#endif
     }
     if (!p) {
 	TH8_TRACE_ERR(interp, "memory allocation failed");
@@ -14973,6 +15025,10 @@ Th8_Free(
 	xFree = interp->pPlatform->xFree;
 	if (xFree) {
 	    size_t (*xMemorySize)(Th8_Interp *, void *, void *) = NULL;
+#if defined(TH8_MEM_DEBUG)
+	    /* Untrack while the address is still valid, before xFree. */
+	    th8MemTrackFree(interp, p);
+#endif
 	    xMemorySize = interp->pPlatform->xMemorySize;
 	    if (xMemorySize) {
 		size_t
@@ -15061,6 +15117,9 @@ th8ReallocCommon(
 	} else {
 	    interp->nAllocBytes += nByte;
 	}
+#if defined(TH8_MEM_DEBUG)
+	th8MemTrackRealloc(interp, p, pNew, nByte);
+#endif
     }
     if (!pNew) {
 	TH8_TRACE_ERR(interp, "memory allocation failed");
@@ -16215,15 +16274,29 @@ Th8_QueueEvent(void *pStateAny, int (*xCallback)(Th8_Interp *, void *))
 /*
  *----------------------------------------------------------------------
  *
- * Th8_IterateArraySearches --
+ * th8ArraySearchIterEntry --
  *
- *	Public diagnostic enumeration of pending array searches.
+ *	Th8_HashIterate visitor for Th8_IterateArraySearches.  For
+ *	one array-search hash entry, unwraps the th8ArraySearch and
+ *	forwards the (arrayName, searchId) pair to the user callback.
  *
  * Why / How:
- *	The array search hash and th8ArraySearch struct are both
- *	internal.  This API exposes only the (arrayName, searchId)
- *	pair via a callback so that test/diagnostic code can
- *	enumerate searches without seeing implementation details.
+ *	Th8_HashIterate speaks in raw Th8_HashEntry pointers; this
+ *	adapter translates each entry into the public callback's
+ *	(zArray, nArray, zKey, nKey, pCtx) signature and stashes the
+ *	user callback's result in the shared th8ArraySearchIterCtx so
+ *	the outer loop can propagate it.  Tombstoned entries (NULL
+ *	pEntry / pData) are skipped with a plain guard that survives
+ *	TH8_OMIT, per Bug 26.
+ *
+ * Results:
+ *	TH8_OK to continue iterating (including for skipped entries or
+ *	when the user callback returned TH8_OK); TH8_ERROR to stop when
+ *	the user callback returned non-TH8_OK.
+ *
+ * Side effects:
+ *	Stores the user callback's return code in the context's rc
+ *	field; otherwise whatever the user callback does.
  *
  *----------------------------------------------------------------------
  */
@@ -19983,40 +20056,30 @@ Th8_IsBigintEnabled(Th8_Interp *interp)
 /*
  *----------------------------------------------------------------------
  *
- * Th8_GetExprFeatures / Th8_SetExprFeatures --
+ * Th8_GetExprFeatures --
  *
- *	Read / write the per-interpreter expression-grammar feature
- *	flag set.  Default is TH8_EXPR_NONE (strict Tcl 8.6 expr(n)
+ *	Read the per-interpreter expression-grammar feature flag
+ *	set.  Default is TH8_EXPR_NONE (strict Tcl 8.6 expr(n)
  *	compliance).  See th8.h for the flag definitions and
  *	semantic guarantees.
  *
  * Why / How:
  *	The flag set is stored in a plain int field on the
  *	Th8_Interp struct (interp->nExprFeatures), zero-initialised
- *	by Th8_CreateInterp via xMemset.  Set masks `flags` against
- *	TH8_EXPR_ALL before storing so that unrecognised bits from
- *	a future-released embedder calling an older library are
- *	silently dropped (forward-compatible no-op rather than a
- *	silently-enabled-but-unimplemented feature).
- *
- *	Get is a simple read; Set returns the previous value to
- *	support the scoped save-and-restore idiom documented in
- *	th8.h.
- *
- *	Unlike Th8_EnableLoad / Th8_EnableBigint, this API does
- *	NOT use the random-token gate pattern.  The features
- *	gated here are syntactic extensions; a memory corruption
- *	that flipped a flag bit at worst makes the parser accept
- *	an extra operator the embedder did not opt into, which is
- *	not a privilege escalation.  The cheap scalar field keeps
- *	the read/write paths trivial.
+ *	by Th8_CreateInterp via xMemset, so this is a trivial
+ *	guarded read.  Unlike Th8_EnableLoad / Th8_EnableBigint,
+ *	the expr-feature API does NOT use the random-token gate
+ *	pattern: the features it exposes are syntactic extensions,
+ *	so a corrupted flag bit at worst makes the parser accept
+ *	an operator the embedder did not opt into, which is not a
+ *	privilege escalation.
  *
  * Results:
- *	Get returns the current flag set (0 = strict).  Set
- *	returns the PREVIOUS flag set.
+ *	The current flag set (TH8_EXPR_NONE / 0 = strict), or
+ *	TH8_EXPR_NONE when `interp` is NULL (Bug 26 / Bug 31 guard).
  *
  * Side effects:
- *	Set writes interp->nExprFeatures.
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -20560,6 +20623,23 @@ Th8_ErrorMessage(
     char cLast;
 
     if (!interp) return TH8_ERROR;
+
+    /*
+     * Sensitivity boundary: an error diagnostic is user-visible egress.
+     * If the detail value is sensitive (the tag bit rides in the length
+     * n, which callers pass straight from argl[]), redact it so no
+     * plaintext byte leaks into the message.  The prefix is always a
+     * fixed literal and is never redacted.
+     *
+     * TH8_NOLEN ((size_t)-1) must be excluded: it is the "compute the
+     * NUL-terminated length" sentinel, and being all-ones it has the
+     * sensitive tag bit set incidentally -- it is NOT a sensitive
+     * value.  Only a real length carrying the bit means sensitive.
+     */
+    if (n != TH8_NOLEN && TH8_SENSITIVE(n)) {
+	z = "<sensitive value withheld>";
+	n = TH8_NOLEN;
+    }
 
 #if defined(TH8_ENABLE_VARIABLES)
     Th8_SetVar(interp, "::errorInfo", TH8_NOLEN, "", 0);
@@ -22049,6 +22129,8 @@ Th8_CoroCreate(
 }
 
 
+static int th8CheckCancel(Th8_Interp *interp); /* forward */
+
 /*
  *----------------------------------------------------------------------
  *
@@ -22070,8 +22152,6 @@ Th8_CoroCreate(
  *
  *----------------------------------------------------------------------
  */
-
-static int th8CheckCancel(Th8_Interp *interp); /* forward */
 
 int
 Th8_IsCanceled(
@@ -22128,6 +22208,8 @@ Th8_IsBeingUnwound(Th8_Interp *interp) /* Interpreter. */
 }
 
 
+static void th8ClearCancel(Th8_Interp *interp); /* forward */
+
 /*
  *----------------------------------------------------------------------
  *
@@ -22143,10 +22225,14 @@ Th8_IsBeingUnwound(Th8_Interp *interp) /* Interpreter. */
  *	used by embedders (e.g., LadyBird's event loop) and by the
  *	debugger resume path.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Clears all cancellation flags and frees interp->zCancelMsg.
+ *
  *----------------------------------------------------------------------
  */
-
-static void th8ClearCancel(Th8_Interp *interp); /* forward */
 
 void
 Th8_ResetCancel(Th8_Interp *interp)
@@ -24617,6 +24703,31 @@ th8XorInterpSecurePersistOk(Th8_Interp *interp, th8_int64_t mask)
  * coverage is lost by moving the mutation here.
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8AsyncStateXorBMutexReady --
+ *
+ *	Test-only perturber for the async-state `bMutexReady`
+ *	flag.  XORs `mask` into `pState->bMutexReady`, letting
+ *	testlib toggle the flag into (and back out of) the
+ *	partial-init / mid-teardown window that drives the
+ *	`!pState->bMutexReady` and `bMutexReady && xMutexFinal`
+ *	defensive guards.
+ *
+ * Parameters:
+ *	pState -- async state to perturb.  Must be non-NULL.
+ *	mask   -- XOR mask applied to bMutexReady.
+ *
+ * Returns:
+ *	The previous value of `bMutexReady`, so the caller can
+ *	restore or assert on it.
+ *
+ * Side effects:
+ *	`pState->bMutexReady ^= mask`.
+ *
+ *----------------------------------------------------------------------
+ */
 TH8_INTERNAL int
 th8AsyncStateXorBMutexReady(Th8_AsyncState *pState, int mask)
 {
@@ -25099,6 +25210,36 @@ th8NextVarName(
  *----------------------------------------------------------------------
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8ParseStackInit --
+ *
+ *	Initialise a Th8ParseStack to empty, backed by its caller-
+ *	provided inline buffer.  Must be called before any
+ *	th8ParseStackPush so the parsers start with a valid,
+ *	heap-free stack.
+ *
+ * Why / How:
+ *	Points `s->p` at the inline array embedded in the struct,
+ *	sets `s->cap` to TH8_PARSE_NEST_INLINE, and clears `s->top`
+ *	to zero.  No allocation occurs; the shallow-nesting common
+ *	case therefore touches only stack memory (th8ParseStackPush
+ *	promotes to a heap buffer only when this capacity is
+ *	exceeded).
+ *
+ * Parameters:
+ *	s -- parse stack to initialise.  Must be non-NULL and own a
+ *	     valid `inlineBuf`.
+ *
+ * Returns:
+ *	None.
+ *
+ * Side effects:
+ *	Sets `s->p`, `s->cap`, and `s->top`.  Does not allocate.
+ *
+ *----------------------------------------------------------------------
+ */
 static void
 th8ParseStackInit(Th8ParseStack *s)
 {
@@ -29273,7 +29414,7 @@ th8_spilornis_memsize(void *p)
  * so that Spilornis.h's prototypes use the correct se_* types.
  */
 /* amalgamation: th8_spilornis.h already included */
-#line 15994 "src/th8_core.c"
+#line 16086 "src/th8_core.c"
 /************** Begin file Spilornis.h *************/
 #line 1 "bin/Spilornis.h"
 /*
@@ -29471,7 +29612,7 @@ EAGLE_EXTERN se_HANDLE	Eagle_SetMemoryHeap(se_HANDLE hNewHeap);
 #endif /* _SPILORNIS_H_ */
 
 /************** End of Spilornis.h *************/
-#line 15995 "src/th8_core.c"
+#line 16087 "src/th8_core.c"
 
 /*
  *----------------------------------------------------------------------
@@ -35073,6 +35214,9 @@ Th8_MergePlatform(
     /* DNS (DNSSEC-validating resolver, libunbound on POSIX) */
     MERGE_SLOT(xDnsResolve);
     MERGE_SLOT(xDnsResolveFree);
+
+    /* Diagnostics (nVersion 5) */
+    MERGE_SLOT(xStackBackTrace);
     return TH8_OK;
 }
 
@@ -39090,6 +39234,14 @@ th8ExprParse(
 
 
 /*
+ * TH8_ISTERM -- true if a token is a complete term (a literal or an
+ * operator that already has its left child set, meaning it has been
+ * incorporated into the tree).
+ */
+
+/* TH8_ISTERM -- declared in th8_expr.h. */
+
+/*
  *----------------------------------------------------------------------
  *
  * th8ExprMakeTree -- phase 2, expression-grammar tree builder
@@ -39164,14 +39316,6 @@ th8ExprParse(
  *
  *----------------------------------------------------------------------
  */
-
-/*
- * TH8_ISTERM -- true if a token is a complete term (a literal or an
- * operator that already has its left child set, meaning it has been
- * incorporated into the tree).
- */
-
-/* TH8_ISTERM -- declared in th8_expr.h. */
 
 static int
 th8ExprMakeTree(Th8_Interp *interp, Th8_ExprNode **apToken, int nToken)
@@ -40871,6 +41015,33 @@ Th8_SetPreLoadCallback(
  * Bigint / Signed token equivalents are in th8_core.c.
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8XorInterpLoadToken --
+ *
+ *	Internal helper used by the dual-field random-token
+ *	pattern that gates `[load]`.  XORs `mask` into the
+ *	current value of `interp->nLoadToken`.  Pair with the
+ *	matching `nLoadOk` XOR (in `th8_core.c`) to atomically
+ *	toggle both fields between a known and an unknown state.
+ *
+ *	Exposed via the internal-stubs table so the test library
+ *	can drive the gate from C without going through the
+ *	public enable / disable wrappers.
+ *
+ * Parameters:
+ *	interp -- live interpreter.
+ *	mask   -- XOR mask to apply.
+ *
+ * Returns:
+ *	None.
+ *
+ * Side effects:
+ *	Mutates `interp->nLoadToken`.
+ *
+ *----------------------------------------------------------------------
+ */
 TH8_INTERNAL void
 th8XorInterpLoadToken(Th8_Interp *interp, th8_int64_t mask)
 {
@@ -45628,19 +45799,17 @@ Th8_RandomBytes(
 /*
  *----------------------------------------------------------------------
  *
- * Th8_DnsResolve / Th8_DnsResolveFree --
+ * Th8_DnsResolve --
  *
- *	Thin wrappers over the platform's xDnsResolve and
- *	xDnsResolveFree callbacks.  Used by the libcurl
- *	integration to validate DNS via DNSSEC before pinning
- *	an IP address into curl's resolve list.
+ *	Thin wrapper over the platform's xDnsResolve callback.
+ *	Used by the libcurl integration to validate DNS via
+ *	DNSSEC before pinning an IP address into curl's resolve
+ *	list.
  *
- *	If xDnsResolve is NULL, Th8_DnsResolve returns
- *	TH8_ERROR -- the caller is expected to fall back to a
- *	non-pinned resolution path or fail closed.
- *
- *	Th8_DnsResolveFree is a no-op when xDnsResolveFree is
- *	NULL or pResult is NULL.
+ *	If interp or ppResult is NULL, or xDnsResolve is NULL,
+ *	Th8_DnsResolve returns TH8_ERROR -- the caller is
+ *	expected to fall back to a non-pinned resolution path or
+ *	fail closed.
  *
  * Results:
  *	TH8_OK on success (check pResult->bogus for DNSSEC
@@ -46031,6 +46200,10 @@ Th8_IntCmpXchg(
 }
 
 
+#if defined(__OpenBSD__)
+#  include <unistd.h>
+#endif
+
 /*
  *----------------------------------------------------------------------
  *
@@ -46057,10 +46230,6 @@ Th8_IntCmpXchg(
  *
  *----------------------------------------------------------------------
  */
-
-#if defined(__OpenBSD__)
-#  include <unistd.h>
-#endif
 
 int
 Th8_Pledge(
@@ -46263,6 +46432,20 @@ Th8_UseDefaultPlatform(Th8_Platform *pPlatform)
     *pPlatform = *Th8_GetWin32Platform();
 #  endif
 #endif /* TH8_USE_MIMALLOC */
+
+    /*
+     * Compiler-runtime layer, merged AFTER the OS layers but BEFORE libc
+     * (most-specific to least-specific).  It supplies xStackBackTrace via
+     * _Unwind_Backtrace: a native OS stack walk (e.g. Win32
+     * RtlCaptureStackBackTrace, merged with the OS layers above) already
+     * won the slot where one exists; otherwise this fills it.  It is more
+     * specific than libc (it provides a capability ANSI C cannot) but less
+     * specific than the OS, so it sits just above libc, which remains the
+     * final least-specific base.
+     */
+    if (Th8_MergePlatform(pPlatform, th8GetUnwindPlatform()) != TH8_OK) {
+	return TH8_ERROR;
+    }
 
     if (Th8_MergePlatform(pPlatform, Th8_GetLibcPlatform()) != TH8_OK) {
 	return TH8_ERROR;
@@ -46664,36 +46847,33 @@ typedef struct TryState {
 /*
  *----------------------------------------------------------------------
  *
- * catch_command / catch_posteval --
+ * catch_command --
  *
- *	Evaluate a script and catch its return code (NRE).
+ *	Front half of the Tcl [catch] command: evaluate a script and
+ *	catch its return code using the NRE trampoline.
  *
  *	catch SCRIPT ?VARNAME?
  *
  * Why / How:
- *	Implements the Tcl [catch] command.  Uses a two-phase NRE
- *	callback chain: catch_command pushes catch_posteval and
- *	NREvals the script; catch_posteval receives the return code,
- *	optionally stores the result in VARNAME, and sets the
- *	interpreter result to the return code integer.
+ *	Validates the argument count, then pushes catch_posteval as
+ *	an NRE callback and NREvals SCRIPT.  The trampoline runs
+ *	SCRIPT to completion and later invokes catch_posteval with
+ *	the return code, which optionally stores the result in
+ *	VARNAME and sets the interpreter result to the return-code
+ *	integer.
  *
- *	NRE callback chain:
- *	  1. catch_command pushes catch_posteval, then NREvals SCRIPT.
- *	  2. The trampoline evaluates SCRIPT to completion.
- *	  3. catch_posteval receives the return code (rc) from SCRIPT.
- *
- *	pData layout for catch_posteval:
+ *	pData layout handed to catch_posteval:
  *	  [0] = argv   (const char **) -- for VARNAME access
  *	  [1] = argl   (size_t *)      -- for VARNAME length
  *	  [2] = argc   (as th8_int64_t)
  *	  [3] = unused
  *
- *	Cancel-unwind interaction: if the script returned TH8_ERROR
- *	and the interpreter has -unwind cancellation active (set via
- *	[interp cancel -unwind]), catch must NOT intercept the error.
- *	Instead it propagates TH8_ERROR so the script unwinds all
- *	the way to the top-level Th8_Eval caller.  Without this
- *	check, [catch] would silently swallow cancellation errors.
+ * Results:
+ *	The return code of Th8_NREval on SCRIPT, or a wrong-num-args
+ *	error when argc is not 2 or 3.
+ *
+ * Side effects:
+ *	Registers an NRE callback and begins evaluating SCRIPT.
  *
  *----------------------------------------------------------------------
  */
@@ -47586,10 +47766,12 @@ if_command(
 }
 
 
+/* th8EvalCleanup declared in th8_int.h (non-static, shared) */
+
 /*
  *----------------------------------------------------------------------
  *
- * eval_command / th8EvalCleanup --
+ * eval_command --
  *
  *	Concatenate arguments and evaluate the result as a script.
  *
@@ -47598,9 +47780,9 @@ if_command(
  * Why / How:
  *	Implements the Tcl [eval] command.  For a single argument,
  *	uses a zero-copy fast path via Th8_NREval.  For multiple
- *	arguments, concatenates them with spaces and pushes an NRE
- *	cleanup callback to free the concatenated buffer after
- *	evaluation completes.
+ *	arguments, concatenates them with spaces and pushes the
+ *	th8EvalCleanup NRE callback to free the concatenated buffer
+ *	after evaluation completes.
  *
  *	When argc == 2, the single argument is NREval'd directly
  *	(zero-copy fast path).  When argc > 2, all arguments are
@@ -47625,8 +47807,6 @@ if_command(
  *
  *----------------------------------------------------------------------
  */
-
-/* th8EvalCleanup declared in th8_int.h (non-static, shared) */
 
 static int
 eval_command(
@@ -48464,9 +48644,32 @@ th8ControlGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
 
 #  if defined(TH8_ENABLE_VARIABLES)
 /*
- * Capture current variable value into pzCap/pnCap.  pzCap is
- * malloc'd if pVar exists; otherwise *pzCap is NULL and *pbExisted
- * is 0.  Caller frees *pzCap.                                     */
+ *----------------------------------------------------------------------
+ *
+ * events_capture_value --
+ *
+ *	Snapshot the current value of a script variable so that a
+ *	later [vwait]/[update] callback can detect whether it
+ *	changed.
+ *
+ * Why / How:
+ *	Reads the variable via Th8_GetVar and copies the interp
+ *	result into a freshly allocated buffer (*pzCap), recording
+ *	its length in *pnCap and whether the variable existed in
+ *	*pbExisted.  A variable that exists but cannot be read (e.g.
+ *	a bare array) is reported as existing with empty content so
+ *	comparison stays well-defined.  The caller owns *pzCap and
+ *	must free it.
+ *
+ * Results:
+ *	TH8_OK on success (including the not-exists case), TH8_ERROR
+ *	if the capture buffer could not be allocated.
+ *
+ * Side effects:
+ *	Allocates *pzCap on the heap and clears the interp result.
+ *
+ *----------------------------------------------------------------------
+ */
 static int
 events_capture_value(
     Th8_Interp *interp,
@@ -48512,9 +48715,30 @@ events_capture_value(
     return TH8_OK;
 }
 
-/* Returns 1 if the named variable's current state differs from
- * the captured (zCap, nCap, bExisted), 0 if unchanged, -1 on
- * unrecoverable error.                                       */
+/*
+ *----------------------------------------------------------------------
+ *
+ * events_value_changed --
+ *
+ *	Determine whether a watched variable's current state differs
+ *	from a snapshot previously taken by events_capture_value.
+ *
+ * Why / How:
+ *	Compares present existence against bExisted (a create or
+ *	unset counts as a change), then, when the variable still
+ *	exists, compares the current value bytes against the captured
+ *	(zCap, nCap).  An unreadable-but-existing variable is treated
+ *	as unchanged so a transient read failure does not spuriously
+ *	wake a [vwait].
+ *
+ * Results:
+ *	1 if the state changed, 0 if unchanged.
+ *
+ * Side effects:
+ *	Clears the interp result.
+ *
+ *----------------------------------------------------------------------
+ */
 static int
 events_value_changed(
     Th8_Interp *interp,
@@ -56679,6 +56903,18 @@ puts_command(
 	    zStr = argv[iArg];
 	    nStr = TH8_LEN(argl[iArg]);
 
+	    /*
+	     * Sensitivity boundary: a sensitive value must never be
+	     * written to a channel as plaintext.  Reject BEFORE any
+	     * write with a fixed diagnostic that discloses no payload.
+	     */
+
+	    if (TH8_SENSITIVE(argl[iArg])) {
+		Th8_SetResultStatic(
+		    interp, "sensitive value cannot be written", TH8_NOLEN);
+		return TH8_ERROR;
+	    }
+
 	    rc = th8ChannelWrite(interp, pChan, zStr, nStr);
 	    if (rc != TH8_OK) return rc;
 	    if (!noNewline) {
@@ -56703,6 +56939,19 @@ puts_command(
 
     zStr = argv[iArg];
     nStr = TH8_LEN(argl[iArg]);
+
+    /*
+     * Sensitivity boundary: a sensitive value must never be routed to
+     * the host xOutput callback as plaintext.  Reject BEFORE buffer
+     * assembly or Th8_Output with a fixed diagnostic that discloses no
+     * payload.
+     */
+
+    if (TH8_SENSITIVE(argl[iArg])) {
+	Th8_SetResultStatic(
+	    interp, "sensitive value cannot be written", TH8_NOLEN);
+	return TH8_ERROR;
+    }
 
     /*
      * Route through platform xOutput.
@@ -66090,6 +66339,18 @@ string_index_command(
 
 
 /*
+ * th8ParseIndex is now in th8_util.c (th8_util.h).
+ *
+ * It parses an index argument that can be:
+ *   - "end"     -> returns nCount - 1
+ *   - "end-N"   -> returns nCount - 1 - N
+ *   - integer   -> returns the integer value
+ *
+ * Used by string range, lrange, lreplace, and string case commands
+ * for consistent index handling.
+ */
+
+/*
  *----------------------------------------------------------------------
  *
  * string_range_command --
@@ -66113,20 +66374,6 @@ string_index_command(
  *
  *----------------------------------------------------------------------
  */
-
-/*
- * th8ParseIndex is now in th8_util.c (th8_util.h).
- *
- * It parses an index argument that can be:
- *   - "end"     -> returns nCount - 1
- *   - "end-N"   -> returns nCount - 1 - N
- *   - integer   -> returns the integer value
- *
- * Used by string range, lrange, lreplace, and string case commands
- * for consistent index handling.
- */
-
-
 static int
 string_range_command(
     Th8_Interp *interp,
@@ -66175,9 +66422,11 @@ string_range_command(
 /*
  *----------------------------------------------------------------------
  *
- * string_first_command / string_last_command --
+ * string_first_command --
  *
- *	Find first/last occurrence of needle in haystack.
+ *	Find the first occurrence of a needle in a haystack.
+ *
+ *	string first NEEDLE HAYSTACK ?STARTINDEX?
  *
  * Why / How:
  *	Implements [string first].  Performs byte-level search from
@@ -67245,15 +67494,15 @@ string_totitle_command(
 /*
  *----------------------------------------------------------------------
  *
- * string_wordend_command / string_wordstart_command --
+ * string_wordend_command --
  *
  *	string wordend STRING INDEX
- *	string wordstart STRING INDEX
  *
- *	Return the index of the character just after (wordend) or
- *	just before (wordstart) the word containing the character
- *	at INDEX.  A "word" is a contiguous run of alphanumeric
- *	characters (ASCII).
+ *	Return the index of the character just after the word
+ *	containing the character at INDEX.  A "word" is a
+ *	contiguous run of alphanumeric characters (ASCII).
+ *	`string_wordstart_command` is the backward-scanning
+ *	mirror of this routine.
  *
  * Why / How:
  *	Implements [string wordend] and [string wordstart].  Scans
@@ -69905,11 +70154,31 @@ oom:
  */
 
 /*
- * Skip empty buckets starting at *piBucket; advance until we find a
- * non-NULL bucket or reach the end of the table.  On entry, *piBucket
- * is the bucket index to start from; *ppCursor is set to that bucket's
- * head entry by the caller.  On return, *ppCursor is either a valid
- * entry pointer or NULL (iteration exhausted).
+ *----------------------------------------------------------------------
+ *
+ * th8ArraySearchSkipEmpty --
+ *
+ *	Advance a hash-table iteration cursor past empty buckets.
+ *	While `*ppCursor` is NULL, step to the next bucket and
+ *	load its head entry, stopping at the first non-empty
+ *	bucket or when the table is exhausted.  Backs the
+ *	`[array nextelement]` walk.
+ *
+ * Parameters:
+ *	pHash    -- the array's element hash being iterated.
+ *	piBucket -- in/out current bucket index; the caller has
+ *		set `*ppCursor` to this bucket's head entry.
+ *	ppCursor -- in/out cursor; NULL on entry means the current
+ *		bucket is empty.  Set to a valid entry, or to NULL
+ *		when iteration is exhausted, on return.
+ *
+ * Returns:
+ *	None.
+ *
+ * Side effects:
+ *	Advances `*piBucket` and rewrites `*ppCursor`.
+ *
+ *----------------------------------------------------------------------
  */
 static void
 th8ArraySearchSkipEmpty(
@@ -69927,14 +70196,40 @@ th8ArraySearchSkipEmpty(
 }
 
 /*
- * Validate a search by SID and array-name pair, returning the search
- * record on success or NULL on any failure.  Does NOT raise an error
- * directly -- callers craft their own error message based on context.
+ *----------------------------------------------------------------------
  *
- * On NULL return with *pbInvalidated == 1, the search was found but
- * is no longer usable (epoch mismatch or array destroyed/recreated)
- * AND has been removed from the search hash; the caller should
- * surface "couldn't find search" since the SID is now defunct.
+ * th8ArraySearchFind --
+ *
+ *	Look up an `[array startsearch]` cursor by search id and
+ *	validate it against the named array: the owning
+ *	interpreter, the registered array name, array liveness,
+ *	and the generation + epoch counters must all match so a
+ *	stale or guessed search id cannot drive a re-bound array.
+ *	Does NOT raise an error directly -- callers craft their
+ *	own message based on context.
+ *
+ *	The generation counter (rather than a bare pointer
+ *	compare on the array hash) avoids the Bug 9 / arrsearch-4.3
+ *	flake where the allocator reused a freed hash address
+ *	after `array unset` + `array set` of the same name.
+ *
+ * Parameters:
+ *	interp -- live interpreter (owns the search hash).
+ *	zSid   -- search id (the hash key).
+ *	nSid   -- search-id length.
+ *	zArray -- array name the search must be bound to.
+ *	nArray -- array-name length.
+ *
+ * Returns:
+ *	The matching th8ArraySearch on success; NULL on any
+ *	mismatch or if the search was found but invalidated.
+ *
+ * Side effects:
+ *	On invalidation, removes the entry from the search hash
+ *	and frees the search record and its owned `zArray` copy,
+ *	so the caller can report "couldn't find search".
+ *
+ *----------------------------------------------------------------------
  */
 static th8ArraySearch *
 th8ArraySearchFind(
@@ -70002,8 +70297,29 @@ invalidate:
 }
 
 /*
- * Free a single search record (used both as Th8_HashIterate callback
- * during interp teardown, and from donesearch via the release path).
+ *----------------------------------------------------------------------
+ *
+ * th8ArraySearchFreeEntry --
+ *
+ *	Free a single array-search record.  Used both as the
+ *	Th8_HashIterate callback during interpreter teardown and
+ *	from `[array donesearch]` via the release path.  NULL-safe
+ *	in `pEntry` and `pEntry->pData` (Bug 26): a tombstoned or
+ *	absent entry is a no-op.
+ *
+ * Parameters:
+ *	pEntry -- hash entry whose pData is the th8ArraySearch,
+ *		or NULL.
+ *	pCtx   -- the owning Th8_Interp (hash-iterate context).
+ *
+ * Returns:
+ *	TH8_OK unconditionally.
+ *
+ * Side effects:
+ *	Frees the search record and its owned `zArray` copy, then
+ *	clears `pEntry->pData`.
+ *
+ *----------------------------------------------------------------------
  */
 int
 th8ArraySearchFreeEntry(Th8_HashEntry *pEntry, void *pCtx)
@@ -70696,6 +71012,27 @@ th8VariablesGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
  *----------------------------------------------------------------------
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryWriteU8 --
+ *
+ *	Store the low 8 bits of `v` to `p[0]`.  A single-byte
+ *	write, so byte order does not apply; provided for
+ *	symmetry with the multi-byte writers.
+ *
+ * Parameters:
+ *	p -- one-byte output buffer (caller guarantees space).
+ *	v -- source value; only the low 8 bits are used.
+ *
+ * Returns:
+ *	None.
+ *
+ * Side effects:
+ *	Overwrites `p[0]`.
+ *
+ *----------------------------------------------------------------------
+ */
 static void
 th8BinaryWriteU8(unsigned char *p, th8_uint64_t v)
 {
@@ -71166,6 +71503,34 @@ typedef int Th8_BinaryAssertFloat64[(sizeof(double) == 8) ? 1 : -1];
 #  define TH8_BINARY_NAN_F32 ((th8_uint64_t)0x7FC00000u)
 #  define TH8_BINARY_NAN_F64 ((th8_uint64_t)0x7FF8000000000000ULL)
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryIsNaN32 --
+ *
+ *	Classify an IEEE 754 binary32 bit pattern as NaN.
+ *	A pattern is a NaN iff:
+ *	  * the exponent field (bits 30..23) is all-ones
+ *	    (`0xFF`), AND
+ *	  * the mantissa field (bits 22..0) is non-zero
+ *	    (else the pattern is +/-Infinity).
+ *
+ *	The sign bit is irrelevant for the classification.
+ *	Mirror of `th8BinaryIsNaN64`.
+ *
+ * Parameters:
+ *	bits -- 32-bit pattern held in a 64-bit accumulator
+ *		(typically from `th8BinaryFloat32Bits`); only the
+ *		low 32 bits are inspected.
+ *
+ * Returns:
+ *	1 if `bits` denotes a NaN; 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
 static int
 th8BinaryIsNaN32(th8_uint64_t bits)
 {
@@ -71497,6 +71862,30 @@ th8BinaryOpFor(int letter)
  *----------------------------------------------------------------------
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryErrBadFormat --
+ *
+ *	Set the interpreter result to the standard "bad field
+ *	specifier" diagnostic naming the offending format letter
+ *	and return `TH8_ERROR`.  Raised by `th8BinaryNextToken`
+ *	when a format byte has no op-table entry.  A
+ *	non-printable letter is rendered as `?` so the message
+ *	stays clean for control bytes.
+ *
+ * Parameters:
+ *	interp -- live interpreter (receives the message).
+ *	letter -- the rejected format letter (byte value).
+ *
+ * Returns:
+ *	`TH8_ERROR` unconditionally.
+ *
+ * Side effects:
+ *	Sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
 static int
 th8BinaryErrBadFormat(Th8_Interp *interp, int letter)
 {
@@ -71614,6 +72003,26 @@ th8BinaryErrStarFormat(Th8_Interp *interp)
  *----------------------------------------------------------------------
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryIsDigit --
+ *
+ *	ASCII decimal-digit predicate used by the binary-format
+ *	tokeniser to parse the count modifier that may follow a
+ *	format letter.
+ *
+ * Parameters:
+ *	c -- byte value (typically promoted from `unsigned char`).
+ *
+ * Returns:
+ *	1 if `c` is one of `'0'..'9'`; 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
 static int
 th8BinaryIsDigit(int c)
 {
@@ -72062,7 +72471,27 @@ th8BinaryWriteFloat64(
  *----------------------------------------------------------------------
  */
 
-/* th8BinaryStrPadByte: pick the pad byte for `a` (NUL) vs `A` (' '). */
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryStrPadByte --
+ *
+ *	Pick the byte used to pad the tail of an `a`/`A` string
+ *	field when the source is shorter than the field count:
+ *	NUL for `a` (KIND_STR_NUL) and space for `A`
+ *	(KIND_STR_SP).
+ *
+ * Parameters:
+ *	kind -- the op kind (TH8_BINARY_KIND_STR_NUL or _STR_SP).
+ *
+ * Returns:
+ *	`' '` for TH8_BINARY_KIND_STR_SP; `0` (NUL) otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
 static unsigned char
 th8BinaryStrPadByte(unsigned char kind)
 {
@@ -72097,8 +72526,24 @@ th8BinaryFormatStr(
 }
 
 /*
- * Bit / hex helpers.  Tcl 8.6 treats any non-`0`/`1` char as `1`
- * for b/B, and any non-hex char as 0 for h/H.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryBitValue --
+ *
+ *	Map one character of a `b`/`B` bit-string field to its
+ *	bit value.  Per Tcl 8.6, only `'0'` denotes a zero bit;
+ *	every other character is treated as a one bit.
+ *
+ * Parameters:
+ *	c -- byte value taken from the source bit string.
+ *
+ * Returns:
+ *	0 if `c` is `'0'`; 1 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryBitValue(int c)
@@ -73964,7 +74409,7 @@ th8MemNeedMemory(Th8_Interp *interp, size_t nByte)
  */
 
 static const Th8_Platform th8MemPlatformData = {
-    4,    /* nVersion */
+    5,    /* nVersion */
     0,    /* xInitialize */
     0,    /* xFinalize */
 
@@ -74093,8 +74538,11 @@ static const Th8_Platform th8MemPlatformData = {
     /* DNS */
     0, 0,   /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0    /* pCtx */
+    0 /* pCtx */
 };
 
 
@@ -74856,15 +75304,14 @@ th8NullInput(
 /*
  *----------------------------------------------------------------------
  *
- * th8NullOutput / th8NullOutputError --
+ * th8NullOutput --
  *
- *	Accept output but discard it.  Returns TH8_OK.
+ *	Accept standard output but discard it.  Returns TH8_OK.
  *
  * Why / How:
- *	Implement the Th8_Platform.xOutput and xOutputError callbacks
- *	for the null I/O platform.  Both functions accept any data
- *	but silently discard it, making [puts] succeed without
- *	producing visible output.
+ *	Implements the Th8_Platform.xOutput callback for the null I/O
+ *	platform.  Accepts any data but silently discards it, making
+ *	[puts] succeed without producing visible output.
  *
  * Results:
  *	TH8_OK unconditionally.
@@ -75040,7 +75487,7 @@ th8NullGetCwd(
  */
 
 static Th8_Platform th8NullIoPlatformData = {
-    4,   /* nVersion */
+    5,   /* nVersion */
     0,   /* xInitialize */
     0,   /* xFinalize */
 
@@ -75169,8 +75616,11 @@ static Th8_Platform th8NullIoPlatformData = {
     /* DNS (none) */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0   /* pCtx */
+    0 /* pCtx */
 };
 
 
@@ -76436,6 +76886,10 @@ static const Th8InternalStubsTable th8InternalStubsTableData = {
     0,
     0,
 #endif
+
+    /* th8_memtrack.c dump + reset (always present; fail-soft off-debug). */
+    th8MemTrackDump,
+    th8MemTrackReset,
 };
 
 /*
@@ -80848,10 +81302,24 @@ th8ChrToUtf8(
 /*
  *----------------------------------------------------------------------
  *
- * th8RegexSetup / th8RegexTeardown --
+ * th8RegexSetup --
  *
- *	Set up and tear down the global regex bridge state before
- *	and after each regex operation.
+ *	Set up the global regex bridge state before a regex
+ *	operation.
+ *
+ * Why / How:
+ *	Acquires the global regex mutex (the engine relies on
+ *	file-scope state that is not re-entrant), then publishes the
+ *	active interpreter pointer and clears the OOM flag so the
+ *	engine's allocation hooks resolve to this interp.  Paired
+ *	with th8RegexTeardown, which must run on every exit path.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Enters the global mutex and sets th8_regex_interp /
+ *	th8_regex_oom_flag.
  *
  *----------------------------------------------------------------------
  */
@@ -91968,20 +92436,6 @@ regc_wc_tolower(chr c)
  * regcomp.c).  We do NOT define it here. */
 
 
-/*
- * regc_ctype_get_cache -- Build a cvec of matching characters.
- *
- * PostgreSQL caches these; TH8 builds them on-demand.
- * We scan characters 0..MAX_SIMPLE_CHR (0x7FF) through the
- * probe function and construct a cvec.  This is called once
- * per character class per regex compilation.
- *
- * Returns a pointer to a cvec, or NULL on memory failure.
- * The cvec is allocated via getcvec (defined in regc_cvec.c,
- * included earlier by regcomp.c) which uses the vars struct's
- * memory management.
- */
-
 typedef int (*pg_wc_probefunc)(chr c);
 
 /*
@@ -91995,6 +92449,39 @@ typedef int (*pg_wc_probefunc)(chr c);
  * We need v to call getcvec().  The caller passes it
  * indirectly -- we add a v parameter and adjust the call
  * site via a macro.
+ */
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * regc_ctype_get_cache_impl --
+ *
+ *	Build a cvec containing every character in 0..MAX_SIMPLE_CHR
+ *	(0x7FF) for which `probefunc` returns true, i.e. the members
+ *	of a POSIX character class.
+ *
+ * Why / How:
+ *	PostgreSQL caches these vecs; TH8 builds them on demand, once
+ *	per character class per regex compilation.  A first pass
+ *	counts matches to size the cvec, getcvec (from regc_cvec.c,
+ *	using the `vars` struct's memory management) allocates it,
+ *	then a second pass fills it.  An empty match set returns a
+ *	valid empty cvec rather than NULL, since NULL signals
+ *	out-of-memory to the caller.
+ *
+ * Parameters:
+ *	v          -- regex compile vars (for getcvec allocation).
+ *	probefunc  -- per-character class-membership predicate.
+ *	cclasscode -- class code; accepted for call-site symmetry
+ *		      but not consulted by the scan.
+ *
+ * Returns:
+ *	A cvec of matching characters, or NULL on memory failure.
+ *
+ * Side effects:
+ *	Allocates a cvec via the vars struct's memory management.
+ *
+ *----------------------------------------------------------------------
  */
 
 static struct cvec *
@@ -92952,7 +93439,7 @@ casecmp(const chr *x, const chr *y, /* strings to compare */
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 10886 "bin/regex_amalg.c"
+#line 10905 "bin/regex_amalg.c"
 
 
 
@@ -96183,7 +96670,7 @@ pickss(struct vars *v,
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 14116 "bin/regex_amalg.c"
+#line 14135 "bin/regex_amalg.c"
 
 
 
@@ -96777,7 +97264,7 @@ pg_regfree(regex_t *re)
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 14709 "bin/regex_amalg.c"
+#line 14728 "bin/regex_amalg.c"
 
 
 
@@ -97627,7 +98114,7 @@ findprefix(struct cnfa *cnfa,
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 15558 "bin/regex_amalg.c"
+#line 15577 "bin/regex_amalg.c"
 
 
 
@@ -98396,26 +98883,29 @@ static TH8_THREAD_LOCAL Th8_Interp *volatile th8_bigint_interp = 0;
 /*
  *----------------------------------------------------------------------
  *
- * th8_bigint_malloc / th8_bigint_calloc / th8_bigint_realloc /
- * th8_bigint_free --
+ * th8_bigint_malloc --
  *
- *	Custom allocator callbacks for libtommath.  These route
- *	all libtommath memory through the TH8 platform allocator
- *	and enforce cancellation and resource limits.
+ *	libtommath `XMALLOC` allocator bridge.  Routes a raw
+ *	`n`-byte request through TH8's `TH8_ALLOC` using the
+ *	thread-local `th8_bigint_interp` captured by the
+ *	bracketing `th8BigintSetup` call.
  *
  * Why / How:
- *	libtommath is compiled with LTM_ALLOC_FUNCS pointing to
- *	these four functions.  Each one checks interpreter readiness
- *	(cancellation, step limit) before delegating to TH8_ALLOC
- *	or Th8_AttemptRealloc.  Returning NULL triggers libtommath's
- *	MP_MEM error path, unwinding gracefully.
+ *	libtommath is compiled with LTM_ALLOC_FUNCS pointing at
+ *	this family of callbacks, which take no user-data pointer;
+ *	the interp is therefore threaded in via the thread-local.
+ *	A NULL `th8_bigint_interp` (bridge not set up) or a
+ *	non-ready interpreter (cancelled / over its memory limit)
+ *	makes this return NULL, which libtommath maps to MP_MEM
+ *	and unwinds gracefully.  Plain guards, NOT `NEVER()`, per
+ *	the Bug 26 family rule.
  *
  * Results:
- *	malloc/calloc/realloc return a pointer or NULL on failure.
- *	free has no return value.
+ *	Pointer to `n` bytes on success; NULL on any failure.
  *
  * Side effects:
- *	Memory allocation/deallocation through the interpreter.
+ *	Allocates via the per-interp allocator (which counts the
+ *	request against the interpreter's memory limit).
  *
  *----------------------------------------------------------------------
  */
@@ -112013,16 +112503,23 @@ th8SecureCheckCanary(Th8_Interp *interp, const void *pKSv)
 /*
  *----------------------------------------------------------------------
  *
- * th8SlotIsUsed / th8SlotSetUsed / th8SlotClearUsed / th8SlotKey --
+ * th8SlotIsUsed --
  *
- *	Bitmap-based slot allocation for the key store.  Each secure
- *	variable gets one 32-byte slot in the locked page.  The bitmap
- *	tracks which slots are in use.
+ *	Query whether key-store slot `i` is currently occupied by
+ *	testing its bit in `pKS->aBitmap`.
  *
  * Why / How:
- *	A fixed-size bitmap avoids heap allocation for slot management,
+ *	The bitmap-based slot allocator (with th8SlotSetUsed and
+ *	th8SlotClearUsed) avoids heap allocation for slot management,
  *	keeping the entire key-store metadata out of pageable memory.
  *	Slot 0 is reserved for the canary; usable range is 1..MAX-1.
+ *	The caller is responsible for passing an in-range index.
+ *
+ * Results:
+ *	Non-zero if slot `i` is in use, 0 if free.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -117072,7 +117569,7 @@ th8PolicyCheckAnnotations(
 	    }
 	} else {
 	    bHaveRemoteTime =
-	        (th8NtpQuery(interp, NULL, 0, 5000, 0, &nowSec) == TH8_OK);
+	        (th8NtpQuery(interp, NULL, 0, 5000, 0, 0, &nowSec) == TH8_OK);
 	}
 
 	/*
@@ -118869,6 +119366,31 @@ th8PolicyResetCachedKeys(void)
 #  if defined(TH8_ENABLE_FAULT_INJECTION)
 extern struct Th8_FaultConfig *th8FaultActiveCfg;
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SnkOsslFaultTrip --
+ *
+ *	Predicate used by the OSSL_CALL / OSSL_CALL_PTR wrappers to
+ *	decide whether a given OpenSSL call site should be forced to
+ *	report failure instead of invoking OpenSSL.
+ *
+ * Why / How:
+ *	Returns true only when a fault config is active and the bit
+ *	for `op` is armed in th8FaultActiveCfg->nFailOsslMask, letting
+ *	tests drive the otherwise-unreachable error arms of OpenSSL
+ *	calls for MC/DC coverage without altering the surrounding
+ *	decision structure.
+ *
+ * Results:
+ *	Non-zero if op's failure bit is armed, 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
 static int
 th8SnkOsslFaultTrip(int op)
 {
@@ -120025,6 +120547,21 @@ Th8_RsaKeyTokenHex(Th8_Interp *interp, const Th8_RsaKey *pKey, char zOut[17])
     return TH8_OK;
 }
 
+#  include <openssl/evp.h>
+#  include <openssl/rsa.h>
+#  include <openssl/param_build.h>
+#  include <openssl/core_names.h>
+
+/*
+ * Maximum RSA signature size in bytes.  Accommodates RSA keys up to
+ * 65536 bits (8192-byte modulus) plus a 64-byte margin for encoding.
+ * Override at compile time with -DTH8_RSA_MAX_SIG_BYTES=N.
+ */
+
+#  ifndef TH8_RSA_MAX_SIG_BYTES
+#    define TH8_RSA_MAX_SIG_BYTES 16448 /* 131072-bit key + 64 margin */
+#  endif
+
 /*
  *----------------------------------------------------------------------
  *
@@ -120056,21 +120593,6 @@ Th8_RsaKeyTokenHex(Th8_Interp *interp, const Th8_RsaKey *pKey, char zOut[17])
  *
  *----------------------------------------------------------------------
  */
-
-#  include <openssl/evp.h>
-#  include <openssl/rsa.h>
-#  include <openssl/param_build.h>
-#  include <openssl/core_names.h>
-
-/*
- * Maximum RSA signature size in bytes.  Accommodates RSA keys up to
- * 65536 bits (8192-byte modulus) plus a 64-byte margin for encoding.
- * Override at compile time with -DTH8_RSA_MAX_SIG_BYTES=N.
- */
-
-#  ifndef TH8_RSA_MAX_SIG_BYTES
-#    define TH8_RSA_MAX_SIG_BYTES 16448 /* 131072-bit key + 64 margin */
-#  endif
 
 int
 Th8_RsaVerify(
@@ -120796,17 +121318,28 @@ cleanup:
 /*
  *----------------------------------------------------------------------
  *
- * th8TestRsaKeyClearPubBlob / th8TestRsaKeyRestorePubBlob --
+ * th8TestRsaKeyClearPubBlob --
  *
- *	Test-only helpers exposed via the internal stubs table for
- *	driving the C2-Pair (F,T) vector at Th8_RsaKeyToken's L1117
- *	`if (!pKey || !pKey->zPubBlob)`.  th8_snk.c is the only
- *	translation unit that can see the Th8_RsaKey layout, so
- *	testlib cannot directly null/restore zPubBlob.
+ *	Test-only helper (exposed via the internal stubs table) that
+ *	captures a `Th8_RsaKey`'s public-key blob pointer/length and
+ *	then nulls them, driving the C2-Pair (F,T) vector at
+ *	Th8_RsaKeyToken's L1117 `if (!pKey || !pKey->zPubBlob)`.
  *
- *	Pattern of use: save -> null -> call Th8_RsaKeyToken
- *	(drives F,T) -> restore.  The save/restore protects the
+ * Why / How:
+ *	th8_snk.c is the only translation unit that can see the
+ *	Th8_RsaKey layout, so testlib cannot directly null/restore
+ *	zPubBlob.  Pattern of use: save -> null -> call
+ *	Th8_RsaKeyToken (drives F,T) -> restore (via the paired
+ *	th8TestRsaKeyRestorePubBlob).  Saving first protects the
  *	caller's key from corruption.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Stores the original (zPubBlob, nPubBlob) into the caller's
+ *	out-parameters and sets pKey->zPubBlob/nPubBlob to NULL/0.
+ *	No-op if any pointer argument is NULL.
  *
  *----------------------------------------------------------------------
  */
@@ -120963,6 +121496,17 @@ typedef int ntp_socket_t;
 #  define NTP_DEFAULT_TIMEOUT_MS   3000
 #  define NTP_DEFAULT_MAX_DISAGREE 5 /* seconds */
 #  define NTP_MAX_SERVERS          8
+/*
+ * Per-server send/receive attempts.  NTP runs over UDP, so a lost
+ * request or reply is expected rather than exceptional; a single shot
+ * would fail the whole query on any transient loss.  Only transient
+ * failures (timeout / short read / send error) are retried -- a
+ * response that arrives but fails validation is never retried.  A
+ * caller may pass a value <= 0 to accept this default, or 1 to disable
+ * retries.
+ */
+#  define NTP_DEFAULT_ATTEMPTS 3
+#  define NTP_MAX_ATTEMPTS     10
 
 static const char *th8NtpDefaultServers[] = {"urn.to", NULL};
 
@@ -121216,6 +121760,7 @@ th8NtpQueryOne(
     Th8_Interp *interp,
     const char *zServer,
     int timeoutMs,
+    int attempts,
     th8_int64_t *pEpochSec)
 {
     struct addrinfo hints, *res = NULL;
@@ -121224,6 +121769,7 @@ th8NtpQueryOne(
     th8_int64_t localMs = 0;
     th8_uint64_t t1Sec;
     int rc = TH8_ERROR;
+    int attempt;
 
     *pEpochSec = 0;
 
@@ -121385,73 +121931,86 @@ th8NtpQueryOne(
     }
 
     /*
-     * Build the NTP client request.
+     * Query loop.  Each attempt builds a FRESH request (a new origin
+     * timestamp) and does exactly one send / receive.  Transient
+     * failures -- a sendto error, a receive timeout (a lost request or
+     * reply), or a short response -- are retried up to `attempts`
+     * times, because NTP runs over UDP and packet loss is expected.  A
+     * response that arrives but fails validation is NOT retried: a bad
+     * stratum or an origin-timestamp mismatch is a misbehaving- or
+     * hostile-server signal, and retrying would only paper over it.
+     * Rebuilding the request each attempt keeps the anti-spoof origin-
+     * timestamp check in th8NtpValidateResponse sound per attempt.
      */
 
-    Th8_Memset(interp, &req, 0, sizeof(req));
-    req.flags = (unsigned char)((NTP_VERSION << 3) | NTP_MODE_CLIENT);
+    if (attempts < 1) attempts = 1;
 
-    /* Set T1 (origin timestamp) from local clock. */
-    Th8_GetTimeMs(interp, &localMs);
-    t1Sec = (th8_uint64_t)(localMs / 1000) + NTP_EPOCH_DELTA;
-    th8NtpWriteTs(req.txTs, t1Sec);
+    for (attempt = 0; attempt < attempts; attempt++) {
+	Th8_Memset(interp, &req, 0, sizeof(req));
+	req.flags = (unsigned char)((NTP_VERSION << 3) | NTP_MODE_CLIENT);
 
-    /*
-     * Send request.
-     */
+	/* Set T1 (origin timestamp) from local clock. */
+	Th8_GetTimeMs(interp, &localMs);
+	t1Sec = (th8_uint64_t)(localMs / 1000) + NTP_EPOCH_DELTA;
+	th8NtpWriteTs(req.txTs, t1Sec);
 
-    if (sendto(
-            sock, (const char *)&req, NTP_PACKET_SIZE, 0, res->ai_addr,
-            (int)res->ai_addrlen) != NTP_PACKET_SIZE) {
-	TH8_TRACE_ERR(interp, "NTP sendto failed");
-	Th8_ErrorMessage(
-	    interp, "clock ntp: sendto failed for \"", zServer,
-	    Th8_Strlen(interp, zServer));
+	if (sendto(
+	        sock, (const char *)&req, NTP_PACKET_SIZE, 0, res->ai_addr,
+	        (int)res->ai_addrlen) != NTP_PACKET_SIZE) {
+	    TH8_TRACE_ERR(interp, "NTP sendto failed");
+	    Th8_ErrorMessage(
+	        interp, "clock ntp: sendto failed for \"", zServer,
+	        Th8_Strlen(interp, zServer));
+	    continue; /* transient -- retry */
+	}
+
+#  if !defined(_WIN32)
+	{
+	    struct pollfd pfd;
+
+	    pfd.fd = sock;
+	    pfd.events = POLLIN;
+	    if (ntp_poll(&pfd, 1, timeoutMs) <= 0) {
+		Th8_ErrorMessage(
+		    interp, "clock ntp: timeout from \"", zServer,
+		    Th8_Strlen(interp, zServer));
+		continue; /* lost packet -- retry */
+	    }
+	}
+#  endif
+
+	Th8_Memset(interp, &resp, 0, sizeof(resp));
+	{
+	    int nRecv = (int)
+	        recvfrom(sock, (char *)&resp, NTP_PACKET_SIZE, 0, NULL, NULL);
+
+	    if (nRecv < NTP_PACKET_SIZE) {
+		TH8_TRACE_ERR(interp, "NTP recvfrom failed");
+		Th8_ErrorMessage(
+		    interp, "clock ntp: incomplete response from \"", zServer,
+		    Th8_Strlen(interp, zServer));
+		continue; /* transient -- retry */
+	    }
+	}
+
+	/*
+	 * A full response arrived.  Validate and derive epoch seconds.
+	 * Validation is TERMINAL -- whether it succeeds or rejects, the
+	 * result is never retried (see the loop-header comment).  The
+	 * protocol-validation logic is factored into
+	 * th8NtpValidateResponse so it can be MC/DC-driven directly with
+	 * crafted packets (via the internal stubs) without a live NTP
+	 * exchange.
+	 */
+
+	rc = th8NtpValidateResponse(interp, &resp, &req, pEpochSec);
 	goto done;
     }
 
     /*
-     * Receive response with timeout guard.
+     * Every attempt failed transiently; rc is still TH8_ERROR and the
+     * interp result holds the last attempt's diagnostic.
      */
-
-#  if !defined(_WIN32)
-    {
-	struct pollfd pfd;
-
-	pfd.fd = sock;
-	pfd.events = POLLIN;
-	if (ntp_poll(&pfd, 1, timeoutMs) <= 0) {
-	    Th8_ErrorMessage(
-	        interp, "clock ntp: timeout from \"", zServer,
-	        Th8_Strlen(interp, zServer));
-	    goto done;
-	}
-    }
-#  endif
-
-    Th8_Memset(interp, &resp, 0, sizeof(resp));
-    {
-	int nRecv = (int)
-	    recvfrom(sock, (char *)&resp, NTP_PACKET_SIZE, 0, NULL, NULL);
-
-	if (nRecv < NTP_PACKET_SIZE) {
-	    TH8_TRACE_ERR(interp, "NTP recvfrom failed");
-	    Th8_ErrorMessage(
-	        interp, "clock ntp: incomplete response from \"", zServer,
-	        Th8_Strlen(interp, zServer));
-	    goto done;
-	}
-    }
-
-    /*
-     * Validate the response and derive the epoch seconds.  The
-     * protocol-validation logic is factored into
-     * th8NtpValidateResponse so it can be MC/DC-driven directly
-     * with crafted packets (via the internal stubs) without a
-     * live NTP exchange.
-     */
-
-    rc = th8NtpValidateResponse(interp, &resp, &req, pEpochSec);
 
 done:
     if (sock != NTP_INVALID_SOCKET) ntp_close(sock);
@@ -121541,6 +122100,7 @@ th8NtpQuery(
     int nServers,
     int timeoutMs,
     int maxDisagreeSec,
+    int attempts,
     th8_int64_t *pEpochSec)
 {
     th8_int64_t aTimes[NTP_MAX_SERVERS];
@@ -121560,6 +122120,8 @@ th8NtpQuery(
     if (nServers > NTP_MAX_SERVERS) nServers = NTP_MAX_SERVERS;
     if (timeoutMs <= 0) timeoutMs = NTP_DEFAULT_TIMEOUT_MS;
     if (maxDisagreeSec <= 0) maxDisagreeSec = NTP_DEFAULT_MAX_DISAGREE;
+    if (attempts <= 0) attempts = NTP_DEFAULT_ATTEMPTS;
+    if (attempts > NTP_MAX_ATTEMPTS) attempts = NTP_MAX_ATTEMPTS;
 
 #  if defined(_WIN32)
     if (th8NtpWsaInit() != TH8_OK) {
@@ -121576,7 +122138,8 @@ th8NtpQuery(
     for (i = 0; i < nServers; i++) {
 	th8_int64_t t = 0;
 
-	if (th8NtpQueryOne(interp, azServers[i], timeoutMs, &t) == TH8_OK) {
+	if (th8NtpQueryOne(interp, azServers[i], timeoutMs, attempts, &t) ==
+	    TH8_OK) {
 	    aTimes[nGood++] = t;
 	}
     }
@@ -121891,6 +122454,18 @@ th8HttpsTimeQuery(
 
     *pEpochSec = 0;
 
+    /*
+     * Sensitivity boundary: the URL is transmitted to a remote time
+     * server, so a sensitive value used as (or within) the URL must
+     * never leave the process.  The tag rides in nUrl (the caller
+     * passes argl[] straight through).  Reject before any network work.
+     */
+    if (TH8_SENSITIVE(nUrl)) {
+	Th8_SetResultStatic(
+	    interp, "sensitive value cannot be written", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+
     rc = Th8_RandomBytes(interp, aNonce, TH8_TIME_NONCE_BYTES);
     if (rc != TH8_OK) {
 	Th8_SetResultStatic(
@@ -122165,7 +122740,7 @@ oom:
  *	Query NTP servers for authenticated wall-clock time.
  *	Used as a subcommand of [clock] via the timekeeping plugin.
  *
- *	clock ntp ?-server HOST? ?-timeout MS?
+ *	clock ntp ?-server HOST? ?-timeout MS? ?-attempts N?
  *
  *----------------------------------------------------------------------
  */
@@ -122181,6 +122756,7 @@ th8HarpyClockNtpCommand(
     const char *azServers[8];
     int nServers = 0;
     int timeoutMs = 0;
+    int attempts = 0; /* 0 -> NTP_DEFAULT_ATTEMPTS; 1 disables retries */
     int i;
     th8_int64_t epochSec;
     int rc;
@@ -122191,8 +122767,8 @@ th8HarpyClockNtpCommand(
 	if (argl[i] == 7 && Th8_Memcmp(interp, argv[i], "-server", 7) == 0) {
 	    if (i + 1 >= argc) {
 		return Th8_WrongNumArgs(
-		    interp, "clock ntp ?-server host? "
-		            "?-timeout ms?");
+		    interp, "clock ntp ?-server host? ?-timeout ms? "
+		            "?-attempts n?");
 	    }
 	    i++;
 	    if (nServers < 8) {
@@ -122202,8 +122778,8 @@ th8HarpyClockNtpCommand(
 	    argl[i] == 8 && Th8_Memcmp(interp, argv[i], "-timeout", 8) == 0) {
 	    if (i + 1 >= argc) {
 		return Th8_WrongNumArgs(
-		    interp, "clock ntp ?-server host? "
-		            "?-timeout ms?");
+		    interp, "clock ntp ?-server host? ?-timeout ms? "
+		            "?-attempts n?");
 	    }
 	    i++;
 	    {
@@ -122214,6 +122790,23 @@ th8HarpyClockNtpCommand(
 		}
 		timeoutMs = (int)v;
 	    }
+	} else if (
+	    argl[i] == 9 &&
+	    Th8_Memcmp(interp, argv[i], "-attempts", 9) == 0) {
+	    if (i + 1 >= argc) {
+		return Th8_WrongNumArgs(
+		    interp, "clock ntp ?-server host? ?-timeout ms? "
+		            "?-attempts n?");
+	    }
+	    i++;
+	    {
+		th8_int64_t v;
+
+		if (Th8_ToWideInt(interp, argv[i], argl[i], &v) != TH8_OK) {
+		    return TH8_ERROR;
+		}
+		attempts = (int)v;
+	    }
 	} else {
 	    Th8_ErrorMessage(
 	        interp, "clock ntp: unknown option \"", argv[i], argl[i]);
@@ -122223,7 +122816,7 @@ th8HarpyClockNtpCommand(
 
     rc = th8NtpQuery(
         interp, nServers > 0 ? azServers : NULL, nServers, timeoutMs, 0,
-        &epochSec);
+        attempts, &epochSec);
     if (rc != TH8_OK) return rc;
 
     return Th8_SetResultWideInt(interp, epochSec);
@@ -123671,7 +124264,7 @@ th8CurlGetData(
  */
 
 static Th8_Platform th8CurlPlatformData = {
-    4, /* nVersion */
+    5, /* nVersion */
     0, 0, 0, 0, /* xInitialize, xFinalize, xPreDeleteInterp, xDeleteInterp */
 
     /* Memory */
@@ -123725,6 +124318,9 @@ static Th8_Platform th8CurlPlatformData = {
 
     /* DNS */
     0, 0, /* xDnsResolve, xDnsResolveFree */
+
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
 
     /* Host context */
     0 /* pCtx */
@@ -125429,7 +126025,7 @@ Th8_GetLibcPlatform(void)
     static int bInit = 0;
 
     if (!bInit) {
-	sLibc.nVersion = 4;
+	sLibc.nVersion = 5;
 
 	/* Memory allocation */
 	sLibc.xMalloc = th8LibcMalloc;
@@ -125458,6 +126054,10 @@ Th8_GetLibcPlatform(void)
 
 	/* Math */
 	sLibc.xMathFunc = th8LibcMathFunc;
+
+	/* nVersion 5 adds xStackBackTrace, but that is a compiler-runtime
+	 * facility (not ANSI C), so it lives in th8_unwind.c and is supplied
+	 * by merging th8GetUnwindPlatform(); libc leaves the slot NULL. */
 
 	bInit = 1;
     }
@@ -125538,6 +126138,29 @@ extern Th8_Platform th8GlobalPlatform;
 
 #  if defined(TH8_ENABLE_FAULT_INJECTION)
 extern struct Th8_FaultConfig *th8FaultActiveCfg;
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8PosixSyscallTrip --
+ *
+ *	Report whether the fault-injection layer is currently armed to
+ *	force the syscall identified by op to fail.
+ *
+ * Why / How:
+ *	The POSIX_CALL / POSIX_CALL_PTR macros consult this predicate
+ *	to decide whether to short-circuit a wrapped syscall.  Returns
+ *	true only when a fault config is active and op's corresponding
+ *	bit is set in th8FaultActiveCfg->nFailPosixMask.
+ *
+ * Results:
+ *	Nonzero if op's failure bit is armed; zero otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
 
 static int
 th8PosixSyscallTrip(int op)
@@ -125981,6 +126604,14 @@ th8PosixDataExists(
 }
 
 
+/* <dlfcn.h> included via th8_meta_posix.h */
+
+#  if !defined(TH8_FUZZ_STANDALONE)
+
+static void th8PosixSaveHandle(Th8_Interp *, const char *, size_t, void *);
+
+typedef int (*Th8_LoadInitProc)(Th8_Interp *);
+
 /*
  *----------------------------------------------------------------------
  *
@@ -126025,14 +126656,6 @@ th8PosixDataExists(
  *
  *----------------------------------------------------------------------
  */
-
-/* <dlfcn.h> included via th8_meta_posix.h */
-
-#  if !defined(TH8_FUZZ_STANDALONE)
-
-static void th8PosixSaveHandle(Th8_Interp *, const char *, size_t, void *);
-
-typedef int (*Th8_LoadInitProc)(Th8_Interp *);
 
 static int
 th8PosixLoad(
@@ -126897,7 +127520,7 @@ th8PosixMemset(Th8_Interp *interp, void *pCtx, void *dst, int c, size_t n)
 
 #  if defined(TH8_ENABLE_UNBOUND)
 /* amalgamation: th8_unbound.h already included */
-#line 1423 "src/th8_posix.c"
+#line 1446 "src/th8_posix.c"
 
 /*
  *----------------------------------------------------------------------
@@ -127774,26 +128397,23 @@ th8PosixGetEnv(Th8_Interp *interp, void *pCtx, const char *zName)
 /*
  *----------------------------------------------------------------------
  *
- * th8PosixGetLastError / th8PosixSetLastError --
+ * th8PosixGetLastError --
  *
- *	Implement the Th8_Platform.xGetLastError and
- *	Th8_Platform.xSetLastError callbacks.  Get or set the
- *	per-thread error code.
+ *	Implements the Th8_Platform.xGetLastError callback.  Return
+ *	the current per-thread error code.
  *
  * Why / How:
  *	On POSIX, the "last error" is the thread-local errno
- *	variable.  These trivial wrappers allow the interpreter
- *	to save/restore errno across platform callback boundaries
- *	without directly referencing the POSIX errno macro.  This
- *	abstraction is essential because Win32 uses GetLastError/
- *	SetLastError instead of errno.
+ *	variable.  This trivial wrapper lets the interpreter read
+ *	errno across platform callback boundaries without directly
+ *	referencing the POSIX errno macro.  This abstraction is
+ *	essential because Win32 uses GetLastError instead of errno.
  *
  * Results:
- *	xGetLastError returns the current errno value.
- *	xSetLastError has no return value.
+ *	Returns the current errno value.
  *
  * Side effects:
- *	xSetLastError modifies the thread-local errno.
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -128240,8 +128860,18 @@ th8PosixChannelControl(
 
     (void)interp;
     (void)pCtx;
-    if (fd < 0) {
-	TH8_TRACE_ERR(NULL, "invalid file descriptor");
+    /*
+     * A NULL pChannel maps to fd 0 (stdin) through TH8_PTR2INT, and a
+     * bare `fd < 0` guard would let it through -- a READ would then
+     * block forever on an interactive stdin, a WRITE/CLOSE would target
+     * the process's standard streams.  Real TH8 channels are temp
+     * files with fd >= 3, so reject fd <= 0 (NULL/stdin) as an invalid
+     * channel for every op that USES the descriptor.  OPEN is exempt:
+     * it creates a brand-new fd from a path and ignores the incoming
+     * pChannel, so a NULL/0 fd is expected and valid there.
+     */
+    if (op != TH8_CHANCTL_OPEN && fd <= 0) {
+	TH8_TRACE_ERR(NULL, "invalid channel file descriptor");
 	return TH8_ERROR;
     }
 
@@ -128286,6 +128916,16 @@ th8PosixChannelControl(
 	    if (n < 0) {
 		if (errno == EINTR) continue;
 		TH8_TRACE_ERR(NULL, "write failed in channel");
+		return TH8_ERROR;
+	    }
+	    if (n == 0) {
+		/*
+		 * write() returning 0 with a non-zero count makes no
+		 * forward progress; without this guard `nTotal` would
+		 * never decrease and the loop would spin forever.  Treat
+		 * a zero-length write as a failure rather than hanging.
+		 */
+		TH8_TRACE_ERR(NULL, "zero-length write in channel");
 		return TH8_ERROR;
 	    }
 	    p += n;
@@ -130888,6 +131528,14 @@ th8PosixNormalizePath(
 }
 
 
+#  if defined(__APPLE__)
+#    include <mach-o/dyld.h> /* _NSGetExecutablePath */
+#  endif
+#  if defined(__FreeBSD__)
+#    include <sys/types.h>
+#    include <sys/sysctl.h>
+#  endif
+
 /*
  *----------------------------------------------------------------------
  *
@@ -130925,14 +131573,6 @@ th8PosixNormalizePath(
  *
  *----------------------------------------------------------------------
  */
-
-#  if defined(__APPLE__)
-#    include <mach-o/dyld.h> /* _NSGetExecutablePath */
-#  endif
-#  if defined(__FreeBSD__)
-#    include <sys/types.h>
-#    include <sys/sysctl.h>
-#  endif
 
 static char *
 th8PosixGetExePath(
@@ -131079,7 +131719,7 @@ th8PosixGetExePath(
  */
 
 static Th8_Platform th8PosixPlatformData = {
-    4, /* nVersion */
+    5, /* nVersion */
     th8PosixInitialize, /* xInitialize */
     th8PosixFinalize, /* xFinalize */
 
@@ -131227,6 +131867,14 @@ static Th8_Platform th8PosixPlatformData = {
     0,    /* xDnsResolve */
     0,    /* xDnsResolveFree */
 #  endif
+
+    /* Diagnostics (nVersion 5) -- xStackBackTrace is deliberately left
+       NULL here.  It is supplied by the compiler-runtime th8_unwind layer
+       (_Unwind_Backtrace), merged after the OS layers.  _Unwind_Backtrace is
+       a compiler-runtime facility (not POSIX), so it lives in th8_unwind.c;
+       the only POSIX-adjacent alternative (backtrace() in <execinfo.h>) is
+       glibc-only and not musl-safe, so POSIX adds no native override. */
+    0, /* xStackBackTrace */
 
     /* Host context */
     0 /* pCtx */
@@ -131648,7 +132296,7 @@ th8MacOSMemset(Th8_Interp *interp, void *pCtx, void *dst, int c, size_t n)
 
 
 static Th8_Platform th8MacOSPlatformData = {
-    4,    /* nVersion */
+    5,    /* nVersion */
     th8MacOSInitialize,  /* xInitialize */
     th8MacOSFinalize,  /* xFinalize */
 
@@ -131777,8 +132425,15 @@ static Th8_Platform th8MacOSPlatformData = {
     /* DNS (provided by POSIX merge when TH8_ENABLE_UNBOUND) */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- xStackBackTrace is deliberately left
+       NULL here.  It is supplied by the compiler-runtime th8_unwind layer
+       (_Unwind_Backtrace), merged after the OS layers.  It works uniformly
+       on Apple targets; macOS's native backtrace() (<execinfo.h>) would be
+       functionally equivalent but redundant, so no override is added here. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0   /* pCtx */
+    0 /* pCtx */
 };
 
 
@@ -132055,7 +132710,7 @@ th8IosRandomBytes(Th8_Interp *interp, void *pCtx, void *pBuf, size_t nByte)
  */
 
 static Th8_Platform th8IosPlatformData = {
-    4,    /* nVersion */
+    5,    /* nVersion */
     0,    /* xInitialize  (macOS provides) */
     0,    /* xFinalize    (macOS provides) */
 
@@ -132176,8 +132831,11 @@ static Th8_Platform th8IosPlatformData = {
     /* DNS (libunbound not available on iOS) */
     0, 0,   /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0    /* pCtx */
+    0 /* pCtx */
 };
 
 
@@ -132260,9 +132918,6 @@ Th8_GetIosPlatform(void)
 
 #  include <android/log.h>
 #  include <malloc.h>             /* malloc_usable_size */
-#  include <stdlib.h>
-#  include <string.h>
-#  include <unistd.h>
 
 #  if __ANDROID_API__ >= 28
 #    include <sys/random.h>        /* getrandom */
@@ -132462,7 +133117,7 @@ th8AndroidRandomBytes(
  */
 
 static Th8_Platform th8AndroidPlatformData = {
-    4,    /* nVersion */
+    5,    /* nVersion */
     0,    /* xInitialize */
     0,    /* xFinalize */
 
@@ -132585,8 +133240,11 @@ static Th8_Platform th8AndroidPlatformData = {
     /* DNS (libunbound provided by POSIX merge when enabled) */
     0, 0,   /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0    /* pCtx */
+    0 /* pCtx */
 };
 
 
@@ -136058,6 +136716,105 @@ th8Win32EmitTrace(Th8_Interp *interp, void *pCtx, const char *zMsg)
 }
 
 
+typedef USHORT(
+    WINAPI *RtlCaptureStackBackTraceFunc)(ULONG, ULONG, PVOID *, PULONG);
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8Win32StackBackTrace --
+ *
+ *	Implements the Th8_Platform.xStackBackTrace callback on Windows:
+ *	capture up to nMaxFrames return-address program counters into
+ *	apFrames[], skipping the innermost nSkip frames.  Returns the
+ *	number captured.
+ *
+ * Why / How:
+ *	Uses RtlCaptureStackBackTrace (exported by name from kernel32.dll,
+ *	forwarded to ntdll; available since Windows XP), the Windows
+ *	analogue of the th8_unwind layer's _Unwind_Backtrace.  A native
+ *	Win32 body is required because under MSVC the compiler unwind
+ *	runtime that th8_unwind relies on is absent, so the merged Win32
+ *	platform would otherwise inherit th8_unwind's no-op.  Win32 is
+ *	merged (with the OS layers) BEFORE th8_unwind in
+ *	Th8_UseDefaultPlatform, and MERGE_SLOT only fills a NULL slot, so
+ *	this native entry wins over the compiler-runtime fallback.
+ *
+ *	The symbol is resolved dynamically (mirroring th8Win32RandomBytes'
+ *	handling of RtlGenRandom) because RtlCaptureStackBackTrace is
+ *	inconsistently prototyped across SDKs / MinGW headers.  Unlike the
+ *	RtlGenRandom path this caches the resolved pointer in function-local
+ *	statics and uses GetModuleHandleA rather than LoadLibrary/FreeLibrary:
+ *	this callback runs on EVERY tracked allocation, so per-call loader
+ *	work would be ruinous, and -- critically -- it must not allocate or
+ *	take the loader lock repeatedly while executing inside the allocation
+ *	tracker.  kernel32.dll is always resident, so GetModuleHandleA neither
+ *	loads nor ref-counts it.  The one-time resolution races benignly
+ *	across threads (idempotent pointer-sized writes of the same value);
+ *	bResolved is latched so a failed lookup is not retried every call.
+ *	The capture itself walks the stack without any debug-help library and
+ *	allocates nothing.  Pre-Vista releases cap FramesToSkip +
+ *	FramesToCapture at 62, so the request is clamped to that ceiling.
+ *
+ * Results:
+ *	Number of frames stored (0 on bad arguments, if the symbol cannot be
+ *	resolved, or if the skip count alone reaches the 62-frame ceiling).
+ *
+ * Side effects:
+ *	Populates and latches function-local static caches on first call.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8Win32StackBackTrace(
+    Th8_Interp *interp,
+    void *pCtx,
+    void **apFrames,
+    int nMaxFrames,
+    int nSkip)
+{
+    static RtlCaptureStackBackTraceFunc pFunc = NULL;
+    static int bResolved = 0;
+    ULONG nSkipFrames;
+    ULONG nCapFrames;
+    USHORT nCaptured;
+
+    (void)interp;
+    (void)pCtx;
+    if (apFrames == NULL || nMaxFrames <= 0) {
+	return 0;
+    }
+    if (!bResolved) {
+	HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+	if (hK32) {
+	    pFunc = (RtlCaptureStackBackTraceFunc)
+	        GetProcAddress(hK32, "RtlCaptureStackBackTrace");
+	}
+	bResolved = 1; /* Latch: do not re-probe on every allocation. */
+    }
+    if (pFunc == NULL) {
+	return 0;
+    }
+    nSkipFrames = (nSkip < 0) ? 0 : (ULONG)nSkip;
+    nCapFrames = (ULONG)nMaxFrames;
+
+    /*
+     * RtlCaptureStackBackTrace on pre-Vista releases limits the sum of
+     * FramesToSkip and FramesToCapture to 62; clamp so the call stays
+     * within that ceiling on every supported Windows version.
+     */
+    if (nSkipFrames >= 62) {
+	return 0;
+    }
+    if (nSkipFrames + nCapFrames > 62) {
+	nCapFrames = 62 - nSkipFrames;
+    }
+    nCaptured = pFunc(nSkipFrames, nCapFrames, apFrames, NULL);
+    return (int)nCaptured;
+}
+
+
 /*
  *----------------------------------------------------------------------
  *
@@ -138133,7 +138890,7 @@ th8Win32DnsResolveFree(Th8_Interp *interp, void *pCtx, Th8_DnsResult *pResult)
 
 
 static Th8_Platform th8Win32PlatformData = {
-    4,   /* nVersion */
+    5,   /* nVersion */
 
     /* Lifecycle */
     th8Win32Initialize,  /* xInitialize */
@@ -138245,6 +139002,12 @@ static Th8_Platform th8Win32PlatformData = {
 #  else
     0, 0,
 #  endif
+
+    /* Diagnostics (nVersion 5) -- native RtlCaptureStackBackTrace, since
+       MSVC lacks the _Unwind_Backtrace runtime the th8_unwind layer uses.
+       Win32 is merged before th8_unwind, so this native entry wins over the
+       compiler-runtime no-op fallback. */
+    th8Win32StackBackTrace, /* xStackBackTrace */
 
     /* Host context */
     0 /* pCtx */
@@ -138424,7 +139187,7 @@ th8CosmopolitanMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  */
 
 static Th8_Platform th8CosmopolitanPlatformData = {
-    4,   /* nVersion */
+    5,   /* nVersion */
     0,   /* xInitialize (filled by POSIX merge) */
     0,   /* xFinalize (filled by POSIX merge) */
 
@@ -138553,8 +139316,11 @@ static Th8_Platform th8CosmopolitanPlatformData = {
     /* DNS (filled by POSIX merge) */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0   /* pCtx */
+    0 /* pCtx */
 };
 
 
@@ -139300,6 +140066,10 @@ pt_xPanic(Th8_Interp *i, void *c, const char *zMsg, size_t nMsg)
     if (REAL(c)->xPanic) REAL(c)->xPanic(i, RCTX(c), zMsg, nMsg);
 }
 
+/* Diagnostics -- stack backtrace capture (nVersion 5).  Pure passthrough;
+ * not fault-injected (a failed capture simply yields fewer frames). */
+PT_3(xStackBackTrace, int, void **, int, int)
+
 /* Math/entropy -- xMathFunc and xRandomBytes are fault-injecting
  * (wrappers defined below).  Their passthrough behaviour is the
  * default; bFailMathFunc / bFailRandomBytes flip them to always
@@ -139889,6 +140659,7 @@ th8FaultWireCallbacks(
     pF->xSetLastError = pR->xSetLastError ? pt_xSetLastError : 0;
     pF->xEmitTrace = pR->xEmitTrace ? pt_xEmitTrace : 0;
     pF->xPanic = pR->xPanic ? pt_xPanic : 0;
+    pF->xStackBackTrace = pR->xStackBackTrace ? pt_xStackBackTrace : 0;
 
     /* Math / entropy -- both xMathFunc and xRandomBytes are
      * fault-injecting (bFailMathFunc / bFailRandomBytes flags). */
@@ -139995,6 +140766,7 @@ static const struct th8FaultSlotEntry th8FaultCallbackSlots[] =
      TH8_FAULT_SLOT(xSetLastError),
      TH8_FAULT_SLOT(xEmitTrace),
      TH8_FAULT_SLOT(xPanic),
+     TH8_FAULT_SLOT(xStackBackTrace),
      TH8_FAULT_SLOT(xMathFunc),
      TH8_FAULT_SLOT(xRandomBytes),
      TH8_FAULT_SLOT(xNeedMemory)};
@@ -141698,7 +142470,7 @@ th8EnvKeyValue(
  */
 
 static Th8_Platform th8EnvPlatformData = {
-    4,   /* nVersion */
+    5,   /* nVersion */
     0,
     0,
     0,
@@ -141782,6 +142554,7 @@ static Th8_Platform th8EnvPlatformData = {
     0,   /* xRandomBytes */
     0,
     0,  /* xDnsResolve, xDnsResolveFree */
+    0,  /* xStackBackTrace */
     0   /* pCtx */
 };
 
@@ -142040,8 +142813,10 @@ th8MimallocMalloc(Th8_Interp *interp, void *pCtx, size_t nByte)
 
     if (!th8MiHeap) th8MiHeapInit();
     if (!th8MiHeap) {
-	/* Heap creation failed; fall back to the thread's default. */
-	return mi_heap_calloc(mi_heap_get_default(), 1, nByte);
+	/* Heap creation failed; fall back to the thread's default heap.
+	 * mi_calloc allocates from that heap and is stable across mimalloc
+	 * 2.x/3.x, whereas mi_heap_get_default() was removed in 3.x. */
+	return mi_calloc(1, nByte);
     }
     return mi_heap_calloc(th8MiHeap, 1, nByte);
 }
@@ -142080,8 +142855,10 @@ th8MimallocRealloc(Th8_Interp *interp, void *pCtx, void *p, size_t nByte)
 
     if (!th8MiHeap) th8MiHeapInit();
     if (!th8MiHeap) {
-	mi_heap_t *h = mi_heap_get_default();
-	return p ? mi_heap_realloc(h, p, nByte) : mi_heap_calloc(h, 1, nByte);
+	/* Heap creation failed; fall back to the thread's default heap via
+	 * the top-level mi_realloc/mi_calloc (stable across mimalloc 2.x/3.x;
+	 * mi_heap_get_default() was removed in 3.x). */
+	return p ? mi_realloc(p, nByte) : mi_calloc(1, nByte);
     }
     if (!p) {
 	return mi_heap_calloc(th8MiHeap, 1, nByte);
@@ -142163,7 +142940,7 @@ th8MimallocMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  */
 
 static Th8_Platform th8MimallocPlatformData = {
-    4,    /* nVersion */
+    5,    /* nVersion */
     th8MimallocInit,  /* xInitialize */
     th8MimallocFinal,  /* xFinalize */
 
@@ -142292,8 +143069,11 @@ static Th8_Platform th8MimallocPlatformData = {
     /* DNS */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
+    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    0, /* xStackBackTrace */
+
     /* Host context */
-    0   /* pCtx */
+    0 /* pCtx */
 };
 
 
