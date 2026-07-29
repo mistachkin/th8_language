@@ -125,8 +125,8 @@ typedef struct {
 #define TH8_RC_PATCH_LEVEL   1.0.0.0
 #define TH8_RC_VERSION       1,0,0,0
 
-#define TH8_SOURCE_ID        "237fc964e6c36055"
-#define TH8_SOURCE_TIMESTAMP "2026-07-27 04:37:53"
+#define TH8_SOURCE_ID        "c4e7e512d070b632"
+#define TH8_SOURCE_TIMESTAMP "2026-07-29 02:52:59"
 #define TH8_SOURCE_TAGS      "trunk"
 #define TH8_SOURCE_VCS       "Fossil"
 #endif
@@ -115721,7 +115721,7 @@ th8SecureSave(Th8_Interp *interp, const char *zVar, size_t nVar)
     unsigned char aTag[TH8_SECURE_TAG_SIZE];
     EVP_CIPHER_CTX *ctx = NULL;
     int outLen = 0, tmpLen = 0;
-    int rc = TH8_ERROR;
+    int rc = TH8_ERROR; /* default: every `goto done` is a failure */
     char *zKvKey = NULL;
 
     if (!interp) return TH8_ERROR;
@@ -115765,11 +115765,21 @@ th8SecureSave(Th8_Interp *interp, const char *zVar, size_t nVar)
 
     {
 	Th8_ProtectedRegion *pPR = th8GetProtectedResultRegion(interp);
+	int rcDec;
 	if (!pPR) return TH8_ERROR;
 	Th8_ClearResult(interp);
-	rc = th8SecureDecrypt(
+	/*
+	 * Use a separate result variable (rcDec), NOT rc: rc must stay
+	 * TH8_ERROR so that the encrypt/alloc/RandomBytes failure paths
+	 * below (which reach the shared `done:` epilogue via `goto done`)
+	 * return an error.  Assigning the decrypt result into rc would
+	 * leave rc == TH8_OK for the rest of the function, making a later
+	 * failure return a stale TH8_OK -- the same fail-open defect fixed
+	 * in th8SecureLoad (Bug 71).  Only the final KV_SET sets rc.
+	 */
+	rcDec = th8SecureDecrypt(
 	    interp, pKS, pData, zVar, nVar, pPR, &zPlain, &nPlain);
-	if (rc != TH8_OK) return rc;
+	if (rcDec != TH8_OK) return rcDec;
     }
 
     nPadded = th8SecurePadSize(nPlain);
@@ -115926,7 +115936,8 @@ th8SecureLoad(Th8_Interp *interp, const char *zVar, size_t nVar)
     size_t nCipher;
     EVP_CIPHER_CTX *ctx = NULL;
     int outLen = 0, tmpLen = 0;
-    int rc = TH8_ERROR;
+    int rcGet;
+    int rc = TH8_ERROR; /* default: every `goto done` is a failure */
 
     if (!interp) return TH8_ERROR;
 
@@ -115952,10 +115963,22 @@ th8SecureLoad(Th8_Interp *interp, const char *zVar, size_t nVar)
     Th8_Memcpy(interp, zKvKey + TH8_SECURE_KV_PREFIX_LEN, zVar, nVar);
     zKvKey[TH8_SECURE_KV_PREFIX_LEN + nVar] = '\0';
 
-    /* Retrieve blob from KV store. */
-    rc = Th8_KeyValue(
+    /*
+     * Retrieve blob from KV store.  Use a SEPARATE result variable
+     * (rcGet), NOT rc: rc must stay TH8_ERROR so that every
+     * validation/decrypt failure below (which reaches the shared
+     * `done:` epilogue via `goto done`) returns an error.  A prior
+     * version assigned the GET result into rc, leaving rc == TH8_OK
+     * for the rest of the function; the bad-magic, bad-version,
+     * corrupted-blob, GCM auth-tag-mismatch, and plaintext-length
+     * paths then set an error message but returned TH8_OK (and the
+     * message was even cleared at the tail), so a tampered or
+     * corrupted persisted blob was silently accepted -- defeating
+     * the AES-GCM authentication that exists precisely to detect it.
+     */
+    rcGet = Th8_KeyValue(
         interp, TH8_KV_GET, zKvKey, TH8_SECURE_KV_PREFIX_LEN + nVar, NULL, 0);
-    if (rc != TH8_OK) {
+    if (rcGet != TH8_OK) {
 	Th8_Free(interp, zKvKey);
 	Th8_ErrorMessage(interp, "secure load: not found: \"", zVar, nVar);
 	return TH8_ERROR;
