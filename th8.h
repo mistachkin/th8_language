@@ -5625,6 +5625,7 @@ struct Th8_FaultFilter {
 #  define TH8_POSIX_OP_GETDATA_OPEN  0 /* th8PosixGetData: open() */
 #  define TH8_POSIX_OP_GETDATA_FSTAT 1 /* th8PosixGetData: fstat() */
 #  define TH8_POSIX_OP_GETDATA_READ  2 /* th8PosixGetData: read() */
+#  define TH8_POSIX_OP_RANDOM_READ 3 /* th8PosixRandomBytes: read(urandom) */
 
 typedef struct Th8_FaultConfig Th8_FaultConfig;
 struct Th8_FaultConfig {
@@ -5766,6 +5767,30 @@ struct Th8_FaultConfig {
      * is off.
      */
     th8_uint64_t nFailPosixMask;
+
+    /*
+     * errno the POSIX_CALL()/POSIX_CALL_PTR() wrappers set on a forced
+     * failure.  0 means the default (EIO) -- a deterministic NON-EINTR
+     * value.  A POSITIVE value (e.g. EINTR) drives an error arm that
+     * inspects errno itself, such as a `errno == EINTR` retry branch or
+     * a `errno != EEXIST` discriminator.  A NEGATIVE value is instead a
+     * sentinel for a SHORT read: the wrapper returns 0 (not -1) with
+     * errno untouched, mimicking a zero-byte read() so a read loop's
+     * `nRead == 0` (break) arm can run.  Honored only for ops armed in
+     * nFailPosixMask.
+     */
+    int nFailPosixErrno;
+
+    /*
+     * One-shot mode for nFailPosixMask.  When nonzero, the FIRST forced
+     * failure of an armed op clears that op's mask bit, so the next call
+     * to the same wrapper passes through to the real syscall.  This lets
+     * a test drive a retry loop's error arm exactly once (e.g. a read()
+     * that fails with EINTR and is then retried to completion) instead
+     * of forcing every iteration to fail and spinning forever.  0 keeps
+     * the default always-fail-while-armed behavior.
+     */
+    int nFailPosixOnce;
 
     /* Counters (updated by fault layer). */
     th8_int64_t nAllocCount;

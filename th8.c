@@ -125,8 +125,8 @@ typedef struct {
 #define TH8_RC_PATCH_LEVEL   1.0.0.0
 #define TH8_RC_VERSION       1,0,0,0
 
-#define TH8_SOURCE_ID        "c4e7e512d070b632"
-#define TH8_SOURCE_TIMESTAMP "2026-07-29 02:52:59"
+#define TH8_SOURCE_ID        "5afb7251bd82b7fa"
+#define TH8_SOURCE_TIMESTAMP "2026-08-06 04:37:30"
 #define TH8_SOURCE_TAGS      "trunk"
 #define TH8_SOURCE_VCS       "Fossil"
 #endif
@@ -7999,7 +7999,7 @@ void Th8Shell_SetArgv(
  *----------------------------------------------------------------------
  */
 
-void Th8Shell_EmitResult(Th8_Interp *interp, int rc);
+void Th8Shell_EmitResult(Th8_Interp *interp, int rc, int repl);
 
 
 /*
@@ -28346,10 +28346,40 @@ th8EvalIteration(
     rc = th8SplitCommand(
         interp, pState->zFirst, (size_t)(pState->zInput - pState->zFirst),
         &argv, &argl, &argc, pState->zName, pState->nName);
-    if (rc == TH8_SUSPEND || rc == TH8_YIELD) {
+    if (rc == TH8_SUSPEND) {
 	/*
-	 * Suspension or yield detected during word splitting.
-	 * Propagate -- th8EvalCleanup handles it.
+	 * Freeze detected during word splitting -- a debug breakpoint
+	 * (R-54392) or an async Th8_Freeze -- BEFORE this command was
+	 * dispatched.  This is the boundary Th8_Ready in th8SplitCommand;
+	 * th8SplitCommand allocates no argv on the suspend path, so there
+	 * is nothing to free.  To honor "resume from the exact point of
+	 * suspension", rewind pState to the START of the current command
+	 * (this iteration's top scan already advanced pState->zInput to
+	 * the command's END) and push a fresh th8EvalIteration.  After
+	 * Th8_Thaw re-attaches and drains the suspended chain, iteration
+	 * re-processes this not-yet-run command and everything after it.
+	 * Without the rewind + re-push, only the bottom cleanup callbacks
+	 * survive the suspend-detach, silently dropping every remaining
+	 * command (the deeper half of Bug 73).  The newline preceding the
+	 * command was consumed before zFirst, so the re-scan does not
+	 * re-count it.
+	 */
+
+	pState->nInput += (size_t)(pState->zInput - pState->zFirst);
+	pState->zInput = pState->zFirst;
+	if (Th8_NRAddCallback(interp, th8EvalIteration, pState, 0, 0, 0) !=
+	    TH8_OK) {
+	    /* Push failed: the cleanup callback below us still frees
+	     * pState when the caller drains the chain. */
+	    return TH8_ERROR;
+	}
+	return TH8_SUSPEND;
+    }
+    if (rc == TH8_YIELD) {
+	/*
+	 * Defensive: word splitting itself does not yield (yield is a
+	 * command that suspends from dispatch, where the continuation is
+	 * already on the chain).  Propagate -- th8EvalCleanup handles it.
 	 */
 
 	return rc;
@@ -29414,7 +29444,7 @@ th8_spilornis_memsize(void *p)
  * so that Spilornis.h's prototypes use the correct se_* types.
  */
 /* amalgamation: th8_spilornis.h already included */
-#line 16086 "src/th8_core.c"
+#line 16116 "src/th8_core.c"
 /************** Begin file Spilornis.h *************/
 #line 1 "bin/Spilornis.h"
 /*
@@ -29612,7 +29642,7 @@ EAGLE_EXTERN se_HANDLE	Eagle_SetMemoryHeap(se_HANDLE hNewHeap);
 #endif /* _SPILORNIS_H_ */
 
 /************** End of Spilornis.h *************/
-#line 16087 "src/th8_core.c"
+#line 16117 "src/th8_core.c"
 
 /*
  *----------------------------------------------------------------------
@@ -36446,7 +36476,7 @@ th8EvalCommon(
 	}
 
 	if ((rc == TH8_SUSPEND || rc == TH8_YIELD) &&
-	    ALWAYS(interp->pCallbacks != pBottom)) {
+	    interp->pCallbacks != pBottom) {
 	    /*
 	     * Suspend or yield: detach the remaining callbacks
 	     * from the chain and save them on the interpreter.
@@ -36455,9 +36485,28 @@ th8EvalCommon(
 	     * the coroutine resume (for yield) re-attaches and
 	     * drains them.
 	     *
+	     * The `pCallbacks != pBottom` test is a REAL runtime
+	     * check, NOT an invariant -- do not wrap it in ALWAYS
+	     * (Bug 73).  th8EvalLocal can return TH8_SUSPEND from its
+	     * entry readiness check (PHASE 3) BEFORE pushing any NRE
+	     * callbacks -- e.g. freeze-on-break, or any bSuspended
+	     * pending when a nested eval begins.  In that case nothing
+	     * was pushed above pBottom, so pCallbacks == pBottom and
+	     * there is nothing to detach: skip the block, leaving
+	     * pSuspendedCallbacks untouched (Th8_Thaw then correctly
+	     * finds nothing to resume, since no command ran).  Wrapping
+	     * this in ALWAYS made it a constant-true in the omit build,
+	     * so the block ran with an empty segment, the walk below ran
+	     * off the end of the chain, and the (equally mis-wrapped)
+	     * ALWAYS(pTail->pNext) failed to stop the NULL deref.
+	     *
 	     * We must NULL-terminate the detached chain by
 	     * finding the callback just before pBottom and
-	     * setting its pNext to NULL.
+	     * setting its pNext to NULL.  Here pCallbacks != pBottom
+	     * is established, and by construction the pushed segment is
+	     * a prefix that terminates at pBottom, so pBottom is always
+	     * reachable before NULL -- ALWAYS(pTail->pNext) below is a
+	     * genuine invariant given that guarantee.
 	     */
 
 	    {
@@ -47016,17 +47065,22 @@ catch_posteval(Th8_Interp *interp, void *pData[], int rc)
  *
  * break_command --
  *
- *	Terminate the innermost loop.
+ *	Terminate the innermost loop, optionally supplying a result.
  *
- *	break
+ *	break ?string?
  *
  * Why / How:
- *	Implements the Tcl [break] command.  Simply returns
- *	TH8_BREAK, which is caught by the enclosing loop command
- *	(while, for, foreach) to terminate iteration.
+ *	Implements the Tcl [break] command.  Returns TH8_BREAK, which
+ *	is caught by the enclosing loop command (while, for, foreach)
+ *	to terminate iteration.  When the optional ?string? argument
+ *	is supplied it becomes the interpreter result; that result is
+ *	visible to a [catch] that traps the break directly.  An
+ *	enclosing loop discards it -- the loop resets the result to
+ *	the empty string on TH8_BREAK -- so the loop itself still
+ *	returns "".  This mirrors Eagle's [break ?string?] extension.
  *
  * Results:
- *	TH8_BREAK.
+ *	TH8_BREAK.  Sets the interpreter result to ?string? when given.
  *
  * Side effects:
  *	None.
@@ -47042,8 +47096,11 @@ break_command(
     const char **argv,  /* Argument values. */
     size_t *argl)  /* Argument lengths. */
 {
-    if (argc != 1) {
-	return Th8_WrongNumArgs(interp, "break");
+    if (argc > 2) {
+	return Th8_WrongNumArgs(interp, "break ?string?");
+    }
+    if (argc == 2) {
+	Th8_SetResult(interp, argv[1], argl[1]);
     }
     return TH8_BREAK;
 }
@@ -47054,17 +47111,23 @@ break_command(
  *
  * continue_command --
  *
- *	Skip to the next loop iteration.
+ *	Skip to the next loop iteration, optionally supplying a result.
  *
- *	continue
+ *	continue ?string?
  *
  * Why / How:
- *	Implements the Tcl [continue] command.  Simply returns
- *	TH8_CONTINUE, which is caught by the enclosing loop command
- *	(while, for, foreach) to skip to the next iteration.
+ *	Implements the Tcl [continue] command.  Returns TH8_CONTINUE,
+ *	which is caught by the enclosing loop command (while, for,
+ *	foreach) to skip to the next iteration.  When the optional
+ *	?string? argument is supplied it becomes the interpreter
+ *	result; that result is visible to a [catch] that traps the
+ *	continue directly.  An enclosing loop discards it (the loop
+ *	resets the result to the empty string when it resumes), so it
+ *	does not affect the loop's own value.  This mirrors Eagle's
+ *	[continue ?string?] extension.
  *
  * Results:
- *	TH8_CONTINUE.
+ *	TH8_CONTINUE.  Sets the interpreter result to ?string? when given.
  *
  * Side effects:
  *	None.
@@ -47080,8 +47143,11 @@ continue_command(
     const char **argv,  /* Argument values. */
     size_t *argl)  /* Argument lengths. */
 {
-    if (argc != 1) {
-	return Th8_WrongNumArgs(interp, "continue");
+    if (argc > 2) {
+	return Th8_WrongNumArgs(interp, "continue ?string?");
+    }
+    if (argc == 2) {
+	Th8_SetResult(interp, argv[1], argl[1]);
     }
     return TH8_CONTINUE;
 }
@@ -127601,16 +127667,63 @@ extern struct Th8_FaultConfig *th8FaultActiveCfg;
  * th8PosixSyscallTrip --
  *
  *	Report whether the fault-injection layer is currently armed to
- *	force the syscall identified by op to fail.
+ *	force the syscall identified by op to fail, consuming a
+ *	one-shot arming in the process.
  *
  * Why / How:
  *	The POSIX_CALL / POSIX_CALL_PTR macros consult this predicate
  *	to decide whether to short-circuit a wrapped syscall.  Returns
  *	true only when a fault config is active and op's corresponding
- *	bit is set in th8FaultActiveCfg->nFailPosixMask.
+ *	bit is set in th8FaultActiveCfg->nFailPosixMask.  When the
+ *	config requests one-shot mode (nFailPosixOnce), a trip clears
+ *	op's arming bit so the NEXT call to the same wrapper passes
+ *	through -- letting a retry loop's error arm run exactly once
+ *	instead of forcing every iteration to fail.
  *
  * Results:
  *	Nonzero if op's failure bit is armed; zero otherwise.
+ *
+ * Side effects:
+ *	In one-shot mode, clears op's bit in nFailPosixMask on a trip.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8PosixSyscallTrip(int op)
+{
+    if (th8FaultActiveCfg == NULL) {
+	return 0;
+    }
+    if ((th8FaultActiveCfg->nFailPosixMask & ((th8_uint64_t)1 << op)) == 0) {
+	return 0;
+    }
+    if (th8FaultActiveCfg->nFailPosixOnce) {
+	th8FaultActiveCfg->nFailPosixMask &= ~((th8_uint64_t)1 << op);
+    }
+    return 1;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8PosixFaultErrno --
+ *
+ *	Return the errno value a forced POSIX_CALL failure should set.
+ *
+ * Why / How:
+ *	Defaults to EIO -- a deterministic NON-EINTR value that mimics
+ *	a real syscall error and avoids a stale errno accidentally
+ *	reading as EINTR (which would send a `nRead < 0 && errno ==
+ *	EINTR` retry loop spinning forever).  A test overrides it via a
+ *	POSITIVE nFailPosixErrno to drive an error arm that inspects
+ *	errno itself -- e.g. forcing EINTR (with one-shot mode) to run
+ *	a retry branch, or a non-EEXIST value for an `errno != EEXIST`
+ *	discriminator.  (A NEGATIVE nFailPosixErrno instead requests a
+ *	short read; see th8PosixFaultShort -- it is not an errno.)
+ *
+ * Results:
+ *	The configured nFailPosixErrno if POSITIVE, else EIO.
  *
  * Side effects:
  *	None.
@@ -127619,22 +127732,55 @@ extern struct Th8_FaultConfig *th8FaultActiveCfg;
  */
 
 static int
-th8PosixSyscallTrip(int op)
+th8PosixFaultErrno(void)
 {
-    return th8FaultActiveCfg != NULL &&
-           (th8FaultActiveCfg->nFailPosixMask & ((th8_uint64_t)1 << op)) != 0;
+    if (th8FaultActiveCfg != NULL && th8FaultActiveCfg->nFailPosixErrno > 0) {
+	return th8FaultActiveCfg->nFailPosixErrno;
+    }
+    return EIO;
 }
 
 /*
- * On a forced failure, set errno to a deterministic NON-EINTR
- * value (EIO).  This both mimics a real syscall error and avoids
- * a stale errno accidentally reading as EINTR, which would send a
- * retry loop (`nRead < 0 && errno == EINTR`) spinning forever.
+ *----------------------------------------------------------------------
+ *
+ * th8PosixFaultShort --
+ *
+ *	Report whether a forced POSIX_CALL failure should be a SHORT
+ *	result (return 0) rather than an error (return -1).
+ *
+ * Why / How:
+ *	A NEGATIVE nFailPosixErrno is the sentinel for short-result
+ *	mode: the wrapper returns 0 with errno untouched, mimicking a
+ *	premature end-of-file / zero-byte read().  This drives the
+ *	`nRead == 0` side of a read loop's `nRead < 0 && errno ==
+ *	EINTR` decision (the C1=F, break arm) -- unreachable with the
+ *	-1/error faults.  Only meaningful for read-like ops (0 is a
+ *	distinguished return there); do not arm it for open/PTR ops.
+ *
+ * Results:
+ *	Nonzero if short-result mode is armed; zero otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
+
+static int
+th8PosixFaultShort(void)
+{
+    return th8FaultActiveCfg != NULL &&
+           th8FaultActiveCfg->nFailPosixErrno < 0;
+}
+
 #    define POSIX_CALL(op, expr)                                             \
-	(th8PosixSyscallTrip(op) ? (errno = EIO, -1) : (expr))
+	(th8PosixSyscallTrip(op)                                             \
+	     ? (th8PosixFaultShort() ? 0                                     \
+	                             : (errno = th8PosixFaultErrno(), -1))   \
+	     : (expr))
 #    define POSIX_CALL_PTR(op, expr)                                         \
-	(th8PosixSyscallTrip(op) ? (errno = EIO, (void *)0) : (expr))
+	(th8PosixSyscallTrip(op) ? (errno = th8PosixFaultErrno(), (void *)0) \
+	                         : (expr))
 #  else
 #    define POSIX_CALL(op, expr)     (expr)
 #    define POSIX_CALL_PTR(op, expr) (expr)
@@ -128976,7 +129122,7 @@ th8PosixMemset(Th8_Interp *interp, void *pCtx, void *dst, int c, size_t n)
 
 #  if defined(TH8_ENABLE_UNBOUND)
 /* amalgamation: th8_unbound.h already included */
-#line 1446 "src/th8_posix.c"
+#line 1526 "src/th8_posix.c"
 
 /*
  *----------------------------------------------------------------------
@@ -129506,7 +129652,8 @@ th8PosixRandomBytes(Th8_Interp *interp, void *pCtx, void *pBuf, size_t nByte)
 	    size_t nLeft = nByte;
 
 	    while (nLeft > 0) {
-		nRead = read(fd, pRd, nLeft);
+		nRead = POSIX_CALL(
+		    TH8_POSIX_OP_RANDOM_READ, read(fd, pRd, nLeft));
 		if (nRead > 0) {
 		    pRd += nRead;
 		    nLeft -= (size_t)nRead;
@@ -141966,6 +142113,8 @@ Th8_FaultConfigInit(Th8_FaultConfig *pCfg)
     pCfg->nCacheLookupSkip = 0;
     pCfg->nFailOsslMask = 0;
     pCfg->nFailPosixMask = 0;
+    pCfg->nFailPosixErrno = 0;
+    pCfg->nFailPosixOnce = 0;
     {
 	int j;
 	for (j = 0; j < (int)sizeof(pCfg->aForceRandomBytes); j++) {
