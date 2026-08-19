@@ -125,8 +125,8 @@ typedef struct {
 #define TH8_RC_PATCH_LEVEL   1.0.0.0
 #define TH8_RC_VERSION       1,0,0,0
 
-#define TH8_SOURCE_ID        "5afb7251bd82b7fa"
-#define TH8_SOURCE_TIMESTAMP "2026-08-06 04:37:30"
+#define TH8_SOURCE_ID        "81bc756525898ea1"
+#define TH8_SOURCE_TIMESTAMP "2026-08-19 03:38:54"
 #define TH8_SOURCE_TAGS      "trunk"
 #define TH8_SOURCE_VCS       "Fossil"
 #endif
@@ -227,6 +227,40 @@ TH8_INTERNAL void th8MiHeapDone(void);
 #endif
 
 /*
+ * th8MallocCommon --
+ *	The single limit-checked, zero-filled, accounted allocation core
+ *	behind Th8_Malloc / Th8_AttemptMalloc / Th8_SafeAlloc.  Exposed so the
+ *	built-in xNeedMemory second-chance callback (th8_mem.c) can delegate to
+ *	it and thereby share ONE owner for the per-interpreter memory-limit
+ *	check and nAllocBytes/nAllocPeak accounting (TH8K-023).  It does NOT
+ *	itself invoke xNeedMemory, so a callback calling it cannot recurse.
+ */
+TH8_INTERNAL void *th8MallocCommon(
+    Th8_Interp *interp,
+    size_t nByte,
+    int bPanic,
+    const char *zFile,
+    int nLine);
+
+#if defined(TH8_ENABLE_CRYPTOGRAPHY)
+/*
+ * th8VerifyAnchorSig (th8_time.c) -- verify a DNS trust-anchor file's raw
+ * bytes against its detached ".b64sig" using a compiled-in trusted key
+ * (keyRoot, or keyTest in ENABLE_TEST_KEY builds).  Called by the libunbound
+ * integration to authenticate a TH8-DOMAIN anchor (the bundled module-adjacent
+ * root.key, or a TH8_DNS_ROOT_KEY file) before it is handed to the validator.
+ * The caller reads both files RAW (not via the signed-only policy) and passes
+ * the bytes; this routine owns only its own temporary buffers.
+ */
+TH8_INTERNAL int th8VerifyAnchorSig(
+    Th8_Interp *interp,
+    const char *zAnchor,
+    size_t nAnchor,
+    const char *zSig,
+    size_t nSig);
+#endif
+
+/*
  * NOTE: This is the flag set by Th8_EvalTrusted to signal to the
  *       policy callback(s) that the script is implicitly trusted
  *       by the embedder.  It should be noted that this only works
@@ -234,6 +268,24 @@ TH8_INTERNAL void th8MiHeapDone(void);
  */
 
 #define TH8_EVAL_TRUSTED ((int)0x01)
+
+/*
+ * TH8_CR_CANCELED --
+ *
+ *	The "canceled" bit in interp->nCancelReq (TH8K-008).  A cancellation
+ *	request is one atomic word = TH8_CR_CANCELED | (flags & (UNWIND|SIGNAL)),
+ *	OR-published by any thread.  The bit is chosen ABOVE the public cancel
+ *	flag bits (TH8_CANCEL_UNWIND=0x01, TH8_CANCEL_SIGNAL=0x02) so the flags
+ *	can ride in the same word without colliding.
+ */
+#define TH8_CR_CANCELED ((int)0x100)
+
+/*
+ * TH8_CANCEL_FLAG_MASK --
+ *
+ *	The request-flag bits carried alongside TH8_CR_CANCELED in nCancelReq.
+ */
+#define TH8_CANCEL_FLAG_MASK ((int)(TH8_CANCEL_UNWIND | TH8_CANCEL_SIGNAL))
 
 /*
  * TH8_ASSERT_RAW_LEN(n) --
@@ -297,6 +349,88 @@ typedef struct Th8_AsyncState Th8_AsyncState;
 #endif
 
 /* ====================================================================
+ * Platform buffer sizes
+ * ==================================================================== */
+
+/*
+ * TH8_PATH_MAX --
+ *
+ *	Maximum length, in bytes (POSIX) or wide characters (Win32), of a
+ *	filesystem path the platform layer holds in a fixed stack buffer.
+ *	Sized to one page so the common case never allocates; a path that
+ *	would exceed it is rejected, not truncated.  This is TH8's own
+ *	bound, deliberately independent of the system PATH_MAX (which is
+ *	unavailable or effectively unbounded on some hosts).
+ */
+#define TH8_PATH_MAX 4096
+
+/*
+ * TH8_IO_BUFSIZE --
+ *
+ *	Size, in bytes (or wide characters), of the fixed stack buffer the
+ *	platform layer uses for one line-oriented I/O chunk -- the [gets]
+ *	read loop and the console read/write conversion buffers.  Distinct
+ *	from TH8_PATH_MAX: it bounds an I/O transfer unit, not a path.  The
+ *	Win32 console read path allocates TH8_IO_BUFSIZE * 3 bytes for the
+ *	worst-case UTF-8 expansion of a BMP-only line.
+ */
+#define TH8_IO_BUFSIZE 4096
+
+/*
+ * TH8_PATH_STACK --
+ *
+ *	Size of the on-stack scratch buffer the platform layer uses to
+ *	NUL-terminate a caller-supplied path before use.  A path longer
+ *	than this falls back to a heap allocation, so it is a fast-path
+ *	size, not a hard limit.  Smaller than TH8_PATH_MAX because the
+ *	input name is usually short, while the fully resolved/absolute
+ *	form (TH8_PATH_MAX) is what needs the full page.
+ */
+#define TH8_PATH_STACK 1024
+
+/*
+ * TH8_ENV_STACK --
+ *
+ *	Size of the on-stack scratch buffer used to NUL-terminate an
+ *	environment variable name, value, or list key before a native
+ *	getenv/setenv call; a longer string falls back to a heap
+ *	allocation.  A fast-path size, not a hard limit.
+ */
+#define TH8_ENV_STACK 256
+
+/*
+ * TH8_LOAD_LIB_MAX / TH8_LOAD_SYM_MAX --
+ *
+ *	Maximum lengths of the library-path and symbol-name parts of a
+ *	[load] "library:symbol" specifier that the platform loader copies
+ *	into fixed stack buffers (dlopen/dlsym on POSIX,
+ *	LoadLibrary/GetProcAddress on Win32).
+ */
+#define TH8_LOAD_LIB_MAX 1024
+#define TH8_LOAD_SYM_MAX 256
+
+/*
+ * TH8_COPY_BUFSIZE --
+ *
+ *	Transfer-chunk size for the platform file-copy loop (one
+ *	read()/write() block).  A throughput/stack tradeoff, not a limit
+ *	on the total file size.
+ */
+#define TH8_COPY_BUFSIZE 8192
+
+/*
+ * TH8_PATH_SEG_MAX / TH8_CWD_SEG_MAX --
+ *
+ *	Maximum number of "/"-separated components a manual path resolver
+ *	splits a path into before rejecting it as too deep.
+ *	TH8_PATH_SEG_MAX (512) bounds the general normalize-path resolver;
+ *	TH8_CWD_SEG_MAX (256) bounds the CWD-relative absolute resolver.
+ *	The two limits differ for historical reasons (see th8_posix.c).
+ */
+#define TH8_PATH_SEG_MAX 512
+#define TH8_CWD_SEG_MAX  256
+
+/* ====================================================================
  * Internal platform wrappers (th8_plat.c)
  * ==================================================================== */
 
@@ -349,6 +483,38 @@ TH8_INTERNAL void th8MemBarrier(Th8_Interp *interp);
 TH8_INTERNAL void th8GlobalMutexEnter(Th8_Interp *interp);
 /* Leave process-global mutex -- internal */
 TH8_INTERNAL void th8GlobalMutexLeave(Th8_Interp *interp);
+
+/* ====================================================================
+ * Thread-affinity contract (th8_core.c)
+ *
+ * Every Th8_* API except the documented thread-safe exceptions
+ * (Th8_CancelEval, the event-queue family, Th8_GetThreadId,
+ * Th8_GetInterpThreadId, Th8_ThreadInit/Done) MUST be called on the
+ * interpreter's owning thread -- the thread that created it.  The
+ * owning-thread id is captured in Th8_CreateInterp and read/written
+ * only through the 64-bit interlocked CAS.
+ * ==================================================================== */
+
+/* Return non-zero if the caller may operate on interp under the
+ * affinity contract (owns it, or affinity cannot be enforced because
+ * the platform reports no thread ids).  Used only by TH8_ASSERT_OWNER;
+ * see Th8_GetInterpThreadId -- internal */
+TH8_INTERNAL int th8CheckThreadOwner(Th8_Interp *interp);
+
+/*
+ * TH8_ASSERT_OWNER(interp) --
+ *	Debug-only assertion that the calling thread owns interp.  In
+ *	debug builds it aborts (assert) if a foreign thread calls an
+ *	owning-thread-only API; in release / coverage builds it compiles
+ *	to nothing.  A NULL interp or a host without thread-id support
+ *	passes silently (see th8CheckThreadOwner).
+ */
+#if defined(TH8_DEBUG) && !defined(TH8_OMIT_AUXILIARY_SAFETY_CHECKS)
+#  include <assert.h>
+#  define TH8_ASSERT_OWNER(interp) assert(th8CheckThreadOwner(interp))
+#else
+#  define TH8_ASSERT_OWNER(interp) ((void)0)
+#endif
 
 /* ====================================================================
  * Event queue + per-pState manual-reset event handle (th8_core.c)
@@ -456,7 +622,7 @@ TH8_INTERNAL int th8IsBinDig(int c);
 
 #if __has_include("th8_version_gen.h")
 /* amalgamation: th8_version_gen.h already included */
-#line 323 "src/th8_int.h"
+#line 489 "src/th8_int.h"
 #else
 #  ifndef TH8_SOURCE_ID
 #    define TH8_SOURCE_ID "unknown"
@@ -552,7 +718,13 @@ TH8_INTERNAL int th8IsBinDig(int c);
 void th8CleanupPackages(Th8_Interp *interp);
 #endif
 #if defined(TH8_ENABLE_EXPRESSIONS)
-void th8RegisterMathFuncs(Th8_Interp *interp);
+int th8RegisterMathFuncs(Th8_Interp *interp);
+/* Named command subsets (TH8K-025): resolve/register one built-in math function
+ * by name.  th8FindMathFunc is a pure lookup (1/0); th8RegisterOneMathFunc
+ * registers a found name (no-op if unknown), TH8_ERROR on OOM. */
+int th8FindMathFunc(Th8_Interp *interp, const char *zName, size_t nName);
+int
+th8RegisterOneMathFunc(Th8_Interp *interp, const char *zName, size_t nName);
 #endif
 
 /*
@@ -614,7 +786,7 @@ int th8NextCommand(Th8_Interp *interp, const char *z, size_t n, size_t *pLen);
 #  elif defined(__GNUC__) || defined(__clang__)
 #    define TH8_THREAD_LOCAL __thread
 #  else
-#    define TH8_THREAD_LOCAL  /* fallback: no TLS */
+#    define TH8_THREAD_LOCAL /* fallback: no TLS */
 #  endif
 #endif
 
@@ -674,6 +846,14 @@ void th8BigintDestroy(Th8_Interp *interp, Th8_Bigint *pBigint);
  */
 void th8BigintSetup(Th8_Interp *interp);
 void th8BigintTeardown(void);
+
+/*
+ * th8ScanBignum (th8_bigint.c) -- parse a signed, optionally radix-prefixed
+ * integer string as an arbitrary-precision value and set the interpreter
+ * result to its decimal form.  Used by the `scan` command's `ll` size
+ * modifier (BigInt storage).
+ */
+int th8ScanBignum(Th8_Interp *interp, const char *zStr, size_t n);
 #endif
 
 /*
@@ -690,10 +870,10 @@ void th8BigintTeardown(void);
 
 typedef struct Th8_CacheEntry Th8_CacheEntry;
 struct Th8_CacheEntry {
-    int cacheType;  /* TH8_CACHE_* that was requested. */
-    char *zOriginal;  /* Copy of original input (owned). */
-    size_t nOriginal;  /* Byte length of zOriginal. */
-    Th8_Value value;  /* The cached value (inline). */
+    int cacheType; /* TH8_CACHE_* that was requested. */
+    char *zOriginal; /* Copy of original input (owned). */
+    size_t nOriginal; /* Byte length of zOriginal. */
+    Th8_Value value; /* The cached value (inline). */
     /*
      * For TH8_CACHE_LIST: the split-list result in Th8_SplitList
      * format so callers can borrow it directly.
@@ -704,9 +884,9 @@ struct Th8_CacheEntry {
      * outside the union so that they survive when a different
      * union member is active.  Owned by the cache entry.
      */
-    char **azListElem;  /* Element string pointers (owned). */
-    size_t *anListElem;  /* Element byte lengths. */
-    int nListElem;  /* Number of elements. */
+    char **azListElem; /* Element string pointers (owned). */
+    size_t *anListElem; /* Element byte lengths. */
+    int nListElem; /* Number of elements. */
 };
 
 /*
@@ -780,33 +960,40 @@ int th8ResolveNsPattern(
 typedef struct Th8_Namespace Th8_Namespace;
 #endif
 struct Th8_Namespace {
-    char *zName;  /* Fully qualified name including the
+    char *zName; /* Fully qualified name including the
 				 * leading "::" (e.g. "::foo::bar").
 				 * For the global namespace, zName is
 				 * "::".  Owned; freed by
 				 * th8FreeNamespace. */
-    size_t nName;  /* Byte length of zName (not including
+    size_t nName; /* Byte length of zName (not including
 				 * the NUL terminator). */
     Th8_Namespace *pParent; /* Parent namespace in the tree.
 				 * NULL only for the global namespace. */
-    Th8_Hash *paChild;  /* Child namespaces (simple tail name
+    int nDepth; /* Nesting depth (global = 0, each child =
+				 * parent + 1).  Bounded at creation by
+				 * TH8_MX_NS_DEPTH so the recursive
+				 * th8FreeNamespace teardown cannot
+				 * overflow the native stack (TH8K-011). */
+    Th8_Hash *paChild; /* Child namespaces (simple tail name
 				 * -> Th8_Namespace*).  Created eagerly
 				 * when the namespace is created. */
-    Th8_Hash *paCmd;  /* Commands in this namespace (simple
+    Th8_Hash *paCmd; /* Commands in this namespace (simple
 				 * name -> Th8_Command*). */
 #if defined(TH8_ENABLE_VARIABLES)
-    Th8_Hash *paVar;  /* Namespace-scoped variables (simple
+    Th8_Hash *paVar; /* Namespace-scoped variables (simple
 				 * name -> Th8_Variable*).
 				 * FUTURE: integrate with frame vars. */
 #endif
-    char *zExport;  /* Space-separated list of export
+    char *zExport; /* Space-separated list of export
 				 * glob patterns, or NULL if none.
 				 * Set by [namespace export]. */
-    size_t nExport;  /* Byte length of zExport. */
+    size_t nExport; /* Byte length of zExport. */
     Th8_Hash *paExpansion; /* Expansion operators: tag name ->
 				 * Th8_ExpansionEntry*.  NULL until
 				 * the first operator is registered
 				 * in this namespace. */
+    Th8_Namespace *pPendingNext; /* Intrusive deferred-delete FIFO link
+				 * (TH8K-007); NULL unless queued. */
 };
 
 Th8_Namespace *th8FindNamespace(
@@ -814,6 +1001,22 @@ Th8_Namespace *th8FindNamespace(
     const char *zName,
     size_t nName,
     int bCreate);
+
+/*
+ * th8CommandSubCommands returns a command's per-interpreter sub-command hash
+ * (name -> Th8_SubCmd), or NULL if the command is unknown or is not an
+ * ensemble.  Used by [info subcommands] so introspection enumerates exactly
+ * what the evaluator dispatches (never a stale static catalogue).
+ */
+Th8_Hash *
+th8CommandSubCommands(Th8_Interp *interp, const char *zName, size_t nName);
+
+/*
+ * th8CommandExists is a silent presence check (sets no result): 1 if a command
+ * named zName is registered, else 0.  Used by named command subsets to avoid
+ * re-registering a command (which would replace and wipe an ensemble).
+ */
+int th8CommandExists(Th8_Interp *interp, const char *zName, size_t nName);
 
 /*
  * Secure variable hooks (defined in crypto/th8_secure.c).
@@ -828,18 +1031,18 @@ Th8_Namespace *th8FindNamespace(
 #if defined(TH8_PLUGIN_PROCEDURES)
 typedef struct Th8_ProcDefn Th8_ProcDefn;
 struct Th8_ProcDefn {
-    int nParam;   /* Number of formal params (not args) */
-    char **azParam;  /* Parameter names */
-    size_t *anParam;  /* Parameter name lengths */
-    char **azDefault;  /* Default values (NULL = required) */
-    size_t *anDefault;  /* Default value lengths */
-    int hasArgs;  /* True if last param is "args" */
-    char *zProgram;  /* Proc body */
-    size_t nProgram;  /* Body length */
-    char *zUsage;  /* Usage message (separate allocation) */
-    size_t nUsage;  /* Usage message length */
-    size_t nAllocSize;  /* Total size of this allocation block. */
-    void *pDefNs;  /* Defining namespace (Th8_Namespace*). */
+    int nParam; /* Number of formal params (not args) */
+    char **azParam; /* Parameter names */
+    size_t *anParam; /* Parameter name lengths */
+    char **azDefault; /* Default values (NULL = required) */
+    size_t *anDefault; /* Default value lengths */
+    int hasArgs; /* True if last param is "args" */
+    char *zProgram; /* Proc body */
+    size_t nProgram; /* Body length */
+    char *zUsage; /* Usage message (separate allocation) */
+    size_t nUsage; /* Usage message length */
+    size_t nAllocSize; /* Total size of this allocation block. */
+    void *pDefNs; /* Defining namespace (Th8_Namespace*). */
 };
 int th8ProcCall1(Th8_Interp *, void *, int, const char **, size_t *);
 int th8NprocCall1(Th8_Interp *, void *, int, const char **, size_t *);
@@ -889,13 +1092,25 @@ extern const Th8_SubCommand *th8_package_aSub;
 
 typedef struct Th8_PkgInfo Th8_PkgInfo;
 struct Th8_PkgInfo {
-    char *zVersion;  /* Provided version (or NULL) */
+    char *zVersion; /* Provided version (or NULL) */
     size_t nVersion;
     Th8_Hash *paIfNeeded; /* Version -> ifneeded script hash */
 };
 #endif
 #if defined(TH8_PLUGIN_STRINGS)
 extern const Th8_SubCommand *th8_string_aSub;
+#endif
+#if defined(TH8_PLUGIN_MANAGEMENT)
+extern const Th8_SubCommand *th8_interp_aSub;
+#endif
+#if defined(TH8_PLUGIN_BINARY)
+extern const Th8_SubCommand *th8_binary_aSub;
+#endif
+#if defined(TH8_PLUGIN_LISTS)
+extern const Th8_SubCommand *th8_dict_aSub;
+#endif
+#if defined(TH8_PLUGIN_TIMEKEEPING)
+extern const Th8_SubCommand *th8_clock_aSub;
 #endif
 
 #if defined(TH8_ENABLE_CRYPTOGRAPHY)
@@ -1317,6 +1532,13 @@ TH8_INTERNAL void th8TestRsaKeyRestorePubBlob(
     Th8_RsaKey *pKey,
     unsigned char *pSavedBlob,
     size_t nSaved);
+TH8_INTERNAL int th8RsaSignRawBlock(
+    Th8_Interp *interp,
+    const Th8_RsaKey *pKey,
+    const unsigned char *zBlock,
+    size_t nBlock,
+    unsigned char **ppSig,
+    size_t *pnSig);
 #endif
 
 /*
@@ -1439,6 +1661,7 @@ TH8_INTERNAL int th8NtpQuery(
     int timeoutMs,
     int maxDisagreeSec,
     int attempts,
+    int bRequireSecure,
     th8_int64_t *pEpochSec);
 /*
  * Validate a received NTP packet (const void * = 48-byte
@@ -1537,7 +1760,6 @@ TH8_INTERNAL int th8MemTrackReset(Th8_Interp *interp);
 
 typedef struct Th8_Callback Th8_Callback;
 typedef struct Th8_Frame Th8_Frame;
-typedef struct Th8_PendingDelete Th8_PendingDelete;
 typedef struct Th8_Variable Th8_Variable;
 typedef struct Th8_Command Th8_Command;
 typedef struct Th8_Event Th8_Event;
@@ -1731,35 +1953,28 @@ struct Th8_Callback {
 /*
  *----------------------------------------------------------------------
  *
- * Th8_PendingDelete --
+ * Deferred deletion --
  *
- *	Deferred-deletion entry.  When a command or namespace is deleted
- *	while script is evaluating (nEvalDepth > 0), the hash removal
- *	happens immediately (so the name can't be resolved again) but
- *	the xDel callback and memory free are deferred until the eval
- *	stack fully unwinds.  This prevents use-after-free when a
- *	command deletes itself during dispatch (e.g. coroutine
- *	auto-delete) or when a namespace is deleted from inside one of
- *	its own commands.
+ *	When a command or namespace is deleted while script is
+ *	evaluating (nEvalDepth > 0), the hash removal happens
+ *	immediately (so the name can't be resolved again) but the xDel
+ *	callback and memory free are deferred until the eval stack fully
+ *	unwinds.  This prevents use-after-free when a command deletes
+ *	itself during dispatch (e.g. coroutine auto-delete) or when a
+ *	namespace is deleted from inside one of its own commands.
+ *
+ *	The queue is INTRUSIVE (TH8K-007): the pending object is already
+ *	unlinked from every hash/index when it is queued, so it is
+ *	threaded onto a per-interpreter FIFO through its own pPendingNext
+ *	field (Th8_Command / Th8_Namespace).  Queuing therefore allocates
+ *	nothing and cannot fail -- eliminating the former "risk a
+ *	use-after-free rather than leak" OOM fallback.  Commands and
+ *	namespaces use separate lists; on drain, commands are freed
+ *	before namespaces so a command destructor may still reference a
+ *	namespace that is also pending.
  *
  *----------------------------------------------------------------------
  */
-
-#define TH8_PENDING_CMD 1 /* Deferred command deletion. */
-#define TH8_PENDING_NS  2 /* Deferred namespace deletion. */
-
-struct Th8_PendingDelete {
-    int eType;   /* TH8_PENDING_CMD or TH8_PENDING_NS. */
-    union {
-	struct {
-	    Th8_Command *pCmd; /* Command struct to free. */
-	} cmd;
-	struct {
-	    void *pNs;  /* Th8_Namespace* (opaque here). */
-	} ns;
-    } u;
-    Th8_PendingDelete *pNext; /* Next entry in the FIFO queue. */
-};
 
 /*
  *----------------------------------------------------------------------
@@ -1819,17 +2034,53 @@ struct Th8_Variable {
  *----------------------------------------------------------------------
  */
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_SubCmd --
+ *
+ *	One sub-command of an ensemble command.  Stored as the pData of a
+ *	Th8_HashEntry in the parent Th8_Command's paSubCommands hash, keyed
+ *	by the sub-command name.  A sub-command is a mini-command: it has its
+ *	own handler, context, destructor, and token, so it can be unregistered
+ *	by token (Th8_DeleteSubCommand) exactly like a top-level command --
+ *	interp->paSubToken maps the token back to this record for O(1) delete.
+ *
+ *----------------------------------------------------------------------
+ */
+
+typedef struct Th8_SubCmd {
+    Th8_CommandProc xProc; /* Sub-command implementation function. */
+    void *pContext;  /* Opaque context passed to xProc. */
+    void (
+        *xDel)(Th8_Interp *, void *); /* Destructor for pContext, or NULL. */
+    th8_uint64_t nToken; /* Unique token (for Th8_DeleteSubCommand). */
+    char *zName; /* Owned copy of the sub-command name (for ordered
+			 * listing / introspection, like Th8_Command.zQualName). */
+    size_t nName; /* Byte length of zName. */
+    struct Th8_Command *pParent; /* Owning command, so a token lookup can
+                                  * remove this sub-command from the right
+                                  * paSubCommands hash. */
+} Th8_SubCmd;
+
 struct Th8_Command {
     Th8_CommandProc xProc; /* Command implementation function. */
-    void *pContext;  /* Opaque context passed to xProc. */
+    void *pContext; /* Opaque context passed to xProc. */
     void (*xDel)(Th8_Interp *, void *);
-                                /* Destructor for pContext, or NULL. */
+    /* Destructor for pContext, or NULL. */
     void *(*xCopy)(Th8_Interp *, void *);
-                                /* Deep-copy for namespace import. */
+    /* Deep-copy for namespace import. */
     Th8_Namespace *pDefNs; /* Defining namespace. */
     th8_uint64_t nToken; /* Unique command token. */
-    char *zQualName;  /* Fully qualified name. */
-    size_t nQualName;  /* Byte length of zQualName. */
+    char *zQualName; /* Fully qualified name. */
+    size_t nQualName; /* Byte length of zQualName. */
+    Th8_Command *pPendingNext; /* Intrusive deferred-delete FIFO link
+				 * (TH8K-007); NULL unless queued. */
+    Th8_Hash *paSubCommands; /* Sub-command overlay (name -> Th8_SubCmd), or
+				 * NULL if none.  When set, a matching sub-command
+				 * wins; an unmatched invocation falls back to
+				 * xProc (if any), else the ensemble error.  A
+				 * pure ensemble has xProc == NULL. */
 };
 
 /*
@@ -1866,15 +2117,24 @@ struct Th8_Interp {
 				   Keyed on callback function address;
 				   pData is the custom context pointer.
 				   Created lazily by SetPlatformContext. */
+    th8_uint64_t threadId; /* Id of the owning (creating) thread.
+				   Captured in Th8_CreateInterp via
+				   xGetThreadId; read/written ONLY through
+				   the 64-bit interlocked CAS
+				   (Th8_Int64CmpXchg).  Enforces the single-
+				   threaded-per-interpreter affinity contract
+				   (see TH8_ASSERT_OWNER,
+				   Th8_GetInterpThreadId).  0 if the platform
+				   reports no thread id (affinity unchecked). */
 
     /*
      * Script debugging.
      */
 
     Th8_DebugProc xDebug; /* Debug callback (NULL = no debugging). */
-    void *pDebugCtx;  /* Debug callback client data. */
-    int nStepMode;  /* TH8_STEP_* mode. */
-    int nStepDepth;  /* Frame depth when stepping began. */
+    void *pDebugCtx; /* Debug callback client data. */
+    int nStepMode; /* TH8_STEP_* mode. */
+    int nStepDepth; /* Frame depth when stepping began. */
     Th8_Hash *paBreakpoints; /* Breakpoint table (lazy). */
     int nNextBreakpointId; /* Auto-incrementing breakpoint ID. */
 
@@ -1894,6 +2154,14 @@ struct Th8_Interp {
                      * sensitive 0x20000000); sensitivity is derived from
                      * TH8_SENSITIVE(nResult), not a separate flag. */
     int bResultBorrowed; /* zResult is borrowed (cache-owned). */
+    int bResultBuildFailed; /* a result-building allocation (Th8_SetResult /
+                             * Th8_ListAppend / Th8_StringAppend) failed since
+                             * the current command was invoked; th8InvokeCommand
+                             * clears this before each command and, if it is set
+                             * when the command returns TH8_OK, promotes the
+                             * result to an out-of-memory error so a
+                             * truncated/empty result is never reported as
+                             * success (TH8K-030). */
 
     /*
      * Finally block state.  Updated by the [try] command after
@@ -1903,7 +2171,7 @@ struct Th8_Interp {
 
     char *zFinallyResult;
     size_t nFinallyResult;
-    int nFinallyRc;  /* TH8_OK if finally succeeded. */
+    int nFinallyRc; /* TH8_OK if finally succeeded. */
 
     /*
      * Namespace tree.
@@ -1933,8 +2201,10 @@ struct Th8_Interp {
      * when nEvalDepth drops to 0 (th8DrainPendingDeletes).
      */
 
-    Th8_PendingDelete *pPendingHead;
-    Th8_PendingDelete *pPendingTail;
+    Th8_Command *pPendingCmdHead; /* Intrusive deferred-delete FIFOs */
+    Th8_Command *pPendingCmdTail; /* (TH8K-007): objects are threaded */
+    Th8_Namespace *pPendingNsHead; /* through their own pPendingNext, so */
+    Th8_Namespace *pPendingNsTail; /* queuing never allocates. */
 
     /*
      * Parser state.
@@ -1942,6 +2212,7 @@ struct Th8_Interp {
 
     int isListMode;
     int nEvalDepth;
+    int nExprDepth; /* Expression-tree recursion depth (TH8K-019). */
     int nLine;
     int nErrorLine;
 
@@ -1949,13 +2220,48 @@ struct Th8_Interp {
      * Cancellation.
      */
 
-    volatile int bCanceled;
+    /*
+     * TH8K-008 lock-free cross-thread cancellation.
+     *
+     * nCancelReq is the SINGLE atomic word that carries a cancellation request
+     * coherently across threads: TH8_CR_CANCELED plus the request's flag bits
+     * (TH8_CANCEL_UNWIND, TH8_CANCEL_SIGNAL).  ANY thread -- the owner, a
+     * foreign worker, or a signal handler -- requests cancellation by
+     * atomically OR-ing (TH8_CR_CANCELED | flags) into it.  Because the canceled
+     * bit and the flags live in ONE word, a cancel and its flags can never be
+     * torn or partially lost (the payload-loss race the audit flagged).  The
+     * evaluator polls it (th8CheckCancel); [catch]/unwind read the flag bits;
+     * the owner clears it (atomic store 0) on reset.  There is NO spinlock.
+     */
+    volatile int nCancelReq;
     volatile int bSuspended;
+    /*
+     * Owner-only cancel MESSAGE state (only the owning thread touches these).
+     * cancelFlags mirrors nCancelReq's flag bits; the owner refreshes it from
+     * nCancelReq at each poll so the owner-only [catch]/save/restore readers
+     * need no synchronization.
+     */
     volatile int cancelFlags;
     volatile int bCancelMsgOwned;
-    char *volatile zSavedCancelMsg; /* pending-free */
     char *volatile zCancelMsg;
     volatile size_t nCancelMsg;
+    /*
+     * TH8K-008 cross-thread cancel MESSAGE buffer.  A foreign NON-signal
+     * canceller (which MAY allocate -- it must be Th8_ThreadInit'd, like
+     * Th8_QueueEvent) copies the caller's message into a self-describing buffer
+     * laid out as [size_t length][bytes...][NUL] and atomic-EXCHANGEs the
+     * pointer in here.  Whoever swaps a non-NULL pointer OUT (a later publisher
+     * overwriting, the owner adopting, or a reset) owns it exclusively and frees
+     * it, so every buffer is freed exactly once -- no leak, double-free, or
+     * use-after-free, and no lock.  The owner reads the EXACT length from the
+     * prefix, copies it into its owned message, and frees the buffer.  A signal
+     * handler never touches this (it cannot allocate/free); a signal cancel
+     * carries no message and the owner reports a fixed static text.
+     *
+     * Stored as a pointer-holding 64-bit integer (portably 32/64-bit) so the
+     * exchange is a single Th8_Int64CmpXchg with no aliasing pun; 0 == empty.
+     */
+    volatile th8_uint64_t nCancelReqMsg;
     volatile int bExit;
 
     /*
@@ -2036,6 +2342,9 @@ struct Th8_Interp {
 
     th8_int64_t nStepCount;
     th8_int64_t nStepLimit;
+    th8_int64_t nDeadlineUs; /* Absolute monotonic-microsecond wall-clock
+			      * deadline (0 = none); checked periodically
+			      * in th8Step (TH8K-010). */
     size_t nResultLimit;
 
     /*
@@ -2096,6 +2405,7 @@ struct Th8_Interp {
 
     size_t nAllocBytes;
     size_t nAllocLimit;
+    size_t nAllocPeak; /* High-water mark of nAllocBytes (TH8K-021). */
 
     /*
      * Signed-only gate.
@@ -2159,6 +2469,9 @@ struct Th8_Interp {
     void *pPlugins;
     th8_uint64_t nNextCmdToken;
     Th8_Hash *paCmdToken;
+    Th8_Hash *paSubToken; /* token -> Th8_SubCmd* index for O(1)
+			   * Th8_DeleteSubCommand; lazily created with the
+			   * first sub-command, freed at teardown. */
 
     /*
      * Channel registry: maps channel names (e.g., "./tmp/foo.tmp")
@@ -2334,7 +2647,8 @@ typedef struct Th8_HashEntry Th8_HashEntry;
 
 struct Th8_Hash {
     Th8_HashEntry *aBucket[TH8_HASH_SIZE];
-    int nNextOrder;  /* Next insertion-order counter. */
+    th8_int64_t
+        nNextOrder;  /* Next insertion-order counter (64-bit; TH8K-016). */
 };
 
 struct Th8_HashEntry {
@@ -2343,7 +2657,8 @@ struct Th8_HashEntry {
     char *zKey;   /* Key string (owned). */
     size_t nKey;  /* Byte length of key. */
     Th8_HashEntry *pNext; /* Internal use only. */
-    int nInsertOrder;  /* Insertion sequence number. */
+    th8_int64_t
+        nInsertOrder;  /* Insertion sequence number (64-bit; TH8K-016). */
 };
 
 /*
@@ -2385,10 +2700,16 @@ TH8_API void Th8_HashIterate(
  * Th8_HashIterateOrdered --
  *	Like Th8_HashIterate, but visits entries in insertion order.
  *	Used by dict commands to preserve key order per Tcl semantics.
- *	Allocates a temporary sort array; falls back to unordered
- *	iteration on allocation failure.
+ *	Allocates a temporary sort array sized from the live-entry
+ *	count.  Returns TH8_OK when every entry was visited in order
+ *	(or the callback stopped early, or the hash was empty), and
+ *	TH8_ERROR if the array could not be allocated or a readiness
+ *	check cancelled the walk -- in which case NO ordered guarantee
+ *	holds and the caller must not treat the iteration as complete.
+ *	Unlike the previous behaviour, it does NOT silently fall back
+ *	to unordered iteration on allocation failure.
  */
-TH8_API void Th8_HashIterateOrdered(
+TH8_API int Th8_HashIterateOrdered(
     Th8_Interp *interp,
     Th8_Hash *pHash,
     int (*xCallback)(Th8_HashEntry *, void *),
@@ -2656,6 +2977,8 @@ TH8_API int Th8_ListAppendPlugins(Th8_Interp *interp, char **pz, size_t *pn);
  */
 TH8_INTERNAL void *th8GetPluginList(Th8_Interp *interp);
 TH8_INTERNAL void th8SetPluginList(Th8_Interp *interp, void *p);
+TH8_INTERNAL int
+th8PluginRegistered(Th8_Interp *interp, const char *zName, size_t nName);
 TH8_INTERNAL th8_uint64_t th8NextCmdToken(Th8_Interp *interp);
 TH8_INTERNAL void
 th8SetCmdToken(Th8_Interp *interp, const char *zName, th8_uint64_t token);
@@ -2805,6 +3128,11 @@ typedef struct Th8StubsTable {
         volatile int *pTarget,
         int iExchange,
         int iComparand);
+    th8_uint64_t (*th8_Int64CmpXchg)(
+        Th8_Interp *interp,
+        volatile th8_uint64_t *pTarget,
+        th8_uint64_t iExchange,
+        th8_uint64_t iComparand);
     Th8_Interp *(*th8_CreateInterp)(Th8_Platform *pPlatform);
     int (*th8_RestoreInterp)(Th8_Interp *interp, int flags);
     void (*th8_DeleteInterp)(Th8_Interp *interp);
@@ -2978,6 +3306,25 @@ typedef struct Th8StubsTable {
         Th8_CommandProc xProc,
         void *pContext,
         void (*xDel)(Th8_Interp *, void *),
+        th8_uint64_t *pToken);
+    int (*th8_CreateSubCommand)(
+        Th8_Interp *interp,
+        const char *zCmdName,
+        const char *zSubName,
+        Th8_CommandProc xProc,
+        void *pContext,
+        void (*xDel)(Th8_Interp *, void *),
+        th8_uint64_t *pToken);
+    int (*th8_DeleteSubCommand)(Th8_Interp *interp, th8_uint64_t token);
+    int (*th8_GetSubCommandInfo)(
+        Th8_Interp *interp,
+        const char *zCmdName,
+        size_t nCmd,
+        const char *zSubName,
+        size_t nSub,
+        Th8_CommandProc *pxProc,
+        void **ppContext,
+        void (**pxDel)(Th8_Interp *, void *),
         th8_uint64_t *pToken);
     int (*th8_DeleteCommand)(Th8_Interp *interp, th8_uint64_t token);
     int (*th8_GetCommandInfo)(
@@ -3275,7 +3622,11 @@ typedef struct Th8StubsTable {
 #else
     void *th8_GetEmbeddedKeyTime;
 #endif
+#if defined(TH8_ENABLE_CRYPTOGRAPHY)
     const Th8_KeyringEntry *(*th8_GetEmbeddedKeyring)(size_t *pnEntries);
+#else
+    void *th8_GetEmbeddedKeyring;
+#endif
 #if defined(TH8_ENABLE_CRYPTOGRAPHY) && defined(TH8_ENABLE_TEST_KEY)
     const unsigned char *(*th8_GetEmbeddedKeyTest)(size_t *pnData);
 #else
@@ -3350,8 +3701,13 @@ typedef struct Th8StubsTable {
     void (*th8_SetOverflowCheck)(Th8_Interp *interp, int bEnable);
     int (*th8_GetOverflowCheck)(Th8_Interp *interp);
     void (*th8_SetAllocLimit)(Th8_Interp *interp, size_t nLimit);
+    void (*th8_SetSafeLimits)(Th8_Interp *interp);
+    void (*th8_SetDeadline)(Th8_Interp *interp, th8_int64_t nDeadlineUs);
+    th8_int64_t (*th8_GetDeadline)(Th8_Interp *interp);
+    int (*th8_SetTimeLimitMs)(Th8_Interp *interp, th8_int64_t nMs);
     size_t (*th8_GetAllocLimit)(Th8_Interp *interp);
     size_t (*th8_GetAllocBytes)(Th8_Interp *interp);
+    size_t (*th8_GetAllocPeak)(Th8_Interp *interp);
 #if defined(TH8_ENABLE_LOAD)
     int (*th8_EnableLoad)(Th8_Interp *interp, int bEnable);
 #else
@@ -3520,13 +3876,6 @@ typedef struct Th8StubsTable {
     void *th8_ListAppendArray;
 #endif
     int (*th8_WrongNumArgs)(Th8_Interp *interp, const char *zMsg);
-    int (*th8_CallSubCommand)(
-        Th8_Interp *interp,
-        void *ctx,
-        int argc,
-        const char **argv,
-        size_t *argl,
-        const Th8_SubCommand *aSub);
     int (*th8_ReportTaint)(
         Th8_Interp *interp,
         const char *zTitle,
@@ -3614,7 +3963,7 @@ typedef struct Th8StubsTable {
         Th8_Hash *pHash,
         int (*xCallback)(Th8_HashEntry *, void *),
         void *pCtx);
-    void (*th8_HashIterateOrdered)(
+    int (*th8_HashIterateOrdered)(
         Th8_Interp *interp,
         Th8_Hash *pHash,
         int (*xCallback)(Th8_HashEntry *, void *),
@@ -3693,6 +4042,7 @@ typedef struct Th8StubsTable {
     int (*th8_GetPid)(Th8_Interp *interp);
     int (*th8_GetParentPid)(Th8_Interp *interp);
     th8_uint64_t (*th8_GetThreadId)(Th8_Interp *interp);
+    th8_uint64_t (*th8_GetInterpThreadId)(Th8_Interp *interp);
     char *(*th8_GetEnv)(Th8_Interp *interp, const char *zName);
     int (*th8_KeyValue)(
         Th8_Interp *interp,
@@ -3808,8 +4158,14 @@ typedef struct Th8StubsTable {
     void *th8_FaultCtxSize;
 #endif
     int (*th8_RegisterLanguage)(Th8_Interp *interp);
+    int (*th8_RegisterSubsets)(
+        Th8_Interp *interp,
+        const char *const *azNames,
+        int nNames);
+    int (*th8_ListSubsets)(Th8_Interp *interp);
+    int (*th8_GetSubsetMembers)(Th8_Interp *interp, const char *zName);
 #if defined(TH8_ENABLE_VARIABLES)
-    void (*th8_ResetSecurityArray)(Th8_Interp *interp);
+    int (*th8_ResetSecurityArray)(Th8_Interp *interp);
 #else
     void *th8_ResetSecurityArray;
 #endif
@@ -4035,6 +4391,7 @@ extern const Th8StubsTable *th8StubsPtr;
 #  define Th8_Finalize            (th8StubsPtr->th8_Finalize)
 #  define Th8_GetInternalStubs    (th8StubsPtr->th8_GetInternalStubs)
 #  define Th8_IntCmpXchg          (th8StubsPtr->th8_IntCmpXchg)
+#  define Th8_Int64CmpXchg        (th8StubsPtr->th8_Int64CmpXchg)
 #  define Th8_CreateInterp        (th8StubsPtr->th8_CreateInterp)
 #  define Th8_RestoreInterp       (th8StubsPtr->th8_RestoreInterp)
 #  define Th8_DeleteInterp        (th8StubsPtr->th8_DeleteInterp)
@@ -4097,6 +4454,9 @@ extern const Th8StubsTable *th8StubsPtr;
 #    define Th8_UnsetVar (th8StubsPtr->th8_UnsetVar)
 #  endif
 #  define Th8_CreateCommand         (th8StubsPtr->th8_CreateCommand)
+#  define Th8_CreateSubCommand      (th8StubsPtr->th8_CreateSubCommand)
+#  define Th8_DeleteSubCommand      (th8StubsPtr->th8_DeleteSubCommand)
+#  define Th8_GetSubCommandInfo     (th8StubsPtr->th8_GetSubCommandInfo)
 #  define Th8_DeleteCommand         (th8StubsPtr->th8_DeleteCommand)
 #  define Th8_GetCommandInfo        (th8StubsPtr->th8_GetCommandInfo)
 #  define Th8_SetCommandCopy        (th8StubsPtr->th8_SetCommandCopy)
@@ -4211,7 +4571,9 @@ extern const Th8StubsTable *th8StubsPtr;
 #  if defined(TH8_ENABLE_CRYPTOGRAPHY)
 #    define Th8_GetEmbeddedKeyTime (th8StubsPtr->th8_GetEmbeddedKeyTime)
 #  endif
-#  define Th8_GetEmbeddedKeyring (th8StubsPtr->th8_GetEmbeddedKeyring)
+#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
+#    define Th8_GetEmbeddedKeyring (th8StubsPtr->th8_GetEmbeddedKeyring)
+#  endif
 #  if defined(TH8_ENABLE_CRYPTOGRAPHY) && defined(TH8_ENABLE_TEST_KEY)
 #    define Th8_GetEmbeddedKeyTest (th8StubsPtr->th8_GetEmbeddedKeyTest)
 #  endif
@@ -4261,8 +4623,13 @@ extern const Th8StubsTable *th8StubsPtr;
 #  define Th8_SetOverflowCheck (th8StubsPtr->th8_SetOverflowCheck)
 #  define Th8_GetOverflowCheck (th8StubsPtr->th8_GetOverflowCheck)
 #  define Th8_SetAllocLimit    (th8StubsPtr->th8_SetAllocLimit)
+#  define Th8_SetSafeLimits    (th8StubsPtr->th8_SetSafeLimits)
+#  define Th8_SetDeadline      (th8StubsPtr->th8_SetDeadline)
+#  define Th8_GetDeadline      (th8StubsPtr->th8_GetDeadline)
+#  define Th8_SetTimeLimitMs   (th8StubsPtr->th8_SetTimeLimitMs)
 #  define Th8_GetAllocLimit    (th8StubsPtr->th8_GetAllocLimit)
 #  define Th8_GetAllocBytes    (th8StubsPtr->th8_GetAllocBytes)
+#  define Th8_GetAllocPeak     (th8StubsPtr->th8_GetAllocPeak)
 #  if defined(TH8_ENABLE_LOAD)
 #    define Th8_EnableLoad (th8StubsPtr->th8_EnableLoad)
 #  endif
@@ -4324,12 +4691,11 @@ extern const Th8StubsTable *th8StubsPtr;
 #  if defined(TH8_ENABLE_VARIABLES)
 #    define Th8_ListAppendArray (th8StubsPtr->th8_ListAppendArray)
 #  endif
-#  define Th8_WrongNumArgs   (th8StubsPtr->th8_WrongNumArgs)
-#  define Th8_CallSubCommand (th8StubsPtr->th8_CallSubCommand)
-#  define Th8_ReportTaint    (th8StubsPtr->th8_ReportTaint)
-#  define Th8_Input          (th8StubsPtr->th8_Input)
-#  define Th8_Output         (th8StubsPtr->th8_Output)
-#  define Th8_OutputError    (th8StubsPtr->th8_OutputError)
+#  define Th8_WrongNumArgs (th8StubsPtr->th8_WrongNumArgs)
+#  define Th8_ReportTaint  (th8StubsPtr->th8_ReportTaint)
+#  define Th8_Input        (th8StubsPtr->th8_Input)
+#  define Th8_Output       (th8StubsPtr->th8_Output)
+#  define Th8_OutputError  (th8StubsPtr->th8_OutputError)
 #  if defined(TH8_PLUGIN_IO)
 #    define Th8_GetInput (th8StubsPtr->th8_GetInput)
 #  endif
@@ -4387,6 +4753,7 @@ extern const Th8StubsTable *th8StubsPtr;
 #  define Th8_GetPid               (th8StubsPtr->th8_GetPid)
 #  define Th8_GetParentPid         (th8StubsPtr->th8_GetParentPid)
 #  define Th8_GetThreadId          (th8StubsPtr->th8_GetThreadId)
+#  define Th8_GetInterpThreadId    (th8StubsPtr->th8_GetInterpThreadId)
 #  define Th8_GetEnv               (th8StubsPtr->th8_GetEnv)
 #  define Th8_KeyValue             (th8StubsPtr->th8_KeyValue)
 #  define Th8_SetPlatformContext   (th8StubsPtr->th8_SetPlatformContext)
@@ -4451,6 +4818,9 @@ extern const Th8StubsTable *th8StubsPtr;
 #    define Th8_FaultCtxSize (th8StubsPtr->th8_FaultCtxSize)
 #  endif
 #  define Th8_RegisterLanguage (th8StubsPtr->th8_RegisterLanguage)
+#  define Th8_RegisterSubsets  (th8StubsPtr->th8_RegisterSubsets)
+#  define Th8_ListSubsets      (th8StubsPtr->th8_ListSubsets)
+#  define Th8_GetSubsetMembers (th8StubsPtr->th8_GetSubsetMembers)
 #  if defined(TH8_ENABLE_VARIABLES)
 #    define Th8_ResetSecurityArray (th8StubsPtr->th8_ResetSecurityArray)
 #  endif
@@ -5518,14 +5888,13 @@ int th8BigintMinTwosComplementBytes(
 #  endif
 
 /*
- * DNS resolution via glibc resolver (only when libunbound is
- * not available for DANE/TLSA lookups).
+ * The glibc stub-resolver API (res_query / res_ninit / ns_msg) lives in the
+ * dedicated th8_meta_glibc.h meta-header, which its consumers include
+ * directly.  It is deliberately NOT pulled in here: it is glibc-only and its
+ * one in-tree consumer (harpy/th8_time.c) needs it regardless of whether
+ * libunbound is compiled in, whereas this POSIX header is shared by files that
+ * neither need nor should drag in <resolv.h>.
  */
-
-#  if defined(__GLIBC__) && !defined(TH8_ENABLE_UNBOUND)
-#    include <resolv.h>  /* res_query */
-#    include <arpa/nameser.h> /* ns_msg, ns_rr, NS_* */
-#  endif
 
 #endif /* !_WIN32 && !WIN32 */
 
@@ -5629,6 +5998,48 @@ int th8BigintMinTwosComplementBytes(
 #endif /* TH8_META_MACOS_H */
 
 /************** End of th8_meta_macos.h *************/
+/************** Begin file th8_meta_glibc.h *************/
+#line 1 "src/th8_meta_glibc.h"
+/*
+ * th8_meta_glibc.h -- glibc stub-resolver meta-header for TH8.
+ *
+ * This header is internal to the TH8 build.
+ *
+ * Copyright (c) 2026 by Joe Mistachkin.  All rights reserved.
+ *
+ * See the file "license.terms" for information on usage and redistribution of
+ * this file, and for a DISCLAIMER OF ALL WARRANTIES.
+ */
+
+#ifndef TH8_META_GLIBC_H
+#define TH8_META_GLIBC_H
+
+/*
+ * Source files that need the glibc stub-resolver API must include
+ * th8_meta_defs.h, th8_meta_libc.h, th8_meta_posix.h, and th8_meta_glibc.h
+ * explicitly, in that order.
+ *
+ * These headers expose glibc's resolver interface (res_ninit / res_nquery /
+ * res_nclose, struct __res_state, and the RES_USE_EDNS0 / RES_USE_DNSSEC
+ * query options) used by the harpy NTP client's insecure-path DNSSEC AD-bit
+ * check.  That check runs whenever the glibc resolver is present, independent
+ * of whether libunbound is compiled in -- so, unlike the DANE/TLSA path in
+ * th8_meta_posix.h, it is NOT gated on TH8_ENABLE_UNBOUND.  The interface is
+ * glibc-only (musl and the BSDs do not define __GLIBC__ and expose a different
+ * resolver surface), so everything is guarded on __GLIBC__ and this header is
+ * a no-op elsewhere.  <netinet/in.h> and <arpa/nameser.h> are the historical
+ * prerequisites of <resolv.h>.
+ */
+
+#if defined(__GLIBC__) && !defined(_WIN32) && !defined(WIN32)
+#  include <netinet/in.h>  /* in_addr; prerequisite of <resolv.h> */
+#  include <arpa/nameser.h> /* ns_msg, ns_rr, NS_* */
+#  include <resolv.h>  /* res_ninit, res_nquery, res_nclose, __res_state */
+#endif
+
+#endif /* TH8_META_GLIBC_H */
+
+/************** End of th8_meta_glibc.h *************/
 /************** Begin file ConvertUTF_v2.h *************/
 #line 1 "externals/utf/ConvertUTF_v2.h"
 /*
@@ -5960,25 +6371,25 @@ typedef int *se_LPBOOL;
  * Constants from SpilornisInt.h.
  */
 
-#define LIBRARY_NAME                "TH8"
-#define LIBRARY_PATCH_LEVEL         "1.0.0.0"
-#define STRINGIFY1(x)               #x
-#define STRINGIFY(x)                STRINGIFY1(x)
-#define SOURCE_ID                   "th8"
-#define SOURCE_TIMESTAMP            "2026"
-#define LIBRARY_UNICODE_NAME        UNICODIFY(LIBRARY_NAME)
-#define LIBRARY_UNICODE_PATCH_LEVEL UNICODIFY(STRINGIFY(LIBRARY_PATCH_LEVEL))
-#define LIBRARY_UNICODE_SOURCE_ID   UNICODIFY(SOURCE_ID)
+#define LIBRARY_NAME                     "TH8"
+#define LIBRARY_PATCH_LEVEL              "1.0.0.0"
+#define STRINGIFY1(x)                    #x
+#define STRINGIFY(x)                     STRINGIFY1(x)
+#define SOURCE_ID                        "th8"
+#define SOURCE_TIMESTAMP                 "2026"
+#define LIBRARY_UNICODE_NAME             UNICODIFY(LIBRARY_NAME)
+#define LIBRARY_UNICODE_PATCH_LEVEL      UNICODIFY(STRINGIFY(LIBRARY_PATCH_LEVEL))
+#define LIBRARY_UNICODE_SOURCE_ID        UNICODIFY(SOURCE_ID)
 #define LIBRARY_UNICODE_SOURCE_TIMESTAMP UNICODIFY(SOURCE_TIMESTAMP)
 #define LIBRARY_MAXIMUM_SIZE_T           ((se_SIZE_T)0x7FFFFFFF)
 #define LIBRARY_RESULT_LENGTH            192
 #define LIBRARY_LOCAL_FLAGS              20
 #define LIBRARY_VAR_BUFFER_LENGTH        20
-#define LIBRARY_TRACE_BUFFER_LENGTH ((se_SIZE_T)(4096 - sizeof(se_DWORD)))
-#define LIBRARY_VERSION_LENGTH      256
-#define LIBRARY_VERSION_FORMAT      "%s v%s [%s %s]"
-#define NO_TRACE_VAR_NAME           "NoTraceSpilornis"
-#define NO_TRACE_UNICODE_VAR_NAME   UNICODIFY(NO_TRACE_VAR_NAME)
+#define LIBRARY_TRACE_BUFFER_LENGTH      ((se_SIZE_T)(4096 - sizeof(se_DWORD)))
+#define LIBRARY_VERSION_LENGTH           256
+#define LIBRARY_VERSION_FORMAT           "%s v%s [%s %s]"
+#define NO_TRACE_VAR_NAME                "NoTraceSpilornis"
+#define NO_TRACE_UNICODE_VAR_NAME        UNICODIFY(NO_TRACE_VAR_NAME)
 #define AllocateMemoryWrapper(size)                                          \
     th8_spilornis_calloc((size), sizeof(se_BYTE))
 #define FreeMemoryWrapper(p) th8_spilornis_free(p)
@@ -5990,17 +6401,6 @@ typedef int *se_LPBOOL;
 #define EAGLE_USE_BRACES       (2)
 #define EAGLE_BRACES_UNMATCHED (4)
 #define EAGLE_DONT_QUOTE_HASH  (8)
-
-/*
- * Error message format for EagleFindElement.
- * USE_NARROW_CHAR_T selects %s/%.*s (narrow) vs %ls/%.*ls (wide).
- */
-
-#if defined(USE_NARROW_CHAR_T)
-#  define ERRONEOUS_STRING_FORMAT "\"%.*s\" %s"
-#else
-#  define ERRONEOUS_STRING_FORMAT "\"%.*ls\" %ls"
-#endif
 
 #ifndef _WIN32
 typedef void *se_HANDLE;
@@ -6037,6 +6437,24 @@ typedef void *se_HANDLE;
 #define USE_TRACE                  0
 #define USE_SYSSTRINGLEN           0
 #define USE_HEAPAPI                0
+
+/*
+ * Error message format for EagleFindElement.  This MUST be selected
+ * AFTER USE_NARROW_CHAR_T is defined (above): TH8's se_WCHAR is a
+ * narrow, single-byte char, so the narrow %s/%.*s conversions are
+ * required.  If this #if is evaluated while USE_NARROW_CHAR_T is not
+ * yet defined, the wide %ls/%.*ls variant is wrongly chosen; passing a
+ * single-byte string to %ls then makes vsnprintf fail (returns -1) and
+ * the list-parse error message comes out EMPTY -- a defect that
+ * surfaces only in builds where the mis-ordered definition wins (it
+ * bit the debug build; the release build happened to bind narrow).
+ */
+
+#if defined(USE_NARROW_CHAR_T)
+#  define ERRONEOUS_STRING_FORMAT "\"%.*s\" %s"
+#else
+#  define ERRONEOUS_STRING_FORMAT "\"%.*ls\" %ls"
+#endif
 
 /*
  * UTFXBOOL -- used for Boolean return values in ConvertUTF
@@ -6756,6 +7174,7 @@ typedef struct Th8InternalStubsTable {
         int timeoutMs,
         int maxDisagreeSec,
         int attempts,
+        int bRequireSecure,
         th8_int64_t *pEpochSec);
     int (*th8_ProtectedAlloc)(
         Th8_Interp *interp,
@@ -7127,6 +7546,13 @@ typedef struct Th8InternalStubsTable {
         Th8_RsaKey *pKey,
         unsigned char *pSavedBlob,
         size_t nSaved);
+    int (*th8_RsaSignRawBlock)(
+        Th8_Interp *interp,
+        const Th8_RsaKey *pKey,
+        const unsigned char *zBlock,
+        size_t nBlock,
+        unsigned char **ppSig,
+        size_t *pnSig);
     int (*th8_NtpValidateResponse)(
         Th8_Interp *interp,
         const void *respv,
@@ -7161,7 +7587,7 @@ typedef struct Th8InternalStubsTable {
  */
 
 #define TH8_INTERNAL_STUBS_MAGIC   (0x54483849)  /* "TH8I" */
-#define TH8_INTERNAL_STUBS_VERSION (55)
+#define TH8_INTERNAL_STUBS_VERSION (56)
 
 /*
  * Optional macro-redirection for plugins.  When
@@ -7352,6 +7778,7 @@ extern const Th8InternalStubsTable *th8InternalStubsPtr;
 	(th8InternalStubsPtr->th8_TestRsaKeyClearPubBlob)
 #    define th8TestRsaKeyRestorePubBlob                                      \
 	(th8InternalStubsPtr->th8_TestRsaKeyRestorePubBlob)
+#    define th8RsaSignRawBlock (th8InternalStubsPtr->th8_RsaSignRawBlock)
 #    define th8NtpValidateResponse                                           \
 	(th8InternalStubsPtr->th8_NtpValidateResponse)
 #    define th8FinalizeSensitiveResult                                       \
@@ -8377,6 +8804,24 @@ struct ub_ctx;
  *	    never feeds libunbound a truncated trust-anchor
  *	    file.
  *
+ *	xGetModuleAnchorPath
+ *	    Compose the module-adjacent candidate anchor path
+ *	    (`<dir-of-this-image>/root.key`) into `zBuf`.  This
+ *	    is the TH8-BUNDLED location; the shared driver uses
+ *	    it to recognise when `xFindStaticAnchorPath`
+ *	    returned the bundled anchor (which must be signature-
+ *	    verified) versus an OS system anchor (trusted as-is).
+ *	    Returns 0 if the image directory cannot be resolved.
+ *
+ *	xReadFile
+ *	    Read up to `nBuf` bytes of `zPath` into the caller-
+ *	    provided buffer `zBuf`, setting `*pnRead`.  RAW read:
+ *	    it MUST NOT invoke the signed-only script policy (the
+ *	    driver uses it to read a trust anchor and its
+ *	    `.b64sig`, and routing through the policy would
+ *	    recurse).  Returns 0 on any error, including a file
+ *	    that does not fit in `nBuf` (no partial read).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -8386,6 +8831,12 @@ typedef struct Th8_UnboundOps {
     int (*xPathReadable)(const char *zPath);
     int (*xEnsureParentDir)(const char *zPath);
     int (*xCopyFileContents)(const char *zSrc, const char *zDst);
+    int (*xGetModuleAnchorPath)(char *zBuf, size_t nBuf);
+    int (*xReadFile)(
+        const char *zPath,
+        char *zBuf,
+        size_t nBuf,
+        size_t *pnRead);
 } Th8_UnboundOps;
 
 /*
@@ -8447,6 +8898,9 @@ void th8UnboundResolveFree(
 #line 21 "src/th8_hash.c"
 /* amalgamation: th8_mem.h already included */
 #line 22 "src/th8_hash.c"
+#  include <string.h> /* memcmp, memcpy, strlen (the shims below expand to these) */
+#  include <stdlib.h> /* qsort */
+#  include <time.h> /* time (hash-seed fallback in th8SeedHash) */
 
 /*
  * Standalone shims: map TH8 APIs to the C runtime.
@@ -8471,6 +8925,49 @@ void th8UnboundResolveFree(
 #  define Th8_Qsort(interp, b, n, sz, cmp) qsort((b), (n), (sz), (cmp))
 
 /*
+ * No cooperative cancellation in standalone mode: the freestanding
+ * hash harness has no interpreter readiness state, so ordered
+ * iteration is always "ready" (0 == TH8_OK).
+ */
+#  define Th8_Ready(interp) (0)
+
+/*
+ * 64-bit signed limit (normally from th8.h) for the insertion-order
+ * saturation guard in Th8_HashFind (TH8K-016).
+ */
+#  ifndef TH8_INT64_MAX
+#    define TH8_INT64_MAX ((th8_int64_t)0x7fffffffffffffff)
+#  endif
+
+/*
+ * Return codes and overflow-checked allocation macros (normally from th8.h /
+ * th8_int.h, which standalone mode does not include).  The TH8_ALLOC* macros
+ * map onto the zero-filling Th8_Malloc shim while preserving the same overflow
+ * REJECTION as the full build -- a freestanding caller gets NULL (not a wrapped
+ * size) when the requested size overflows.
+ */
+#  ifndef TH8_OK
+#    define TH8_OK (0)
+#  endif
+#  ifndef TH8_ERROR
+#    define TH8_ERROR (1)
+#  endif
+#  define TH8_ALLOC(interp, nByte) Th8_Malloc((interp), (nByte))
+#  define TH8_ALLOC_STR(interp, nLen)                                        \
+      ((nLen) == (size_t)-1 ? (void *)0 : Th8_Malloc((interp), (nLen) + 1))
+/*
+ * (a) and (b) are size_t at every call site (nLive cast to size_t and a
+ * sizeof).  The overflow guard mirrors TH8_SAFE_MUL_SIZE exactly, so the
+ * product is only formed when it fits size_t -- and, like that macro, the
+ * multiply carries no (size_t) cast adjacent to it, keeping the size-multiply
+ * audit rule satisfied without a suppression.
+ */
+#  define TH8_ALLOC_MUL(interp, a, b)                                        \
+      (((b) != 0 && (a) > (size_t)-1 / (b))                                  \
+	   ? (void *)0                                                       \
+	   : Th8_Malloc((interp), (a) * (b)))
+
+/*
  * No global mutex in standalone mode.  The caller is responsible
  * for external synchronization if needed.
  */
@@ -8481,18 +8978,22 @@ void th8UnboundResolveFree(
 #else /* !TH8_HASH_STANDALONE */
 
 /* amalgamation: th8_meta_defs.h already included */
-#line 56 "src/th8_hash.c"
+#line 102 "src/th8_hash.c"
 /* amalgamation: th8_meta_libc.h already included */
-#line 57 "src/th8_hash.c"
+#line 103 "src/th8_hash.c"
 #  include "th8.h"
 /* amalgamation: th8_int.h already included */
-#line 59 "src/th8_hash.c"
+#line 105 "src/th8_hash.c"
 
 /*
- * In normal (non-standalone) mode, Th8_Qsort maps to the
- * C library qsort, matching the standalone shim above.
+ * In normal (non-standalone) mode Th8_Qsort maps to th8Qsort (th8_plat.c,
+ * declared in th8_int.h), which routes sorting through the platform `xQsort`
+ * abstraction (TH8K-015) rather than the C library qsort directly, so a build
+ * with no C-library qsort (e.g. a future kernel profile) can supply its own
+ * sort.
  */
-#  define Th8_Qsort(interp, b, n, sz, cmp) qsort((b), (n), (sz), (cmp))
+#  define Th8_Qsort(interp, b, n, sz, cmp)                                   \
+      th8Qsort((interp), (b), (n), (sz), (cmp))
 
 #endif /* TH8_HASH_STANDALONE */
 
@@ -8663,6 +9164,7 @@ th8SeedHash(Th8_Platform *pPlatform)
  *	collision-producing strings -- a hash-DoS hardening
  *	the original Tcl 8.x hash table lacks.
  *
+ * Why / How:
  *	The implementation is the standard SipHash-2-4
  *	specification: 8-byte little-endian blocks are XOR'd
  *	into the rolling `v0..v3` state with two
@@ -8675,7 +9177,7 @@ th8SeedHash(Th8_Platform *pPlatform)
  *	zKey -- key bytes (not necessarily NUL-terminated).
  *	nKey -- key length in bytes.
  *
- * Returns:
+ * Results:
  *	The keyed hash, truncated to `unsigned int`.
  *
  * Side effects:
@@ -8685,8 +9187,8 @@ th8SeedHash(Th8_Platform *pPlatform)
  */
 static unsigned int
 th8HashKey(
-    const char *zKey,  /* Key bytes. */
-    size_t nKey)  /* Number of key bytes. */
+    const char *zKey, /* Key bytes. */
+    size_t nKey) /* Number of key bytes. */
 {
     th8_uint64_t v0, v1, v2, v3, m;
     const unsigned char *p = (const unsigned char *)zKey;
@@ -8729,7 +9231,7 @@ th8HashKey(
     case 3:
 	b |= ((th8_uint64_t)p[2]) << 16; /* fall through */
     case 2:
-	b |= ((th8_uint64_t)p[1]) << 8;  /* fall through */
+	b |= ((th8_uint64_t)p[1]) << 8; /* fall through */
     case 1:
 	b |= ((th8_uint64_t)p[0]);
     }
@@ -8806,7 +9308,7 @@ Th8_HashNew(Th8_Interp *interp) /* Interpreter for memory. */
 void
 Th8_HashDelete(
     Th8_Interp *interp, /* Interpreter for memory. */
-    Th8_Hash *pHash)  /* Hash table to destroy. */
+    Th8_Hash *pHash) /* Hash table to destroy. */
 {
     int i;
 
@@ -8858,10 +9360,10 @@ Th8_HashDelete(
 Th8_HashEntry *
 Th8_HashFind(
     Th8_Interp *interp, /* Interpreter for memory. */
-    Th8_Hash *pHash,  /* Hash table. */
-    const char *zKey,  /* Key bytes. */
-    size_t nKey,  /* Key length (TH8_NOLEN = NUL-term). */
-    int op)   /* <0 delete, 0 find, >0 insert. */
+    Th8_Hash *pHash, /* Hash table. */
+    const char *zKey, /* Key bytes. */
+    size_t nKey, /* Key length (TH8_NOLEN = NUL-term). */
+    int op) /* <0 delete, 0 find, >0 insert. */
 {
     unsigned int iBucket;
     Th8_HashEntry *p;
@@ -8898,7 +9400,21 @@ Th8_HashFind(
 	p->zKey[nKey] = 0;
 	p->nKey = nKey;
 	p->pData = 0;
-	p->nInsertOrder = pHash->nNextOrder++;
+	/* Assign the insertion-order stamp from a 64-bit history counter
+	 * (TH8K-016).  The counter increments on every insert over the hash's
+	 * LIFETIME (it is never decremented on delete), so a churning dict --
+	 * e.g. a work queue with repeated insert/delete -- would drive a 32-bit
+	 * counter to its ceiling after ~2^31 inserts (reachable in a
+	 * long-running process), whereupon later entries would share one stamp
+	 * and their relative order would become unspecified, breaking the
+	 * insertion-order contract.  At 64 bits the ceiling is ~2^63 inserts
+	 * (centuries at any real insert rate), so the saturation guard below is
+	 * defence-in-depth for defined behaviour, not a reachable path. */
+	if (pHash->nNextOrder < TH8_INT64_MAX) {
+	    p->nInsertOrder = pHash->nNextOrder++;
+	} else {
+	    p->nInsertOrder = TH8_INT64_MAX;
+	}
 	p->pNext = pHash->aBucket[iBucket];
 	pHash->aBucket[iBucket] = p;
 	return p;
@@ -8968,16 +9484,21 @@ Th8_HashRemove(
 void
 Th8_HashIterate(
     Th8_Interp *interp, /* Interpreter (unused). */
-    Th8_Hash *pHash,  /* Hash table. */
+    Th8_Hash *pHash, /* Hash table. */
     int (*xCb)(Th8_HashEntry *, void *),
-                                /* Callback for each entry.
+    /* Callback for each entry.
 				 * Return TH8_OK to continue,
 				 * any other value to stop. */
-    void *pCtx)   /* Context for callback. */
+    void *pCtx) /* Context for callback. */
 {
     int i;
 
     (void)interp;
+
+    /* NULL-safe like Th8_HashDelete, so a partially-constructed namespace
+     * (some hashes not yet allocated) can be torn down on an OOM rollback
+     * without a NULL dereference (TH8K-002). */
+    if (!pHash) return;
 
     for (i = 0; i < TH8_HASH_SIZE; i++) {
 	Th8_HashEntry *p = pHash->aBucket[i];
@@ -8995,23 +9516,91 @@ Th8_HashIterate(
 /*
  *----------------------------------------------------------------------
  *
- * th8CompareInsertOrder --
+ * th8HashSortByOrder --
  *
- *	qsort comparator for Th8_HashEntry pointers, ordering by
- *	nInsertOrder ascending.
+ *	Stable, POLLABLE ascending sort of ap[0..nEntry-1] (Th8_HashEntry
+ *	pointers) by nInsertOrder, using a bottom-up merge sort with the
+ *	caller-provided scratch array aTmp[nEntry].
+ *
+ * Why / How:
+ *	The platform Th8_Qsort is opaque and its comparator has no
+ *	interpreter context, so an attacker-sized ordered-hash walk could run
+ *	the sort to completion with no cancellation check (TH8K-009/TH8K-016).
+ *	This merge sort polls Th8_Ready every ~4096 element moves (0xFFF, the
+ *	documented interval) across the merge, leftover-drain, and copy-back
+ *	phases, each guarded by nested single-condition ifs so no compound
+ *	MC/DC decision is introduced.  Stable: on a tie the left run wins.
+ *
+ * Results:
+ *	TH8_OK when sorted, or TH8_ERROR if a readiness check fires (the
+ *	interpreter result is set by Th8_Ready); ap is left partially sorted
+ *	in that case and the caller must discard the ordered walk.
+ *
+ * Side effects:
+ *	Overwrites ap and aTmp.
  *
  *----------------------------------------------------------------------
  */
 
 static int
-th8CompareInsertOrder(const void *a, const void *b)
+th8HashSortByOrder(
+    Th8_Interp *interp,
+    Th8_HashEntry **ap,
+    Th8_HashEntry **aTmp,
+    int nEntry)
 {
-    const Th8_HashEntry *pa = *(const Th8_HashEntry *const *)a;
-    const Th8_HashEntry *pb = *(const Th8_HashEntry *const *)b;
+    int width;
+    int nOp = 0;
 
-    if (pa->nInsertOrder < pb->nInsertOrder) return -1;
-    if (pa->nInsertOrder > pb->nInsertOrder) return 1;
-    return 0;
+    for (width = 1; width < nEntry; width *= 2) {
+	int iLeft;
+	int m;
+
+	for (iLeft = 0; iLeft < nEntry; iLeft += 2 * width) {
+	    int iMid = iLeft + width;
+	    int iEnd = iLeft + 2 * width;
+	    int i, j, k;
+
+	    if (iMid > nEntry) iMid = nEntry;
+	    if (iEnd > nEntry) iEnd = nEntry;
+	    i = iLeft;
+	    j = iMid;
+	    k = iLeft;
+	    /* Merge.  The two range tests are nested single-condition ifs
+	     * (not a compound while-condition) to stay out of MC/DC. */
+	    for (;;) {
+		if (i >= iMid) break;
+		if (j >= iEnd) break;
+		if ((nOp++ & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+		}
+		if (ap[i]->nInsertOrder <= ap[j]->nInsertOrder) {
+		    aTmp[k++] = ap[i++]; /* stable: left on tie */
+		} else {
+		    aTmp[k++] = ap[j++];
+		}
+	    }
+	    while (i < iMid) {
+		if ((nOp++ & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+		}
+		aTmp[k++] = ap[i++];
+	    }
+	    while (j < iEnd) {
+		if ((nOp++ & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+		}
+		aTmp[k++] = ap[j++];
+	    }
+	}
+	for (m = 0; m < nEntry; m++) {
+	    if ((nOp++ & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
+	    ap[m] = aTmp[m];
+	}
+    }
+    return TH8_OK;
 }
 
 
@@ -9027,10 +9616,34 @@ th8CompareInsertOrder(const void *a, const void *b)
  *	Used by dict commands to preserve key insertion order.
  *	Non-dict code should use Th8_HashIterate (faster, no sort).
  *
+ * Why / How:
+ *	The temporary array is sized from a live-entry count taken by
+ *	walking the buckets, NOT from the monotonic nNextOrder history
+ *	counter (which only ever grows and, after insert/delete churn,
+ *	would over-allocate) (TH8K-016).  If that allocation fails the
+ *	function reports the failure instead of silently falling back
+ *	to unordered iteration: a caller that requested insertion order
+ *	must never receive an out-of-order visit and mistake it for
+ *	success.  The collection, sort, and callback phases are
+ *	cancellation-aware via Th8_Ready so a large ordered walk cannot
+ *	run unbounded (TH8K-016, TH8K-009).
+ *
+ * Results:
+ *	TH8_OK if every entry was visited in order (or the callback
+ *	requested an early stop, which is a normal control signal, not
+ *	an error), or the hash was empty.  TH8_ERROR if the temporary
+ *	array could not be allocated or a cancellation/readiness check
+ *	fired mid-walk; in the error case no ordered guarantee is made
+ *	and the caller should treat the ordered iteration as not done.
+ *
+ * Side effects:
+ *	Whatever the callback does.  On a readiness failure Th8_Ready
+ *	sets the interpreter result.
+ *
  *----------------------------------------------------------------------
  */
 
-void
+int
 Th8_HashIterateOrdered(
     Th8_Interp *interp,
     Th8_Hash *pHash,
@@ -9038,40 +9651,81 @@ Th8_HashIterateOrdered(
     void *pCtx)
 {
     Th8_HashEntry **apEntry;
+    Th8_HashEntry **apTmp;
     int nEntry = 0;
-    int nAlloc;
+    int nLive = 0;
+    int nOp = 0; /* Poll counter for the bucket walks. */
     int i;
 
-    nAlloc = pHash->nNextOrder;
-    if (nAlloc <= 0) return;
+    /* Count live entries so the array matches the current population.  Polled:
+     * an attacker-sized hash makes this O(nLive) unpolled otherwise
+     * (TH8K-009). */
+    for (i = 0; i < TH8_HASH_SIZE; i++) {
+	Th8_HashEntry *p;
+	for (p = pHash->aBucket[i]; p; p = p->pNext) {
+	    if ((nOp++ & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
+	    nLive++;
+	}
+    }
+    if (nLive <= 0) return TH8_OK;
 
     apEntry = (Th8_HashEntry **)
-        TH8_ALLOC_MUL(interp, (size_t)nAlloc, sizeof(Th8_HashEntry *));
+        TH8_ALLOC_MUL(interp, (size_t)nLive, sizeof(Th8_HashEntry *));
     if (!apEntry) {
-	Th8_HashIterate(interp, pHash, xCb, pCtx);
-	return;
+	return TH8_ERROR;
+    }
+    /* Scratch array for the stable merge sort (same bottom-up merge sort as
+     * lsort / native Tcl, made pollable -- see th8HashSortByOrder). */
+    apTmp = (Th8_HashEntry **)
+        TH8_ALLOC_MUL(interp, (size_t)nLive, sizeof(Th8_HashEntry *));
+    if (!apTmp) {
+	Th8_Free(interp, apEntry);
+	return TH8_ERROR;
     }
 
     for (i = 0; i < TH8_HASH_SIZE; i++) {
 	Th8_HashEntry *p;
 	for (p = pHash->aBucket[i]; p; p = p->pNext) {
-	    if (nEntry < nAlloc) {
+	    if ((nOp++ & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, apTmp);
+		    Th8_Free(interp, apEntry);
+		    return TH8_ERROR;
+		}
+	    }
+	    if (nEntry < nLive) {
 		apEntry[nEntry++] = p;
 	    }
 	}
     }
 
+    /* Sort by insertion order with a pollable stable merge sort (the platform
+     * Th8_Qsort is opaque and its comparator cannot poll -- TH8K-009). */
     if (nEntry > 1) {
-	Th8_Qsort(
-	    interp, apEntry, (size_t)nEntry, sizeof(Th8_HashEntry *),
-	    th8CompareInsertOrder);
+	if (th8HashSortByOrder(interp, apEntry, apTmp, nEntry) != TH8_OK) {
+	    Th8_Free(interp, apTmp);
+	    Th8_Free(interp, apEntry);
+	    return TH8_ERROR;
+	}
     }
+    Th8_Free(interp, apTmp); /* scratch no longer needed before callbacks */
 
     for (i = 0; i < nEntry; i++) {
-	if (xCb(apEntry[i], pCtx) != TH8_OK) break;
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, apEntry);
+		return TH8_ERROR;
+	    }
+	}
+	if (xCb(apEntry[i], pCtx) != TH8_OK) {
+	    break;
+	}
     }
 
     Th8_Free(interp, apEntry);
+    return TH8_OK;
 }
 
 /************** End of th8_hash.c **************/
@@ -9096,6 +9750,14 @@ Th8_HashIterateOrdered(
  * th8StrEq --
  *
  *	Compare a sized string against a NUL-terminated literal.
+ *
+ * Why / How:
+ *	TH8 strings carry an explicit length (and a taint bit in the
+ *	high bits of that length) rather than relying on NUL
+ *	termination, so a plain strcmp cannot be used.  This measures
+ *	the literal, compares the taint-stripped length via TH8_LEN,
+ *	and only then does a byte compare -- giving callers a cheap,
+ *	taint-safe keyword test.
  *
  * Results:
  *	1 if equal, 0 if not.
@@ -9128,6 +9790,14 @@ th8StrEq(
  * th8ParseIndex --
  *
  *	Parse an index that may be "end", "end-N", or plain integer.
+ *
+ * Why / How:
+ *	List-style commands accept the Tcl end-relative index syntax
+ *	as well as absolute integers; centralizing that here keeps the
+ *	three forms consistent.  "end" maps to nCount-1, "end-N"
+ *	subtracts the parsed offset from the last index, and anything
+ *	else is delegated to Th8_ToInt as an absolute index.  (Bounds
+ *	clamping is left to the caller, which knows the valid range.)
  *
  * Results:
  *	TH8_OK on success, TH8_ERROR on failure.
@@ -9479,7 +10149,14 @@ th8Base64Decode(
  *	patterns.
  *
  * Results:
- *	1 if the pattern matches the string, 0 otherwise.
+ *	1 if the pattern matches the string, 0 otherwise.  Returns 0
+ *	when the depth cap is exceeded or the interpreter signals
+ *	cancellation.
+ *
+ * Side effects:
+ *	None.  The function only reads the pattern and string; the
+ *	Th8_Ready calls poll the interpreter for cancellation but this
+ *	function changes no interpreter or global state.
  *
  *----------------------------------------------------------------------
  */
@@ -10762,20 +11439,64 @@ Th8_ListAppendMathFunctions(
 /*
  *----------------------------------------------------------------------
  *
+ * th8RegisterMathFuncEntry --
+ *
+ *	Register one built-in math function from its th8BuiltinMathFuncs[] entry.
+ *
+ * Why / How:
+ *	Shared by th8RegisterMathFuncs (all) and th8RegisterOneMathFunc (by name,
+ *	for named command subsets).  Assigns the direct callback or the generic
+ *	th8MathTranscendental dispatcher (with the opcode+arity packed as
+ *	context), matching the original inline loop body.
+ *
+ * Results:
+ *	TH8_OK, or TH8_ERROR on a real registration failure (e.g. OOM).
+ *
+ * Side effects:
+ *	Creates a math-function entry in the interpreter's hash table.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8RegisterMathFuncEntry(Th8_Interp *interp, const Th8_MathFuncInit *p)
+{
+    Th8_MathFuncProc xProc = p->xProc;
+    void *pCtx = 0;
+
+    if (p->opcode) {
+	/* Pass opcode (low 16 bits) + arity (next 8 bits) as context for
+	 * dispatcher callbacks (Bug 22 fix 2026-06-07: arity is needed so the
+	 * dispatcher can reject NULL operands when arity > 0, instead of
+	 * silently treating them as 0.0). */
+	pCtx = TH8_INT2PTR(TH8_MATH_CTX_PACK(p->nArg, p->opcode));
+    }
+    if (!xProc) {
+	/* No direct callback: use transcendental dispatcher. */
+	xProc = th8MathTranscendental;
+    }
+    return Th8_CreateMathFunc(
+        interp, p->zName, Th8_Strlen(interp, p->zName), p->nArg, xProc, pCtx);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8RegisterMathFuncs --
  *
  *	Register all built-in math functions from the static
  *	th8BuiltinMathFuncs[] table into the interpreter.
  *
  * Why / How:
- *	Called once per interpreter from Th8_RegisterLanguage.
- *	Iterates the init table, assigning either the direct
- *	callback (for abs, int, bool, etc.) or the generic
- *	th8MathTranscendental dispatcher (for sin, cos, etc.)
- *	with the TH8_MATH_* opcode encoded as the context pointer.
+ *	Called once per interpreter from Th8_RegisterLanguage (and from the
+ *	"expressions" plugin subset).  Iterates the init table via
+ *	th8RegisterMathFuncEntry.
  *
  * Results:
- *	None.
+ *	TH8_OK if every built-in math function is registered; TH8_ERROR
+ *	on a real registration failure (e.g. OOM), propagated so the
+ *	language is not reported complete with missing math functions
+ *	(TH8K-006).
  *
  * Side effects:
  *	Creates math function entries in the interpreter's hash table.
@@ -10783,31 +11504,88 @@ Th8_ListAppendMathFunctions(
  *----------------------------------------------------------------------
  */
 
-void
+int
 th8RegisterMathFuncs(Th8_Interp *interp)
 {
     const Th8_MathFuncInit *p;
 
     for (p = th8BuiltinMathFuncs; p->zName; p++) {
-	Th8_MathFuncProc xProc = p->xProc;
-	void *pCtx = 0;
-
-	if (p->opcode) {
-	    /* Pass opcode (low 16 bits) + arity (next 8 bits) as
-	     * context for dispatcher callbacks (Bug 22 fix
-	     * 2026-06-07: arity is needed so the dispatcher can
-	     * reject NULL operands when arity > 0, instead of
-	     * silently treating them as 0.0). */
-	    pCtx = TH8_INT2PTR(TH8_MATH_CTX_PACK(p->nArg, p->opcode));
+	if (th8RegisterMathFuncEntry(interp, p) != TH8_OK) {
+	    return TH8_ERROR;
 	}
-	if (!xProc) {
-	    /* No direct callback: use transcendental dispatcher. */
-	    xProc = th8MathTranscendental;
-	}
-	Th8_CreateMathFunc(
-	    interp, p->zName, Th8_Strlen(interp, p->zName), p->nArg, xProc,
-	    pCtx);
     }
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8FindMathFunc --
+ *
+ *	Return 1 if zName is a built-in math function (pure lookup, no
+ *	mutation), else 0.  Used by the subset resolver to validate a FUNCTION
+ *	member up front, so an unknown member registers nothing.
+ *
+ * Why / How:
+ *	Linear scan of th8BuiltinMathFuncs[] comparing the name.
+ *
+ * Results:
+ *	1 if found, else 0.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8FindMathFunc(Th8_Interp *interp, const char *zName, size_t nName)
+{
+    const Th8_MathFuncInit *p;
+
+    for (p = th8BuiltinMathFuncs; p->zName; p++) {
+	if (Th8_Strlen(interp, p->zName) == nName &&
+	    Th8_Memcmp(interp, p->zName, zName, nName) == 0) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8RegisterOneMathFunc --
+ *
+ *	Register one built-in math function by name (for a FUNCTION subset
+ *	member), assuming the caller validated it with th8FindMathFunc.
+ *
+ * Why / How:
+ *	Linear scan of th8BuiltinMathFuncs[] for the name, then
+ *	th8RegisterMathFuncEntry on the match.
+ *
+ * Results:
+ *	TH8_OK if registered (or the name is unknown -- a no-op), TH8_ERROR on
+ *	OOM.
+ *
+ * Side effects:
+ *	Creates a math-function entry in the interpreter's hash table.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8RegisterOneMathFunc(Th8_Interp *interp, const char *zName, size_t nName)
+{
+    const Th8_MathFuncInit *p;
+
+    for (p = th8BuiltinMathFuncs; p->zName; p++) {
+	if (Th8_Strlen(interp, p->zName) == nName &&
+	    Th8_Memcmp(interp, p->zName, zName, nName) == 0) {
+	    return th8RegisterMathFuncEntry(interp, p);
+	}
+    }
+    return TH8_OK; /* Unknown name: caller validated with th8FindMathFunc. */
 }
 
 #endif /* TH8_ENABLE_EXPRESSIONS */
@@ -11360,6 +12138,20 @@ th8ClearCache(Th8_Interp *interp) /* Interpreter whose cache to clear. */
  *	collisions); on a miss, it allocates a new entry with a copy
  *	of the input.  The caller receives a borrowed Th8_Value* whose
  *	union fields can be populated with type-specific cached data.
+ *
+ * Results:
+ *	A borrowed (cache-owned) pointer to the Th8_Value for the key --
+ *	the existing entry on a hit, or a freshly created entry on a
+ *	miss or collision eviction.  NULL on a NULL interp/string or on
+ *	an out-of-memory failure (and, in fault-injection builds, when
+ *	the lookup-failure hook is armed for this cacheType).
+ *
+ * Side effects:
+ *	Acquires the cache mutex.  May allocate a new cache entry (with
+ *	a cache-owned copy of the input string) and insert it into the
+ *	per-interpreter cache hash table, and may evict/free a colliding
+ *	entry.  In fault-injection builds, may update the fault hook's
+ *	skip/fire counters.
  *
  *----------------------------------------------------------------------
  */
@@ -13403,7 +14195,7 @@ th8ChannelList(Th8_Interp *interp, char **pz, size_t *pn)
 #endif
 
 #if defined(TH8_USE_MIMALLOC)
-#  include "mimalloc.h"  /* mi_thread_init / mi_thread_done */
+#  include "mimalloc.h"  /* mi_thread_init (teardown is mimalloc-owned) */
 #endif
 
 /*
@@ -13510,8 +14302,8 @@ struct Th8_CmdBuild {
 /*
  * Th8_ExecCtx --
  *	Saved interpreter execution context: NRE callback chain,
- *	frame stack, current namespace, eval depth, line counter,
- *	suspended callbacks, and saved frame.  Snapshot/restore
+ *	frame stack, current namespace, eval depth, expression depth,
+ *	line counter, suspended callbacks, and saved frame.  Snapshot/restore
  *	via th8SaveExecCtx/th8RestoreExecCtx during a coroutine
  *	context switch.
  */
@@ -13520,6 +14312,7 @@ typedef struct Th8_ExecCtx {
     Th8_Frame *pFrame;  /* Call frame stack. */
     Th8_Namespace *pCurrentNs; /* Current namespace. */
     int nEvalDepth;  /* Eval nesting depth. */
+    int nExprDepth;  /* Expression-tree recursion depth (TH8K-019). */
     int nLine;   /* Current line number. */
     Th8_Callback *pSuspendedCallbacks;
     Th8_Frame *pSavedFrame;
@@ -13971,14 +14764,16 @@ size_t th8_spilornis_memsize(void *p);
  *	per-variable AES keys and the master key slot used by the
  *	[secure] command family.
  *
+ * Why / How:
  *	The crypto subsystem (`src/plugins/crypto/th8_secure.c`)
  *	allocates and owns the store; this accessor isolates it
- *	from the `Th8_Interp` struct layout.
+ *	from the `Th8_Interp` struct layout by returning the stored
+ *	pointer field directly.
  *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The stored pointer, or NULL if no key store has been
  *	installed on this interpreter.
  *
@@ -14003,11 +14798,16 @@ th8GetSecureKeyStore(Th8_Interp *interp)
  *	interpreter key store is allocated, and cleared (to NULL)
  *	on teardown.
  *
+ * Why / How:
+ *	Isolates the crypto subsystem from the `Th8_Interp` struct
+ *	layout by writing the caller-supplied pointer straight into
+ *	the stored field; ownership stays with the caller.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	p      -- new key-store pointer; may be NULL to clear.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -14032,13 +14832,15 @@ th8SetSecureKeyStore(Th8_Interp *interp, void *p)
  *	authentication tag).  The hash is consulted by [set] and
  *	[unset] to dispatch the secure-variable path transparently.
  *
+ * Why / How:
  *	The crypto subsystem owns the hash; this accessor isolates
- *	it from the `Th8_Interp` struct layout.
+ *	it from the `Th8_Interp` struct layout by returning the
+ *	stored hash-table pointer directly.
  *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The stored `Th8_Hash *`, or NULL if no secure-variable hash
  *	has been installed on this interpreter.
  *
@@ -14062,11 +14864,16 @@ th8GetSecureVarHash(Th8_Interp *interp)
  *	Called by the crypto subsystem during initialisation and
  *	cleared (to NULL) on teardown.
  *
+ * Why / How:
+ *	Isolates the crypto subsystem from the `Th8_Interp` struct
+ *	layout by writing the caller-supplied hash pointer straight
+ *	into the stored field; ownership stays with the caller.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	p      -- new hash pointer; may be NULL to clear.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -14097,10 +14904,15 @@ th8SetSecureVarHash(Th8_Interp *interp, Th8_Hash *p)
  *	clock-skew attacks on signed scripts; paired with
  *	`th8GetLastLocalMs` to compute cache freshness.
  *
+ * Why / How:
+ *	Isolates the Harpy time-validation code from the
+ *	`Th8_Interp` struct layout by returning the cached epoch
+ *	second field directly.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The cached epoch second, or 0 if no NTP query has ever
  *	been recorded on this interpreter.
  *
@@ -14125,11 +14937,16 @@ th8GetLastNtpSec(Th8_Interp *interp)
  *	`th8SetLastLocalMs(monotonic-millisecond-at-query)` so the
  *	freshness comparison works correctly.
  *
+ * Why / How:
+ *	Isolates the Harpy time-validation code from the
+ *	`Th8_Interp` struct layout by writing the epoch second
+ *	straight into the stored field.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	sec    -- epoch seconds since 1970-01-01 UTC.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -14155,10 +14972,15 @@ th8SetLastNtpSec(Th8_Interp *interp, th8_int64_t sec)
  *	whether the cached NTP result has expired and a fresh query
  *	is needed.
  *
+ * Why / How:
+ *	Isolates the Harpy time-validation code from the
+ *	`Th8_Interp` struct layout by returning the cached
+ *	monotonic-millisecond field directly.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The cached monotonic millisecond, or 0 if no NTP query has
  *	ever been recorded on this interpreter.
  *
@@ -14182,11 +15004,16 @@ th8GetLastLocalMs(Th8_Interp *interp)
  *	most recent NTP query.  See `th8GetLastLocalMs` for how
  *	this value is used in the cache-freshness check.
  *
+ * Why / How:
+ *	Isolates the Harpy time-validation code from the
+ *	`Th8_Interp` struct layout by writing the monotonic
+ *	millisecond straight into the stored field.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	ms     -- monotonic milliseconds (typically from `xTimeMs`).
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -14210,14 +15037,16 @@ th8SetLastLocalMs(Th8_Interp *interp, th8_int64_t ms)
  *
  *	Return the head of the plugin-registration linked list on
  *	the interpreter.  Plugins are kept as a chain of
- *	`Th8_PluginEntry` records owned by `src/th8_plugin.c`;
- *	this accessor isolates the plugin code from the
- *	`Th8_Interp` struct layout.
+ *	`Th8_PluginEntry` records owned by `src/th8_plugin.c`.
+ *
+ * Why / How:
+ *	Isolates the plugin code from the `Th8_Interp` struct
+ *	layout by returning the stored list-head pointer directly.
  *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The list head, or NULL if no plugins are registered.
  *
  * Side effects:
@@ -14241,11 +15070,16 @@ th8GetPluginList(Th8_Interp *interp)
  *	a plugin is added at the head of the list and on teardown
  *	to clear the chain.
  *
+ * Why / How:
+ *	Isolates the plugin code from the `Th8_Interp` struct
+ *	layout by writing the caller-supplied list head straight
+ *	into the stored field.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	p      -- new list head; may be NULL to clear.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -14414,6 +15248,72 @@ th8GetCmdToken(Th8_Interp *interp, const char *zName)
 /*
  *----------------------------------------------------------------------
  *
+ * th8AccountAlloc --
+ *
+ *	Add `nAccounted` bytes to the per-interpreter allocation counter
+ *	interp->nAllocBytes with overflow-safe (saturating) arithmetic.
+ *	`nAccounted` is the allocator's reported usable size for a block just
+ *	obtained, or the requested size when the platform has no usable-size
+ *	query.  Called by every allocation/reallocation success path.
+ *
+ * Why / How:
+ *	TH8K-023.  The preflight limit check bounds the REQUESTED size against the
+ *	remaining headroom, but a real allocator's usable size can exceed the
+ *	request by rounding, and a broken or hostile platform could report an
+ *	absurd size.  A plain `nAllocBytes += nAccounted` can therefore wrap
+ *	size_t, after which the ceiling check sees a falsely small current total
+ *	and the per-interpreter memory cap silently collapses -- the invariant
+ *	the finding is about.  This helper never wraps: if the addition would
+ *	overflow it saturates nAllocBytes at (size_t)-1, which permanently rejects
+ *	every later allocation (a LOCAL POISON) rather than wrapping or panicking.
+ *
+ *	Accounting stays EXACT otherwise (it does not clamp the total down to
+ *	nAllocLimit): the counter then equals the true outstanding usable bytes,
+ *	so the free path -- which subtracts the same usable size -- never drifts,
+ *	and the ceiling remains a sound upper bound on real memory.  The only
+ *	slack is that an honest allocator's rounding can leave the total at most
+ *	one allocation's rounding ABOVE nAllocLimit; that is the SAFE direction
+ *	(the next preflight is stricter and rejects sooner) and it self-corrects
+ *	when the block is freed.  Clamping the total down to nAllocLimit instead
+ *	would look tidier but is unsound: a later free subtracts the real usable
+ *	size from a clamped total and drives the counter BELOW the truth, which
+ *	understates memory pressure -- the unsafe direction.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Updates interp->nAllocBytes.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8AccountAlloc(Th8_Interp *interp, size_t nAccounted)
+{
+    size_t nNew;
+
+    if (NEVER(interp == NULL)) return;
+    if (TH8_SAFE_ADD_SIZE(interp->nAllocBytes, nAccounted, &nNew)) {
+	/* Impossible/hostile platform usable size: poison the counter at its
+	 * ceiling so no further allocation can succeed, instead of wrapping to
+	 * a falsely small value that would collapse the memory cap. */
+	interp->nAllocBytes = (size_t)-1;
+    } else {
+	interp->nAllocBytes = nNew;
+    }
+    /* Maintain the high-water mark (TH8K-021).  Every growth of nAllocBytes
+     * flows through this single helper, so the peak is exact without touching
+     * the free/subtract paths (which only shrink the total). */
+    if (interp->nAllocBytes > interp->nAllocPeak) {
+	interp->nAllocPeak = interp->nAllocBytes;
+    }
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8MallocCommon --
  *
  *	Common implementation for Th8_Malloc and Th8_AttemptMalloc.
@@ -14429,10 +15329,23 @@ th8GetCmdToken(Th8_Interp *interp, const char *zName)
  *	dispatch (xMalloc), zero-fill (xMemset), and allocation
  *	tracking (nAllocBytes) code path.
  *
+ * Results:
+ *	A pointer to nByte zero-filled bytes, or NULL if the
+ *	interpreter/platform is NULL, the sandbox memory limit
+ *	would be exceeded, or the platform allocator fails.  When
+ *	bPanic is non-zero, a failure invokes xPanic (which
+ *	typically does not return) before NULL is produced.
+ *
+ * Side effects:
+ *	Calls the platform xMalloc/xMemset; updates the
+ *	interpreter's nAllocBytes/nAllocPeak accounting; stashes the
+ *	call site for fault injection; may emit an error trace and
+ *	invoke xPanic.
+ *
  *----------------------------------------------------------------------
  */
 
-static void *
+void *
 th8MallocCommon(
     Th8_Interp *interp, /* Interpreter for platform access. */
     size_t nByte, /* Number of bytes to allocate. */
@@ -14454,8 +15367,17 @@ th8MallocCommon(
      * Sandbox memory limit check.
      */
 
+    /*
+     * Overflow-safe limit check (TH8K-023).  `nAllocBytes + nByte` can wrap
+     * before the comparison, which would silently admit an allocation past the
+     * limit.  Because usable-size accounting can round nAllocBytes slightly
+     * over the limit, reject that case first, then compare against the
+     * remaining headroom by subtraction (never an add).
+     */
+
     if (interp->nAllocLimit > 0 &&
-        interp->nAllocBytes + nByte > interp->nAllocLimit) {
+        (interp->nAllocBytes > interp->nAllocLimit ||
+         nByte > interp->nAllocLimit - interp->nAllocBytes)) {
 	TH8_TRACE_ERR(interp, "memory limit exceeded");
 	if (bPanic && interp->pPlatform->xPanic) {
 	    interp->pPlatform->xPanic(
@@ -14489,10 +15411,12 @@ th8MallocCommon(
 	 */
 
 	if (interp->pPlatform->xMemorySize) {
-	    interp->nAllocBytes += interp->pPlatform->xMemorySize(
-	        interp, interp->pPlatform->pCtx, p);
+	    th8AccountAlloc(
+	        interp,
+	        interp->pPlatform
+	            ->xMemorySize(interp, interp->pPlatform->pCtx, p));
 	} else {
-	    interp->nAllocBytes += nByte;
+	    th8AccountAlloc(interp, nByte);
 	}
 #if defined(TH8_MEM_DEBUG)
 	th8MemTrackAlloc(interp, p, nByte);
@@ -14523,6 +15447,14 @@ th8MallocCommon(
  *	failure, xPanic is invoked (which typically aborts), so
  *	the caller never sees a NULL return.
  *
+ * Results:
+ *	A pointer to nByte zero-filled bytes.  Only returns NULL if
+ *	xPanic is absent or does not abort on failure.
+ *
+ * Side effects:
+ *	Those of th8MallocCommon: platform allocation, nAllocBytes
+ *	accounting, and xPanic on failure.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -14549,6 +15481,14 @@ Th8_Malloc(Th8_Interp *interp, size_t nByte)
  *	Thin wrapper around th8MallocCommon with bPanic=0.  Returns
  *	NULL on failure, allowing the caller to set an error message
  *	and propagate TH8_ERROR gracefully.
+ *
+ * Results:
+ *	A pointer to nByte zero-filled bytes, or NULL on allocation
+ *	failure or memory-limit exhaustion.  Never panics.
+ *
+ * Side effects:
+ *	Those of th8MallocCommon: platform allocation and
+ *	nAllocBytes accounting.  No xPanic.
  *
  *----------------------------------------------------------------------
  */
@@ -14601,22 +15541,19 @@ Th8_SafeAlloc(Th8_Interp *interp, size_t nByte, const char *zFile, int nLine)
      * (no-op when fault injection is not installed). */
     p = th8MallocCommon(interp, nByte, 0, zFile, nLine);
 
-    /* Second-chance: xNeedMemory callback. */
+    /*
+     * Second-chance: xNeedMemory callback (TH8K-023).  It returns a
+     * ready-to-use block -- zero-filled, limit-checked, and ACCOUNTED -- or
+     * NULL.  The built-in callback guarantees that by delegating to the same
+     * th8MallocCommon core the normal path uses, so accounting and the memory
+     * limit live in EXACTLY ONE place.  The core therefore does NOT re-zero or
+     * re-account the result here (doing so previously double-accounted and,
+     * worse, skipped the limit check -- letting the second chance punch through
+     * Th8_SetAllocLimit).  Th8_SafeAlloc is the non-panicking path, so bPanic
+     * is 0; the call site (zFile,nLine) is forwarded for the fault filter.
+     */
     if (!p && interp->pPlatform->xNeedMemory) {
-	p = interp->pPlatform->xNeedMemory(interp, nByte);
-	if (p) {
-	    /* Zero-fill and track, same as th8MallocCommon. */
-	    if (interp->pPlatform->xMemset) {
-		interp->pPlatform
-		    ->xMemset(interp, interp->pPlatform->pCtx, p, 0, nByte);
-	    }
-	    if (interp->pPlatform->xMemorySize) {
-		interp->nAllocBytes += interp->pPlatform->xMemorySize(
-		    interp, interp->pPlatform->pCtx, p);
-	    } else {
-		interp->nAllocBytes += nByte;
-	    }
-	}
+	p = interp->pPlatform->xNeedMemory(interp, nByte, 0, zFile, nLine);
     }
 
 #if defined(TH8_DEBUG)
@@ -15059,6 +15996,19 @@ Th8_Free(
  *	new.  The bPanic flag controls whether failure invokes xPanic
  *	or returns NULL.
  *
+ * Results:
+ *	A pointer to the resized block of nByte bytes, or NULL if the
+ *	interpreter/platform is NULL, the sandbox memory limit would
+ *	be exceeded when growing, or xRealloc fails.  When bPanic is
+ *	non-zero, a failure invokes xPanic (which typically does not
+ *	return) before NULL is produced.  On failure the original
+ *	block is left untouched.
+ *
+ * Side effects:
+ *	Calls the platform xRealloc; updates the interpreter's
+ *	nAllocBytes/nAllocPeak accounting; stashes the call site for
+ *	fault injection; may emit an error trace and invoke xPanic.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15087,7 +16037,9 @@ th8ReallocCommon(
     if (interp->nAllocLimit > 0 && nByte > nOldSize) {
 	size_t nDelta = nByte - nOldSize;
 
-	if (interp->nAllocBytes + nDelta > interp->nAllocLimit) {
+	/* Overflow-safe headroom check; see TH8K-023 note in th8Alloc. */
+	if (interp->nAllocBytes > interp->nAllocLimit ||
+	    nDelta > interp->nAllocLimit - interp->nAllocBytes) {
 	    TH8_TRACE_ERR(interp, "memory limit exceeded");
 	    if (bPanic && interp->pPlatform->xPanic) {
 		interp->pPlatform->xPanic(
@@ -15112,10 +16064,12 @@ th8ReallocCommon(
 	    interp->nAllocBytes = 0;
 	}
 	if (interp->pPlatform->xMemorySize) {
-	    interp->nAllocBytes += interp->pPlatform->xMemorySize(
-	        interp, interp->pPlatform->pCtx, pNew);
+	    th8AccountAlloc(
+	        interp,
+	        interp->pPlatform
+	            ->xMemorySize(interp, interp->pPlatform->pCtx, pNew));
 	} else {
-	    interp->nAllocBytes += nByte;
+	    th8AccountAlloc(interp, nByte);
 	}
 #if defined(TH8_MEM_DEBUG)
 	th8MemTrackRealloc(interp, p, pNew, nByte);
@@ -15179,6 +16133,15 @@ Th8_Realloc(Th8_Interp *interp, void *p, size_t nByte)
  *	NULL on failure, leaving the original block untouched so
  *	the caller can free it after setting an error.
  *
+ * Results:
+ *	A pointer to the resized block, or NULL on failure or
+ *	memory-limit exhaustion.  Never panics.  On failure the
+ *	original block is NOT freed.
+ *
+ * Side effects:
+ *	Those of th8ReallocCommon: platform reallocation and
+ *	nAllocBytes accounting.  No xPanic.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15202,6 +16165,21 @@ Th8_AttemptRealloc(Th8_Interp *interp, void *p, size_t nByte)
  *	Pathological sizes (zero, or larger than TH8_MX_ALLOC) are
  *	rejected with a trace and a NULL return.  This matches the
  *	Th8_SafeAlloc contract for non-realloc allocations.
+ *
+ * Why / How:
+ *	Adds a size sanity gate in front of th8ReallocCommon
+ *	(bPanic=1) and threads the caller's __FILE__/__LINE__ through
+ *	for fault-injection filtering and, under TH8_DEBUG, richer
+ *	rejection/OOM traces.
+ *
+ * Results:
+ *	A pointer to the resized block, or NULL if nByte is zero or
+ *	exceeds TH8_MX_ALLOC.  On a genuine OOM, th8ReallocCommon
+ *	panics rather than returning.
+ *
+ * Side effects:
+ *	Those of th8ReallocCommon (platform reallocation, nAllocBytes
+ *	accounting, xPanic on OOM); may emit error traces.
  *
  *----------------------------------------------------------------------
  */
@@ -15259,6 +16237,21 @@ Th8_SafeRealloc(
  *	TH8_ATTEMPT_REALLOC macro.  The original block is NOT freed
  *	on failure; the caller can recover or report TH8_ERROR.
  *
+ * Why / How:
+ *	Adds a size sanity gate in front of th8ReallocCommon
+ *	(bPanic=0) and threads the caller's __FILE__/__LINE__ through
+ *	for fault-injection filtering and, under TH8_DEBUG, richer
+ *	rejection/OOM traces.
+ *
+ * Results:
+ *	A pointer to the resized block, or NULL if nByte is zero,
+ *	exceeds TH8_MX_ALLOC, or the reallocation fails.  Never
+ *	panics; the original block is NOT freed on failure.
+ *
+ * Side effects:
+ *	Those of th8ReallocCommon (platform reallocation, nAllocBytes
+ *	accounting); may emit error traces.  No xPanic.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15307,6 +16300,13 @@ Th8_SafeAttemptRealloc(
  *	modules outside th8_core.c can call platform callbacks
  *	without accessing interpreter internals directly.
  *
+ * Results:
+ *	The interpreter's stored platform vtable pointer (may be
+ *	NULL during teardown).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15329,6 +16329,13 @@ Th8_GetPlatform(Th8_Interp *interp)
  *	records in a hash keyed by package name.  This accessor
  *	hides the interpreter struct layout from that module.
  *
+ * Results:
+ *	The interpreter's package registry hash pointer (may be NULL
+ *	if none has been created).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15350,6 +16357,15 @@ Th8_GetPackageHash(Th8_Interp *interp) /* Interpreter. */
  *	Math functions are optional (expr extensions), so the hash
  *	is only allocated on first use to avoid overhead when
  *	no math functions are registered.
+ *
+ * Results:
+ *	The interpreter's math-function registry hash, allocating it
+ *	on first call.  (A NULL allocation failure would propagate
+ *	from Th8_HashNew.)
+ *
+ * Side effects:
+ *	May allocate and install a new hash table on the interpreter
+ *	on first use.
  *
  *----------------------------------------------------------------------
  */
@@ -15380,6 +16396,15 @@ Th8_GetMathFuncHash(Th8_Interp *interp) /* Interpreter. */
  *	threads).  Allocation is lazy so interpreters that never
  *	use the search API pay no overhead.
  *
+ * Results:
+ *	The interpreter's array-search registry hash.  Allocates and
+ *	installs one when bCreate is non-zero and none exists;
+ *	otherwise returns the existing hash or NULL.
+ *
+ * Side effects:
+ *	May allocate and install a new hash table on the interpreter
+ *	when bCreate is non-zero.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15407,6 +16432,13 @@ th8GetArraySearchHash(
  *	Using a per-interp counter (instead of process-static)
  *	keeps search IDs from one interpreter from colliding with
  *	another's, even if interpreters share a process.
+ *
+ * Results:
+ *	The next array-search counter value (the pre-increment
+ *	counter after incrementing).
+ *
+ * Side effects:
+ *	Increments the interpreter's array-search counter.
  *
  *----------------------------------------------------------------------
  */
@@ -15506,6 +16538,14 @@ th8NextArraySearchId(Th8_Interp *interp) /* Interpreter. */
  *	Th8_CreateAsyncState).  It does NOT take any lock, because
  *	by contract no concurrent producer exists yet.
  *
+ * Why / How:
+ *	Snapshotting the platform callbacks onto the pState at
+ *	creation time means cross-thread producers never touch the
+ *	interp's pPlatform; they read only the pState's own stable,
+ *	cached pointers.  TH8_CHECK_EVENT_CALLBACKS gates the copy so
+ *	the "locked in" set is validated as complete before any is
+ *	stored (all-or-nothing).
+ *
  * Results:
  *	TH8_OK if every required platform callback is present and
  *	the pState's cached pointers were populated.  TH8_ERROR if
@@ -15567,6 +16607,16 @@ th8EventQueueAvailable(Th8_Interp *interp, Th8_AsyncState *pState)
  *	Th8_CancelEval / Th8_Freeze (via th8SignalAllStates), and
  *	by [vwait]'s wake-up path indirectly through xEventWait.
  *
+ * Why / How:
+ *	The producer that just enqueued work (or a cancel/freeze
+ *	hook) sets the manual-reset event so a consumer blocked in
+ *	th8WaitEvent wakes and re-polls.  Guards are plain (not
+ *	NEVER/ALWAYS) because a concurrent finalize can NULL the
+ *	handle out from under this call.
+ *
+ * Results:
+ *	None.
+ *
  * Side effects:
  *	Transitions pEventHandle to "signaled" state.  Subsequent
  *	xEventWait calls on this handle return immediately until
@@ -15607,6 +16657,21 @@ th8SignalEvent(Th8_AsyncState *pState)
  *	Same-thread only.  Reset is meaningful only on the consumer
  *	thread; producers Set without ever Resetting.
  *
+ * Why / How:
+ *	Implements the Reset => re-check => Wait half of the
+ *	manual-reset idiom: clearing the handle before re-checking
+ *	predicates closes the window where a signal that arrives
+ *	during the re-check would be lost.  Guards are plain because
+ *	a concurrent finalize can NULL the handle.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Transitions pEventHandle to the "non-signaled" state so the
+ *	next xEventWait can block.  No-op if the handle or callback
+ *	is absent.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15646,6 +16711,22 @@ th8ResetEvent(Th8_AsyncState *pState)
  *	the failure surface as a distinct return code rather than
  *	a NULL-deref).
  *
+ * Why / How:
+ *	Delegates to the pState's cached xEventWait so [vwait] can
+ *	sleep efficiently until a producer signals, rather than
+ *	busy-polling.  Distinguishing RETRY (spurious/early wake)
+ *	from OK/TIMEOUT/ERROR lets the caller re-poll only when it
+ *	must.
+ *
+ * Results:
+ *	One of TH8_WAIT_OK / TH8_WAIT_RETRY / TH8_WAIT_TIMEOUT /
+ *	TH8_WAIT_ERROR (the last also when the cached
+ *	xEventWait/handle is missing).
+ *
+ * Side effects:
+ *	Blocks the calling thread until signaled, timed out, or
+ *	early-woken.  No state change of its own beyond the wait.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15674,6 +16755,18 @@ th8WaitEvent(Th8_AsyncState *pState, int nTimeoutMs)
  *	use the high-level Th8_DrainQueueEvents instead of polling
  *	a length.
  *
+ * Why / How:
+ *	The count spans the static ring buffer plus the overflow
+ *	list, both mutated by cross-thread producers, so it must be
+ *	read under the pState's queue mutex to be coherent.
+ *
+ * Results:
+ *	The number of pending callbacks (nStatic + nOverflow), or 0
+ *	if pState is NULL or its mutex is not ready.
+ *
+ * Side effects:
+ *	Briefly acquires and releases the pState's queue mutex.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15701,6 +16794,20 @@ th8PStateQueueLen(Th8_AsyncState *pState)
  *	is gone) and reads each live pState's count under its
  *	own mutex.  Single-threaded: must be called on the
  *	interp's owning thread.
+ *
+ * Why / How:
+ *	[vwait] must distinguish "work is pending" from "sleep until
+ *	signaled"; this scans the interp's pState registry and
+ *	short-circuits on the first non-empty queue, skipping
+ *	finalized/absent nodes.
+ *
+ * Results:
+ *	1 if any live pState has at least one queued callback; 0
+ *	otherwise (including a NULL interp).
+ *
+ * Side effects:
+ *	None of its own; th8PStateQueueLen briefly locks each
+ *	pState's queue mutex as it is polled.
  *
  *----------------------------------------------------------------------
  */
@@ -15738,10 +16845,23 @@ th8AnyEventQueued(Th8_Interp *interp)
  *	invoked), 0 if the queue was empty.  This lets the caller
  *	loop without re-checking length.
  *
+ * Why / How:
+ *	The pop happens under the queue mutex but the callback is
+ *	invoked with the mutex released, because the callback may
+ *	re-enter the queue (on this or another pState) or take other
+ *	locks.  Backfilling the freed static slot from the overflow
+ *	head preserves strict FIFO across the ring/overflow seam.
+ *
  * Results:
  *	The callback's return code on success.  TH8_OK if the
  *	queue was empty (with *pbDrained==0).  TH8_ERROR only on
  *	input validation (NULL pState).
+ *
+ * Side effects:
+ *	Removes one callback from the pState's queue and invokes it;
+ *	may free an overflow event node; acquires/releases the queue
+ *	mutex.  Drops the event silently if the owning interp has
+ *	been NULLed (teardown).
  *
  *----------------------------------------------------------------------
  */
@@ -15819,6 +16939,24 @@ th8DrainOneStateEvent(Th8_AsyncState *pState, int *pbDrained)
  *	wait for the next drain call.  This keeps the walk
  *	bounded.
  *
+ * Why / How:
+ *	Uses a round-robin walk that re-fetches each pState through
+ *	its interp-owned registry node every pass, so a callback that
+ *	finalizes its own pState mid-drain is detected via
+ *	pNode->nFinalized instead of dangling a stale pointer.
+ *	Repeating passes until one drains nothing bounds the work to
+ *	the events present when the call began.
+ *
+ * Results:
+ *	TH8_OK when the queues are drained (or nLimit reached);
+ *	otherwise the first non-OK callback return code, which stops
+ *	the drain.  TH8_ERROR on a NULL interp.
+ *
+ * Side effects:
+ *	Invokes queued callbacks (which may mutate arbitrary interp
+ *	state and enqueue further events); writes the count invoked
+ *	to *pnProcessed when non-NULL.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15883,6 +17021,18 @@ th8DrainAll(Th8_Interp *interp, int nLimit, int *pnProcessed)
  *	scripts get a clear error rather than a silent no-op.
  *	Same-thread only.
  *
+ * Why / How:
+ *	Checks the interp's live platform vtable (not a cached
+ *	pState snapshot) with TH8_CHECK_EVENT_CALLBACKS so [update] /
+ *	[vwait] can reject unsupported platforms at dispatch.
+ *
+ * Results:
+ *	1 if the platform supplies every required event-queue
+ *	callback; 0 otherwise (including a NULL interp or platform).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -15906,6 +17056,19 @@ th8PlatformHasEventQueue(Th8_Interp *interp)
  *	every queued event on every live pState registered with
  *	the interp.  Single-threaded: must be called on the
  *	interp's owning thread.
+ *
+ * Why / How:
+ *	Exposes the unlimited-drain operation as the public API,
+ *	delegating to th8DrainAll with nLimit=-1 so callers need not
+ *	know about limits or the processed-count out-parameter.
+ *
+ * Results:
+ *	TH8_OK when all queues drain, or the first non-OK callback
+ *	return code (which halts the drain); TH8_ERROR on NULL interp.
+ *
+ * Side effects:
+ *	Those of th8DrainAll: invokes every currently queued
+ *	callback and whatever state they mutate.
  *
  *----------------------------------------------------------------------
  */
@@ -15932,6 +17095,21 @@ Th8_DrainQueueEvents(Th8_Interp *interp)
  *	Th8_QueueEvent on this pState.  In practice this is
  *	achieved by joining all worker threads before calling
  *	Finalize.
+ *
+ * Why / How:
+ *	At teardown the queued callbacks have nowhere left to run, so
+ *	they are discarded rather than invoked.  The static ring is
+ *	reset by zeroing its counters; each overflow node is a heap
+ *	allocation and must be individually freed.  Done under the
+ *	queue mutex (when ready) for consistency with producers.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Frees every overflow event node and resets the pState's
+ *	static/overflow queue counters to empty; acquires/releases
+ *	the queue mutex when ready.
  *
  *----------------------------------------------------------------------
  */
@@ -15970,6 +17148,19 @@ th8FreePStateEvents(Th8_AsyncState *pState)
  *	[vwait] currently sleeping in xEventWait so it can
  *	observe the cancel/freeze flag promptly.  Single-threaded
  *	(interp's owning thread).
+ *
+ * Why / How:
+ *	Cancel/freeze set a flag that a sleeping [vwait] only notices
+ *	after it wakes, so every live pState's handle must be
+ *	signaled to force a prompt re-poll.  Walks the interp's
+ *	pState registry, skipping finalized/absent nodes.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Signals each live pState's event handle (via th8SignalEvent),
+ *	waking any thread blocked in th8WaitEvent.
  *
  *----------------------------------------------------------------------
  */
@@ -16013,9 +17204,24 @@ th8SignalAllStates(Th8_Interp *interp)
  *
  *	On any failure the partial state is unwound completely.
  *
+ * Why / How:
+ *	Snapshotting the platform's function pointers and pCtx onto
+ *	the pState at creation is what lets cross-thread producers
+ *	(Th8_QueueEvent) run without ever touching interp->pPlatform.
+ *	The registry node is appended at the tail so cross-source
+ *	events drain in registration (FIFO) order.  Every step's
+ *	failure path unwinds the earlier steps, so no partial pState
+ *	is ever published.
+ *
  * Results:
  *	The new pState on success; NULL if the platform is
  *	missing required callbacks or any allocation fails.
+ *
+ * Side effects:
+ *	Allocates the pState and its registry node; initializes the
+ *	queue mutex; creates the manual-reset event handle; links the
+ *	node into interp->pAsyncStateHead.  Frees all of it again on
+ *	any failure.
  *
  *----------------------------------------------------------------------
  */
@@ -16140,6 +17346,21 @@ Th8_CreateAsyncState(Th8_Interp *interp, void *pCtx)
  *	NEVER dereferences interp internals - that's what makes
  *	it safe after Th8_DeleteInterp.
  *
+ * Why / How:
+ *	Because the pState carries its own cached callbacks, teardown
+ *	needs no interp, so it is safe even after Th8_DeleteInterp.
+ *	Setting nFinalized via an atomic compare-exchange interlocks
+ *	against Th8_DeleteInterp's concurrent registry walk so the
+ *	pState is torn down exactly once.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR if pStateAny is NULL.
+ *
+ * Side effects:
+ *	Marks the registry node finalized; drops queued callbacks;
+ *	destroys the event handle; finalizes the queue mutex; frees
+ *	the pState struct.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -16216,10 +17437,25 @@ Th8_FinalizeAsyncState(void *pStateAny)
  *	     for the lost-wakeup race close).
  *	  5. Unlock.
  *
+ * Why / How:
+ *	Operates solely on the pState's cached callbacks/mutex/handle
+ *	so it is safe from any thread without touching the interp.
+ *	An atomic read of nDeleted rejects enqueues after interp
+ *	teardown.  The static ring buffer absorbs the common case
+ *	with no heap activity; only when it is full is an overflow
+ *	Th8_Event node allocated.  The handle is signaled under the
+ *	mutex to close the lost-wakeup window against the consumer's
+ *	Reset => Wait sequence.
+ *
  * Results:
  *	TH8_OK on success; TH8_ERROR if pState/xCallback is NULL,
  *	the interp has been deleted, the pState was somehow (?)
  *	created without a complete platform, or an allocation fails.
+ *
+ * Side effects:
+ *	Appends the callback to the pState's queue (possibly
+ *	allocating an overflow node), signals the event handle, and
+ *	acquires/releases the queue mutex.  Callable from any thread.
  *
  *----------------------------------------------------------------------
  */
@@ -16333,6 +17569,13 @@ th8ArraySearchIterEntry(Th8_HashEntry *pEntry, void *pCtx)
  *	non-`TH8_OK`; that return code propagates to this
  *	function's caller.
  *
+ * Why / How:
+ *	Wraps Th8_HashIterate over the per-interp array-search hash,
+ *	using th8ArraySearchIterEntry to translate each raw hash
+ *	entry into the public (zArray, nArray, zSid, nSid, pCtx)
+ *	callback shape.  An absent hash (no active cursors) is
+ *	treated as success with zero iterations.
+ *
  * Parameters:
  *	interp    -- interpreter holding the array-search hash.
  *	             Must be non-NULL.
@@ -16343,7 +17586,7 @@ th8ArraySearchIterEntry(Th8_HashEntry *pEntry, void *pCtx)
  *	pCtx      -- opaque pointer passed through to the
  *	             callback.  May be NULL.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` if every callback returned `TH8_OK` (or no
  *	cursors exist).
  *	`TH8_ERROR` if `interp` or `xCallback` is NULL, or if any
@@ -16457,9 +17700,13 @@ Th8_SetPackageUnknown(Th8_Interp *interp, const char *zCmd, size_t nCmd)
 static void th8FreeNamespace(Th8_Interp *, Th8_Namespace *);
 static int th8FreeChildEntry(Th8_HashEntry *, void *);
 static int th8FreeCmdEntry(Th8_HashEntry *, void *);
+static void th8FreeSubCommands(Th8_Interp *, Th8_Command *);
 static void th8QueuePendingCmd(Th8_Interp *, Th8_Command *);
 static void th8QueuePendingNs(Th8_Interp *, Th8_Namespace *);
 static void th8DrainPendingDeletes(Th8_Interp *);
+static void th8UnlinkFreeNamespace(Th8_Interp *, Th8_Namespace *);
+static Th8_Namespace *
+th8FindNamespaceEx(Th8_Interp *, const char *, size_t, int, Th8_Namespace **);
 
 
 /*
@@ -16475,6 +17722,13 @@ static void th8DrainPendingDeletes(Th8_Interp *);
  *	The global namespace has no explicit name, so "::" is
  *	returned as a special case.  Used by [namespace current]
  *	and namespace-qualified command resolution.
+ *
+ * Results:
+ *	The current namespace's fully qualified name, or "::" for the
+ *	global namespace (or an unnamed current namespace).
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -16608,6 +17862,14 @@ th8SetFrameNsPtr(
  *	being evaluated.  Silently stops pushing at
  *	TH8_MAX_SOURCE_DEPTH to prevent overflow.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Pushes (zName, nName) onto the interpreter's source stack and
+ *	increments nSourceDepth, unless the stack is already full (in
+ *	which case it silently does nothing).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -16636,6 +17898,13 @@ Th8_PushSourceName(Th8_Interp *interp, const char *zName, size_t nName)
  *	Paired with Th8_PushSourceName to bracket file
  *	evaluation so the source stack stays balanced.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Decrements nSourceDepth and clears the vacated slot, unless
+ *	the stack is already empty (in which case it does nothing).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -16663,6 +17932,14 @@ Th8_PopSourceName(Th8_Interp *interp)
  *	Peeks at the top of the source-name stack without popping.
  *	Returns "" rather than NULL so callers never need a NULL
  *	check.  Implements [info script].
+ *
+ * Results:
+ *	The innermost source-name string, or "" if none is active.
+ *	When pnName is non-NULL, *pnName receives that name's length
+ *	(0 for the empty case).
+ *
+ * Side effects:
+ *	None (writes only through the caller's optional pnName).
  *
  *----------------------------------------------------------------------
  */
@@ -16698,7 +17975,12 @@ Th8_GetSourceName(Th8_Interp *interp, size_t *pnName)
  *	result for callers that only need existence information.
  *
  * Results:
- *	1 if found (or created), 0 if not found.
+ *	1 if found (or created), 0 if not found.  TH8_ERROR (also a
+ *	nonzero value) if interp is NULL.
+ *
+ * Side effects:
+ *	When bCreate is non-zero, may create the namespace (and any
+ *	missing parents) via th8FindNamespace; otherwise none.
  *
  *----------------------------------------------------------------------
  */
@@ -16734,6 +18016,16 @@ Th8_FindNamespace(
  * Results:
  *	TH8_OK on success, TH8_ERROR if not found or is global.
  *
+ * Side effects:
+ *	Frees the namespace's child namespaces, commands, and
+ *	variables (invoking command delete callbacks).  For the
+ *	global namespace, empties it and reinitializes its hashes
+ *	instead of freeing the struct.  Unlinks a non-global
+ *	namespace from its parent; resets pCurrentNs to global if the
+ *	current namespace was deleted.  Defers the recursive free when
+ *	inside an eval.  May set the interpreter result to an error
+ *	message.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -16741,7 +18033,6 @@ int
 Th8_DeleteNamespace(Th8_Interp *interp, const char *zName, size_t nName)
 {
     Th8_Namespace *pNs;
-    Th8_Namespace *pParent;
 
     if (!interp) return TH8_ERROR;
     pNs = th8FindNamespace(interp, zName, nName, 0);
@@ -16825,21 +18116,54 @@ Th8_DeleteNamespace(Th8_Interp *interp, const char *zName, size_t nName)
 	return TH8_OK;
     }
 
-    pParent = pNs->pParent;
+    /*
+     * Non-global: unlink from the parent's paChild hash and free the
+     * subtree (deferred while inside eval).  Shared with the transactional
+     * rollback path in th8FindNamespaceEx / Th8_CreateCommand.
+     */
+    th8UnlinkFreeNamespace(interp, pNs);
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8UnlinkFreeNamespace --
+ *
+ *	Unlink a non-global namespace from its parent's child hash and
+ *	free its subtree.
+ *
+ * Why / How:
+ *	Factored out of Th8_DeleteNamespace so the same "remove and free"
+ *	primitive backs both namespace deletion and the transactional
+ *	rollback of a namespace hierarchy that a failed qualified command
+ *	registration created (TH8K-005).  It removes pNs from its parent's
+ *	paChild hash keyed by the last "::"-separated component (via
+ *	th8SplitQualName -- Bug 5: a hand-rolled scan mishandled single-colon
+ *	names and left a dangling entry), which makes the namespace INVISIBLE
+ *	immediately; the recursive free is deferred to the pending-delete
+ *	queue while inside an eval so a command currently executing within the
+ *	namespace does not have its context freed out from under it.  Callers
+ *	must pass a non-global namespace that has a parent.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Removes pNs from its parent's paChild hash and frees pNs and its
+ *	children (immediately, or queued when interp->nEvalDepth > 0),
+ *	invoking command-delete callbacks.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8UnlinkFreeNamespace(Th8_Interp *interp, Th8_Namespace *pNs)
+{
+    Th8_Namespace *pParent = pNs->pParent;
+
     if (pParent && pNs->zName) {
-	/*
-	 * Remove from parent's paChild hash by tail (component)
-	 * name.  The child is keyed under the last "::"-separated
-	 * component; th8SplitQualName computes it correctly even
-	 * for namespace names that contain a single ":" (e.g.
-	 * "::_pkg:sub", whose component tail is "_pkg:sub", NOT
-	 * "sub").  Bug 5: the previous hand-rolled backward scan
-	 * stopped at the last single ':', so for a single-colon
-	 * name it removed the WRONG key (the entry stayed) and
-	 * left the parent's paChild pointing at the just-freed
-	 * namespace -- a dangling entry that hung interpreter
-	 * teardown (and made `namespace delete` a silent no-op).
-	 */
 	const char *zNsPart, *zTail;
 	size_t nNsPart, nTail;
 
@@ -16849,18 +18173,11 @@ Th8_DeleteNamespace(Th8_Interp *interp, const char *zName, size_t nName)
 	(void)nNsPart;
 	Th8_HashRemove(interp, pParent->paChild, zTail, nTail);
     }
-    /*
-     * Defer the recursive free when inside eval so that any
-     * command currently executing within this namespace does
-     * not have its context freed out from under it.
-     */
-
     if (interp->nEvalDepth > 0) {
 	th8QueuePendingNs(interp, pNs);
     } else {
 	th8FreeNamespace(interp, pNs);
     }
-    return TH8_OK;
 }
 
 
@@ -16903,6 +18220,14 @@ static void th8PopFrame(Th8_Interp *);
  *	previously-current namespace and pops the frame regardless
  *	of evaluation success or failure.
  *
+ * Why / How:
+ *	Creating the namespace on demand (th8FindNamespace with
+ *	bCreate=1), then bracketing the eval with a saved/restored
+ *	pCurrentNs and a pushed/popped call frame tagged with pNs, is
+ *	what makes variable and command resolution inside the script
+ *	happen in the target namespace's scope while leaving the
+ *	caller's context intact afterward.
+ *
  * Parameters:
  *	interp  -- interpreter.  Must be non-NULL.
  *	zNs     -- namespace name bytes (may be fully-qualified
@@ -16913,7 +18238,7 @@ static void th8PopFrame(Th8_Interp *);
  *	nScript -- length of `zScript`.  Pass `TH8_NOLEN` to use
  *	           `Th8_Strlen`.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on successful eval (interp result holds the
  *	script's value).
  *	`TH8_ERROR` if `interp` is NULL, if the namespace could
@@ -16944,7 +18269,25 @@ Th8_NsEval(
     if (!interp) return TH8_ERROR;
     pTarget = th8FindNamespace(interp, zNs, nNs, 1);
     if (!pTarget) {
-	Th8_SetResult(interp, "can't create namespace", TH8_NOLEN);
+	/*
+	 * Preserve the specific "namespace nested too deeply" message
+	 * that th8FindNamespace's depth guard sets (TH8K-011); other
+	 * creation failures (OOM, etc.) get the generic message.  Nested
+	 * single-condition guards so no compound MC/DC decision is added.
+	 */
+	size_t nMsg = 0;
+	const char *zMsg = Th8_GetResult(interp, &nMsg);
+	static const char zDeep[] = "namespace nested too deeply";
+	int bDeep = 0;
+
+	if (nMsg == sizeof(zDeep) - 1) {
+	    if (Th8_Memcmp(interp, zMsg, zDeep, nMsg) == 0) {
+		bDeep = 1;
+	    }
+	}
+	if (!bDeep) {
+	    Th8_SetResult(interp, "can't create namespace", TH8_NOLEN);
+	}
 	return TH8_ERROR;
     }
 
@@ -17099,6 +18442,14 @@ Th8_ListAppendNsChildren(
  *	and "" when there is no parent (i.e. the namespace is
  *	global itself).  Implements [namespace parent].
  *
+ * Results:
+ *	The parent namespace's name; "::" when the parent is the
+ *	global namespace; "" when the namespace is not found or has
+ *	no parent.
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -17132,6 +18483,12 @@ th8GetNsParent(Th8_Interp *interp, const char *zNs, size_t nNs)
  *	matches any string starting with prefix, and otherwise
  *	performs an exact length-and-byte comparison.  No
  *	recursion or backtracking is needed.
+ *
+ * Results:
+ *	1 if zStr matches the pattern zPat; 0 otherwise.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -17182,6 +18539,16 @@ th8SimpleGlob(
  *	(space-separated).  Import operations later walk this
  *	list to determine which commands are visible for import.
  *	Implements [namespace export].
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR if interp is NULL, the target
+ *	namespace is not found (interp result: "namespace not
+ *	found"), or the append runs out of memory.
+ *
+ * Side effects:
+ *	Appends zPattern (space-separated) to the namespace's
+ *	zExport buffer, growing it; may set the interpreter result to
+ *	an error message.
  *
  *----------------------------------------------------------------------
  */
@@ -17240,6 +18607,13 @@ oom:
  *	Returns "" rather than NULL when no exports are set,
  *	so callers can use the result directly.
  *
+ * Results:
+ *	The namespace's export-pattern string, or "" if the
+ *	namespace is not found or has no exports.
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -17280,6 +18654,17 @@ th8NsGetExport(Th8_Interp *interp, const char *zNs, size_t nNs)
  *	pattern.  Matching commands are cloned into the current
  *	namespace via xCopy (deep copy) or shared pointer (shallow).
  *	The -force flag allows overwriting existing commands.
+ *
+ * Results:
+ *	TH8_OK to continue iterating (including for skipped, non-
+ *	exported, or non-matching commands); TH8_ERROR to stop when
+ *	allocating the new command fails.
+ *
+ * Side effects:
+ *	For each matching command, creates (or, with -force, replaces
+ *	after freeing) a command in the current namespace.  A replaced
+ *	command's delete callback runs and its storage is freed.  May
+ *	set the interpreter result to "out of memory".
  *
  *----------------------------------------------------------------------
  */
@@ -17357,6 +18742,7 @@ th8ImportCallback(Th8_HashEntry *pEntry, void *pContext)
 
 		pOld = (Th8_Command *)pDst->pData;
 		th8RemoveCmdTokenEntry(interp, pOld);
+		th8FreeSubCommands(interp, pOld);
 		if (pOld->xDel) {
 		    pOld->xDel(interp, pOld->pContext);
 		}
@@ -17392,6 +18778,23 @@ th8ImportCallback(Th8_HashEntry *pEntry, void *pContext)
 	    }
 	    pNew->xCopy = pSrc->xCopy;
 	    pNew->pDefNs = pSrc->pDefNs;
+	    pNew->zQualName = 0;
+	    pNew->nQualName = 0;
+	    pNew->nToken = 0;
+	    /*
+	     * TH8K-025: an imported ENSEMBLE command's sub-command hash
+	     * (pSrc->paSubCommands) is not copied -- paSubCommands is set NULL
+	     * explicitly (not left to platform zero-fill, since th8InvokeCommand
+	     * treats non-NULL as an ensemble), so importing an ensemble yields a
+	     * command with no sub-commands.  This is currently unreachable for
+	     * the built-in ensembles, which live in the global namespace and are
+	     * not exported, so `namespace import` cannot name them.  A full fix
+	     * (deep-copy the sub-command hash, sharing pContext with a NULL
+	     * copy-xDel like the no-xCopy command case above) is deferred to when
+	     * ensemble import is actually needed; see
+	     * design_notes_command_subsets.md.
+	     */
+	    pNew->paSubCommands = 0;
 	    pDst->pData = (void *)pNew;
 	}
     }
@@ -17412,6 +18815,17 @@ th8ImportCallback(Th8_HashEntry *pEntry, void *pContext)
  *	glob, looks up the source namespace, then iterates its
  *	command hash via th8ImportCallback.  Implements
  *	[namespace import].
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR if interp is NULL, the pattern
+ *	is not qualified, the source namespace is unknown, or a
+ *	command copy fails.  The interpreter result carries the error
+ *	message.
+ *
+ * Side effects:
+ *	Creates import commands in the current namespace for every
+ *	matching, exported command (see th8ImportCallback); may set
+ *	the interpreter result.
  *
  *----------------------------------------------------------------------
  */
@@ -17646,6 +19060,14 @@ th8SplitQualName(
  *	it was a simple unqualified pattern.  On qualified return,
  *	*pzNs + *pnNs and *pzTail + *pnTail are set.
  *
+ * Side effects:
+ *	Writes through all the output parameters (*pzNs, *pnNs,
+ *	*pzTail, *pnTail, *pzBuf).  For a relative pattern, allocates
+ *	a resolved-pattern buffer and returns it via *pzBuf (the
+ *	caller must free it); on an out-of-memory growth it frees the
+ *	partial buffer, sets the interpreter result to "out of
+ *	memory", and returns 0.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -17790,11 +19212,13 @@ th8GetFullNsName(
 /*
  *----------------------------------------------------------------------
  *
- * th8FindNamespace --
+ * th8FindNamespaceEx --
  *
- *	Find (or create) a namespace by qualified name.  Walks the
- *	"::" separated path components starting from the global or
- *	current namespace.
+ *	Find (or, when bCreate is set, create) a namespace by qualified
+ *	name, reporting through ppCreatedRoot which namespaces (if any) this
+ *	call newly created so the caller can roll them back on a later
+ *	failure.  Walks the "::" separated path components starting from the
+ *	global or current namespace.
  *
  *	RESOLUTION ALGORITHM:
  *
@@ -17813,30 +19237,44 @@ th8GetFullNsName(
  *	4. Return the final namespace reached.
  *
  * Why / How:
- *	Implements a path-walking algorithm over the namespace tree.
- *	Each "::" separated component is looked up in the current
- *	node's paChild hash.  When bCreate is set, missing nodes are
- *	allocated with their own paCmd, paVar, and paChild hashes
- *	and inserted into the parent's child hash.
+ *	Implements a path-walking algorithm over the namespace tree.  When
+ *	bCreate is set, missing nodes are allocated and linked into the
+ *	parent's child hash.  The nodes created in one call always form a
+ *	CONTIGUOUS chain (once a component is missing, every deeper component
+ *	is missing too, because a freshly-created node has an empty paChild),
+ *	so the whole created hierarchy is the subtree rooted at the shallowest
+ *	node this call allocated -- recorded in ppCreatedRoot.  This makes the
+ *	create path transactional (TH8K-005 / project-wide rule): if any later
+ *	component fails to allocate, this function rolls back its own created
+ *	chain with th8UnlinkFreeNamespace before returning NULL, and a caller
+ *	that fails AFTER a successful create (e.g. Th8_CreateCommand) rolls the
+ *	same chain back via the returned ppCreatedRoot handle.  ppCreatedRoot
+ *	may be NULL when the caller does not need rollback tracking.
  *
  * Results:
- *	Pointer to the namespace, or NULL if not found and bCreate
- *	is false.
+ *	Pointer to the namespace, or NULL if not found and bCreate is false,
+ *	or NULL on a create allocation failure (with the partial chain already
+ *	rolled back).  On success, *ppCreatedRoot (when non-NULL) is set to the
+ *	shallowest namespace created this call, or NULL if all pre-existed.
  *
  * Side effects:
- *	If bCreate is true, missing intermediate namespaces are
- *	created.
+ *	If bCreate is true, missing intermediate namespaces are created and
+ *	linked; a create failure rolls back (unlinks + frees) any namespaces
+ *	this call had already created, leaving the tree exactly as before.
  *
  *----------------------------------------------------------------------
  */
 
-Th8_Namespace *
-th8FindNamespace(
+static Th8_Namespace *
+th8FindNamespaceEx(
     Th8_Interp *interp, /* Interpreter. */
     const char *zName, /* Namespace path (e.g. "::foo::bar"). */
     size_t nName, /* Length of zName. */
-    int bCreate) /* Create if not found? */
+    int bCreate, /* Create if not found? */
+    Th8_Namespace *
+        *ppCreatedRoot) /* OUT (may be NULL): created-chain root. */
 {
+    Th8_Namespace *pCreatedRoot = 0;
     Th8_Namespace *pNs;
     const char *z;
     size_t n;
@@ -17918,7 +19356,26 @@ th8FindNamespace(
 	    }
 
 	    /*
-	     * Create a new child namespace.
+	     * Bound namespace nesting depth (TH8K-011).  A deeply
+	     * qualified name creates one level per "::" component in a
+	     * single command, bypassing the evaluation-depth limit that
+	     * bounds nested `namespace eval`; without this cap the
+	     * recursive th8FreeNamespace teardown would overflow the
+	     * native C stack when the tree is deleted.
+	     */
+
+	    if (pNs->nDepth >= TH8_MX_NS_DEPTH) {
+		Th8_SetResultStatic(
+		    interp, "namespace nested too deeply", TH8_NOLEN);
+		goto createFail;
+	    }
+
+	    /*
+	     * Create a new child namespace.  Each create-failure arm below
+	     * frees the CURRENT half-built child locally, then jumps to
+	     * createFail, which additionally rolls back any earlier namespaces
+	     * this call had already created (pCreatedRoot) so a mid-chain
+	     * failure leaves the tree exactly as before (TH8K-005).
 	     */
 
 	    {
@@ -17927,20 +19384,21 @@ th8FindNamespace(
 
 		pChild = (Th8_Namespace *)
 		    TH8_ALLOC(interp, sizeof(Th8_Namespace));
-		if (!pChild) return 0;
+		if (!pChild) goto createFail;
 		zFull = th8GetFullNsName(interp, pNs, zComp, nComp);
 		if (!zFull) {
 		    Th8_Free(interp, pChild);
-		    return 0;
+		    goto createFail;
 		}
 		pChild->zName = zFull;
 		pChild->nName = Th8_Strlen(interp, zFull);
 		pChild->pParent = pNs;
+		pChild->nDepth = pNs->nDepth + 1;
 		pChild->paCmd = Th8_HashNew(interp);
 		if (!pChild->paCmd) {
 		    Th8_Free(interp, zFull);
 		    Th8_Free(interp, pChild);
-		    return 0;
+		    goto createFail;
 		}
 #if defined(TH8_ENABLE_VARIABLES)
 		pChild->paVar = Th8_HashNew(interp);
@@ -17948,7 +19406,7 @@ th8FindNamespace(
 		    Th8_HashDelete(interp, pChild->paCmd);
 		    Th8_Free(interp, zFull);
 		    Th8_Free(interp, pChild);
-		    return 0;
+		    goto createFail;
 		}
 #endif
 		pChild->paChild = Th8_HashNew(interp);
@@ -17959,7 +19417,7 @@ th8FindNamespace(
 		    Th8_HashDelete(interp, pChild->paCmd);
 		    Th8_Free(interp, zFull);
 		    Th8_Free(interp, pChild);
-		    return 0;
+		    goto createFail;
 		}
 
 		pEntry = Th8_HashFind(interp, pNs->paChild, zComp, nComp, 1);
@@ -17971,9 +19429,15 @@ th8FindNamespace(
 		    Th8_HashDelete(interp, pChild->paCmd);
 		    Th8_Free(interp, zFull);
 		    Th8_Free(interp, pChild);
-		    return 0;
+		    goto createFail;
 		}
 		pEntry->pData = (void *)pChild;
+
+		/*
+		 * A component was successfully created and linked.  Record the
+		 * shallowest such node as the created-chain root for rollback.
+		 */
+		if (!pCreatedRoot) pCreatedRoot = pChild;
 	    }
 	}
 
@@ -17996,7 +19460,58 @@ th8FindNamespace(
 	}
     }
 
+    if (ppCreatedRoot) *ppCreatedRoot = pCreatedRoot;
     return pNs;
+
+createFail:
+    /*
+     * A create allocation failed.  Roll back the contiguous chain of
+     * namespaces this call created (if any), leaving the tree exactly as it
+     * was on entry.  The current half-built child was already freed by the
+     * arm that jumped here.
+     */
+    if (pCreatedRoot) th8UnlinkFreeNamespace(interp, pCreatedRoot);
+    return 0;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8FindNamespace --
+ *
+ *	Find (or, when bCreate is set, create) a namespace by qualified
+ *	name, without the transactional create-chain tracking.
+ *
+ * Why / How:
+ *	Thin wrapper over th8FindNamespaceEx that passes a NULL created-root
+ *	out-param.  It is the stable internal entry point for the many callers
+ *	that only look a namespace up (bCreate == 0) or that create one and
+ *	have no later fallible step of their own to roll back for.  Callers
+ *	that must undo a just-created namespace hierarchy on a subsequent
+ *	failure (e.g. Th8_CreateCommand) call th8FindNamespaceEx directly to
+ *	obtain the rollback handle.
+ *
+ * Results:
+ *	Pointer to the namespace, or NULL if not found and bCreate is false
+ *	(or a create allocation failed, which th8FindNamespaceEx has already
+ *	rolled back).
+ *
+ * Side effects:
+ *	If bCreate is true, missing intermediate namespaces are created; a
+ *	create failure is fully rolled back.
+ *
+ *----------------------------------------------------------------------
+ */
+
+Th8_Namespace *
+th8FindNamespace(
+    Th8_Interp *interp,
+    const char *zName,
+    size_t nName,
+    int bCreate)
+{
+    return th8FindNamespaceEx(interp, zName, nName, bCreate, 0);
 }
 
 
@@ -18064,9 +19579,25 @@ th8FreeChildEntry(
 
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8FreeDataEntry --
  *
  *	Hash iteration callback: free a generic pData entry.
+ *
+ * Why / How:
+ *	Used with Th8_HashIterate over hashes whose pData is a plain
+ *	interpreter allocation (e.g. namespace expansion operators):
+ *	frees the entry's pData and NULLs it so the subsequent hash
+ *	delete cannot double-free.
+ *
+ * Results:
+ *	Always TH8_OK (continue iterating).
+ *
+ * Side effects:
+ *	Frees pEntry->pData (when non-NULL) and clears it.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -18180,39 +19711,41 @@ th8FreeNamespace(
  *	The command has already been removed from the namespace hash
  *	and token index; only the xDel callback and memory free remain.
  *
+ * Why / How:
+ *	Deleting a command while it (or its namespace) is still on the
+ *	eval stack would free memory in use.  Because pCmd is already
+ *	unlinked, it is threaded onto the interpreter's pending-command
+ *	FIFO through its own pPendingNext pointer -- an intrusive,
+ *	allocation-free enqueue with no OOM path (TH8K-007).
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Appends pCmd to the interpreter's pending-command deletion
+ *	FIFO (pPendingCmdHead/Tail).
+ *
  *----------------------------------------------------------------------
  */
 
 static void
 th8QueuePendingCmd(Th8_Interp *interp, Th8_Command *pCmd)
 {
-    Th8_PendingDelete *pEntry;
-
-    pEntry = (Th8_PendingDelete *)
-        TH8_ALLOC(interp, sizeof(Th8_PendingDelete));
-    if (!pEntry) {
-	/*
-	 * Out of memory -- fall back to immediate deletion.
-	 * Better to risk the use-after-free than to leak the
-	 * command permanently.
-	 */
-	if (pCmd->xDel) {
-	    pCmd->xDel(interp, pCmd->pContext);
-	}
-	Th8_Free(interp, pCmd->zQualName);
-	Th8_Free(interp, pCmd);
-	return;
-    }
-    pEntry->eType = TH8_PENDING_CMD;
-    pEntry->u.cmd.pCmd = pCmd;
-    pEntry->pNext = 0;
-
-    if (interp->pPendingTail) {
-	interp->pPendingTail->pNext = pEntry;
+    /*
+     * Intrusive, allocation-free enqueue (TH8K-007): pCmd is already
+     * unlinked from its namespace hash and the token index, so it is
+     * threaded directly onto the pending-command FIFO through its own
+     * pPendingNext.  There is no allocation, hence no OOM path that
+     * could force the old "risk a use-after-free rather than leak"
+     * immediate free.
+     */
+    pCmd->pPendingNext = 0;
+    if (interp->pPendingCmdTail) {
+	interp->pPendingCmdTail->pPendingNext = pCmd;
     } else {
-	interp->pPendingHead = pEntry;
+	interp->pPendingCmdHead = pCmd;
     }
-    interp->pPendingTail = pEntry;
+    interp->pPendingCmdTail = pCmd;
 }
 
 
@@ -18226,31 +19759,39 @@ th8QueuePendingCmd(Th8_Interp *interp, Th8_Command *pCmd)
  *	child hash; only the recursive free (commands, variables,
  *	children) remains.
  *
+ * Why / How:
+ *	Mirrors th8QueuePendingCmd: pNs is already detached from its
+ *	parent, so it is threaded onto the interpreter's
+ *	pending-namespace FIFO through its own pPendingNext pointer,
+ *	deferring the recursive free until the eval stack unwinds
+ *	(TH8K-007).
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Appends pNs to the interpreter's pending-namespace deletion
+ *	FIFO (pPendingNsHead/Tail).
+ *
  *----------------------------------------------------------------------
  */
 
 static void
 th8QueuePendingNs(Th8_Interp *interp, Th8_Namespace *pNs)
 {
-    Th8_PendingDelete *pEntry;
-
-    pEntry = (Th8_PendingDelete *)
-        TH8_ALLOC(interp, sizeof(Th8_PendingDelete));
-    if (!pEntry) {
-	/* Out of memory -- immediate deletion as fallback. */
-	th8FreeNamespace(interp, pNs);
-	return;
-    }
-    pEntry->eType = TH8_PENDING_NS;
-    pEntry->u.ns.pNs = (void *)pNs;
-    pEntry->pNext = 0;
-
-    if (interp->pPendingTail) {
-	interp->pPendingTail->pNext = pEntry;
+    /*
+     * Intrusive, allocation-free enqueue (TH8K-007); see
+     * th8QueuePendingCmd.  pNs is already detached from its parent's
+     * child hash, so it is threaded onto the pending-namespace FIFO
+     * through its own pPendingNext with no allocation.
+     */
+    pNs->pPendingNext = 0;
+    if (interp->pPendingNsTail) {
+	interp->pPendingNsTail->pPendingNext = pNs;
     } else {
-	interp->pPendingHead = pEntry;
+	interp->pPendingNsHead = pNs;
     }
-    interp->pPendingTail = pEntry;
+    interp->pPendingNsTail = pNs;
 }
 
 
@@ -18267,44 +19808,62 @@ th8QueuePendingNs(Th8_Interp *interp, Th8_Namespace *pNs)
  *	command xDel that deletes another command); the loop continues
  *	until the queue is empty.
  *
+ * Why / How:
+ *	Drains both intrusive FIFOs, unlinking each object BEFORE
+ *	running its destructor so a callback that re-enters this drain
+ *	cannot process the same object twice.  Commands are freed
+ *	before namespaces within each pass, so a command destructor
+ *	may still reference a namespace that is also pending.  The
+ *	outer loop re-checks both heads because destructors may enqueue
+ *	further deletions.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Runs deferred command/namespace destructors and frees their
+ *	memory; empties the interpreter's pending-delete FIFOs.
+ *
  *----------------------------------------------------------------------
  */
 
 static void
 th8DrainPendingDeletes(Th8_Interp *interp)
 {
-    while (interp->pPendingHead) {
-	Th8_PendingDelete *pEntry = interp->pPendingHead;
+    /*
+     * Drain both intrusive FIFOs until empty.  A destructor may queue
+     * further deletions (e.g. a command xDel that deletes another
+     * command or namespace), so the outer loop re-checks both heads.
+     * Each object is unlinked from its list BEFORE its destructor runs,
+     * so a callback that re-enters this drain cannot process it twice.
+     * Commands are freed before namespaces within each pass so a
+     * command destructor may still reference a namespace that is also
+     * pending.
+     */
+    while (interp->pPendingCmdHead || interp->pPendingNsHead) {
+	while (interp->pPendingCmdHead) {
+	    Th8_Command *pCmd = interp->pPendingCmdHead;
 
-	interp->pPendingHead = pEntry->pNext;
-	if (!interp->pPendingHead) {
-	    interp->pPendingTail = 0;
-	}
-
-	switch (pEntry->eType) {
-	case TH8_PENDING_CMD: {
-	    Th8_Command *pCmd = pEntry->u.cmd.pCmd;
-
-	    if (pCmd) {
-		if (pCmd->xDel) {
-		    pCmd->xDel(interp, pCmd->pContext);
-		}
-		Th8_Free(interp, pCmd->zQualName);
-		Th8_Free(interp, pCmd);
+	    interp->pPendingCmdHead = pCmd->pPendingNext;
+	    if (!interp->pPendingCmdHead) {
+		interp->pPendingCmdTail = 0;
 	    }
-	    break;
+	    th8FreeSubCommands(interp, pCmd);
+	    if (pCmd->xDel) {
+		pCmd->xDel(interp, pCmd->pContext);
+	    }
+	    Th8_Free(interp, pCmd->zQualName);
+	    Th8_Free(interp, pCmd);
 	}
-	case TH8_PENDING_NS: {
-	    Th8_Namespace *pNs;
+	while (interp->pPendingNsHead) {
+	    Th8_Namespace *pNs = interp->pPendingNsHead;
 
-	    pNs = (Th8_Namespace *)pEntry->u.ns.pNs;
+	    interp->pPendingNsHead = pNs->pPendingNext;
+	    if (!interp->pPendingNsHead) {
+		interp->pPendingNsTail = 0;
+	    }
 	    th8FreeNamespace(interp, pNs);
-	    break;
 	}
-	default:
-	    break;
-	}
-	Th8_Free(interp, pEntry);
     }
 }
 
@@ -18435,6 +19994,17 @@ th8PopFrame(Th8_Interp *interp) /* Interpreter. */
  *	nResult's tag bits and is cleared when the caller overwrites
  *	nResult immediately after this call.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Depending on how the current result was classified: does
+ *	nothing (borrowed), securely zeroes the protected region's
+ *	data area in place while retaining it, securely zeroes and
+ *	frees a sensitive heap buffer, or plainly frees a regular
+ *	buffer.  Clears interp->bResultBorrowed.  Does NOT clear
+ *	zResult/nResult -- the caller must overwrite them.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -18525,6 +20095,8 @@ Th8_SetResult(
 {
     if (!interp) return TH8_ERROR;
 
+    TH8_ASSERT_OWNER(interp);
+
     /*
      * If the outgoing result was marked sensitive (decrypted
      * secure-variable data), securely zero it before freeing
@@ -18556,6 +20128,7 @@ Th8_SetResult(
 	}
 	interp->zResult = (char *)TH8_ALLOC_STR(interp, nRaw);
 	if (!interp->zResult) {
+	    interp->bResultBuildFailed = 1; /* TH8K-030 */
 	    return TH8_ERROR;
 	}
 	Th8_Memcpy(interp, interp->zResult, z, nRaw);
@@ -18585,6 +20158,14 @@ Th8_SetResult(
  *	result as borrowed so that the next Th8_SetResult will not
  *	attempt to free it.  Zero allocation makes it safe to use
  *	when the allocator itself has failed.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Releases the previous result, then stores z as a borrowed
+ *	result (preserving any taint tag bits in nResult) and sets
+ *	bResultBorrowed; a NULL z clears the result.  Never allocates.
  *
  *----------------------------------------------------------------------
  */
@@ -18698,6 +20279,14 @@ Th8_ClearResult(Th8_Interp *interp) /* Interpreter. */
  *	not free this pointer on the next result change.  The
  *	caller must ensure the pointer stays valid until the next
  *	result-modifying call.
+ *
+ * Results:
+ *	TH8_OK; TH8_ERROR if interp is NULL.
+ *
+ * Side effects:
+ *	Releases the previous result, stores the borrowed pointer
+ *	(preserving taint tag bits), and sets bResultBorrowed so the
+ *	interpreter will not free it.  Never allocates or copies.
  *
  *----------------------------------------------------------------------
  */
@@ -18850,11 +20439,25 @@ Th8_TakeResult(
  *	sensitive in the returned length so the classification survives
  *	downstream, and the source result is securely cleared.
  *
+ * Why / How:
+ *	Copying the sensitive plaintext (rather than detaching the
+ *	protected-region buffer) keeps the secret's storage under the
+ *	interpreter's control while still letting internal consumers
+ *	process the value; Th8_ClearResult then securely zeroes the
+ *	source.  Non-sensitive results fall straight through to
+ *	Th8_TakeResult.
+ *
  * Results:
  *	A newly-owned buffer the caller must Th8_Free (may be NULL on
  *	allocation failure, exactly as TH8_ALLOC_STR).  For a
  *	non-sensitive result this is the ordinary Th8_TakeResult return
  *	(which may transfer ownership without a copy).
+ *
+ * Side effects:
+ *	For a sensitive result: allocates the returned copy and
+ *	securely clears the interpreter result.  For a non-sensitive
+ *	result: those of Th8_TakeResult (clears the interpreter
+ *	result, possibly copying a borrowed one).
  *
  *----------------------------------------------------------------------
  */
@@ -18894,6 +20497,20 @@ th8TakeResultInternal(Th8_Interp *interp, size_t *pN)
  *	tag bits still set; TH8_LEN(nTagged) + 1 (payload + NUL) is
  *	zeroed, matching the TH8_ALLOC_STR allocation size.
  *
+ * Why / How:
+ *	Secret plaintext can propagate (via the sensitive tag bit)
+ *	into ordinary heap holders; routing their frees through this
+ *	one helper means the plaintext is securely zeroed before the
+ *	block returns to the allocator, closing the freed-but-pageable
+ *	exposure window.  Non-sensitive blocks are simply freed.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Securely zeroes z when nTagged marks it sensitive, then frees
+ *	z (a NULL z is ignored).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -18921,6 +20538,13 @@ th8FreeSensitive(Th8_Interp *interp, char *z, size_t nTagged)
  *	operations that would copy or detach it.  Always returns 0
  *	on builds without TH8_ENABLE_CRYPTOGRAPHY (the flag is never
  *	set in that configuration).
+ *
+ * Results:
+ *	1 if the current result is marked sensitive; 0 otherwise
+ *	(including a NULL interp).
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -18951,6 +20575,13 @@ Th8_IsResultSensitive(Th8_Interp *interp)
  *	secure-zero-on-overwrite path without depending on internal
  *	APIs.  This call only sets a flag; it does not move the
  *	result into protected memory.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Sets the sensitive tag bit in interp->nResult (idempotent);
+ *	no-op on a NULL interp.
  *
  *----------------------------------------------------------------------
  */
@@ -19018,6 +20649,16 @@ Th8_MarkResultSensitive(Th8_Interp *interp)
  *	their own.  Caller is responsible for canary verification
  *	and for clearing/zeroing the prior contents before reuse.
  *
+ * Results:
+ *	The per-interp protected region, allocating it on first use;
+ *	NULL (with the interpreter result set to an error message) if
+ *	interp is NULL or the allocation/mlock fails.
+ *
+ * Side effects:
+ *	On first use, allocates the Th8_ProtectedRegion and its
+ *	mlock'd guard-paged backing store and stores it on the
+ *	interpreter; may set the interpreter result to an error.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -19059,6 +20700,23 @@ th8GetProtectedResultRegion(Th8_Interp *interp)
  *	(th8ProtectedData(pPR) + 0) (i.e., the same place
  *	Th8_SetResultSensitive copies into).  This helper writes
  *	the trailing NUL and updates zResult/nResult/flags.
+ *
+ * Why / How:
+ *	Lets producers that decrypt straight into the protected
+ *	region (secure getVar/save) publish the result without a
+ *	second copy: it just terminates the bytes and points
+ *	zResult/nResult at the region, forcing the sensitive tag on
+ *	while preserving any incoming taint tag.  bResultBorrowed is
+ *	set because the region owns the memory.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR if interp or its protected region
+ *	(or the region's data area) is absent.
+ *
+ * Side effects:
+ *	Writes the trailing NUL into the protected region and updates
+ *	interp->zResult/nResult/bResultBorrowed to reference it,
+ *	replacing the previous result classification.
  *
  *----------------------------------------------------------------------
  */
@@ -19111,6 +20769,15 @@ th8FinalizeSensitiveResult(Th8_Interp *interp, size_t nLen)
  *	Available only when TH8 is built with
  *	`TH8_ENABLE_CRYPTOGRAPHY`.
  *
+ * Why / How:
+ *	Copies the plaintext into the lazily-allocated, reused
+ *	protected region (via th8GetProtectedResultRegion) after a
+ *	canary check, then finalizes it with th8FinalizeSensitiveResult
+ *	so zResult/nResult reference the mlock'd page and the result is
+ *	tagged sensitive.  This keeps cryptographic plaintext out of
+ *	swap and core dumps and inside guard pages, which
+ *	`Th8_SetResult` cannot guarantee.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	z      -- pointer to the source bytes; may be NULL only
@@ -19118,7 +20785,7 @@ th8FinalizeSensitiveResult(Th8_Interp *interp, size_t nLen)
  *	n      -- length of `z` in bytes, or `TH8_NOLEN` to call
  *	          `Th8_Strlen(interp, z)`.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success.
  *	`TH8_ERROR` with the interpreter result set to a
  *	descriptive message when:
@@ -19500,9 +21167,14 @@ th8SetLine(
  *
  * Why / How:
  *	Increments nStepCount unconditionally, then compares against
- *	nStepLimit (when non-zero).  This provides a hard upper bound
- *	on total interpreter work, protecting against infinite loops
- *	and runaway scripts.
+ *	nStepLimit (when non-zero).  This bounds the number of COUNTED
+ *	work-units -- command invocations and expression-tree nodes,
+ *	each of which reaches this choke-point -- protecting against
+ *	infinite loops and runaway scripts at that granularity.  It is
+ *	NOT a bound on raw CPU work: a single work-unit can perform an
+ *	arbitrary amount of internal work between increments unless that
+ *	inner loop polls Th8_Ready itself (the loop-poll coverage work,
+ *	TH8K-009, is what makes long inner loops interruptible).
  *
  * Results:
  *	TH8_OK if under the limit, TH8_ERROR if exceeded.
@@ -19520,6 +21192,32 @@ th8Step(Th8_Interp *interp) /* Interpreter. */
     if (interp->nStepLimit > 0 && interp->nStepCount > interp->nStepLimit) {
 	Th8_SetResult(interp, "step limit exceeded", TH8_NOLEN);
 	return TH8_ERROR;
+    }
+    /*
+     * Cooperative checkpoint deadline (TH8K-010).  The step counter bounds
+     * WORK, not time: a script that runs few commands but each expensive can
+     * burn real time within the step budget.  An absolute monotonic deadline
+     * bounds that -- but COOPERATIVELY, not preemptively.  The clock is read
+     * only every 4096 steps (nested single-condition guards, so no compound
+     * MC/DC decision) to amortize the read, so the deadline fires at the first
+     * checkpoint at or after it; the overshoot is bounded by the inter-
+     * checkpoint interval PLUS the running time of the current work-unit,
+     * which for one large work-unit or a blocking platform callback can be
+     * large.  A hard wall-clock guarantee needs preemptive containment outside
+     * the interpreter.  If the platform has no clock, Th8_GetTimeUs yields 0
+     * and the deadline never fires (fail-open, since the caller opted in).
+     */
+    if (interp->nDeadlineUs > 0) {
+	if ((interp->nStepCount & 0xFFF) == 0) {
+	    th8_int64_t nowUs = 0;
+
+	    if (Th8_GetTimeUs(interp, &nowUs) == TH8_OK) {
+		if (nowUs >= interp->nDeadlineUs) {
+		    Th8_SetResult(interp, "time limit exceeded", TH8_NOLEN);
+		    return TH8_ERROR;
+		}
+	    }
+	}
     }
     return TH8_OK;
 }
@@ -19909,6 +21607,158 @@ Th8_SetAllocLimit(Th8_Interp *interp, size_t nLimit)
 /*
  *----------------------------------------------------------------------
  *
+ * Th8_SetSafeLimits --
+ *
+ *	Apply the recommended hardened resource profile for evaluating
+ *	untrusted script (TH8K-018).
+ *
+ * Why / How:
+ *	A fresh interpreter defaults to no allocation and no step limit
+ *	(0 = unlimited), because the general embedding case runs trusted
+ *	script.  An embedder that runs UNTRUSTED script should bound it
+ *	first; rather than require three separate calls with
+ *	hand-chosen magic numbers, this applies the vetted profile
+ *	(TH8_SAFE_ALLOC_LIMIT / TH8_SAFE_STEP_LIMIT / TH8_SAFE_RESULT_LIMIT)
+ *	as one logical "harden this interpreter" operation.  Individual
+ *	limits may still be raised or lowered afterwards with the
+ *	per-limit setters.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Sets interp->nAllocLimit, nStepLimit, and nResultLimit.
+ *
+ *----------------------------------------------------------------------
+ */
+
+void
+Th8_SetSafeLimits(Th8_Interp *interp)
+{
+    if (!interp) return;
+    Th8_SetAllocLimit(interp, TH8_SAFE_ALLOC_LIMIT);
+    Th8_SetStepLimit(interp, TH8_SAFE_STEP_LIMIT);
+    Th8_SetResultLimit(interp, TH8_SAFE_RESULT_LIMIT);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_SetDeadline --
+ *
+ *	Set an absolute monotonic-microsecond wall-clock deadline for the
+ *	interpreter, or 0 to remove it (TH8K-010).
+ *
+ * Why / How:
+ *	The step counter bounds work, not time; a script that runs few
+ *	commands but each expensive can consume real time within the step
+ *	budget.  This installs an absolute deadline (in the same monotonic
+ *	microsecond timebase as Th8_GetTimeUs) that th8Step checks
+ *	periodically, so a long-running evaluation is stopped with "time
+ *	limit exceeded".  Th8_SetTimeLimitMs is the relative-duration
+ *	convenience wrapper.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Updates interp->nDeadlineUs.
+ *
+ *----------------------------------------------------------------------
+ */
+
+void
+Th8_SetDeadline(Th8_Interp *interp, th8_int64_t nDeadlineUs)
+{
+    if (!interp) return;
+    interp->nDeadlineUs = nDeadlineUs;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_GetDeadline --
+ *
+ *	Return the interpreter's absolute monotonic-microsecond deadline
+ *	(0 = none) (TH8K-010).
+ *
+ * Why / How:
+ *	Simple accessor for interp->nDeadlineUs.
+ *
+ * Results:
+ *	The deadline in monotonic microseconds, or 0 if none is set (also
+ *	0 if interp is NULL).
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+th8_int64_t
+Th8_GetDeadline(Th8_Interp *interp)
+{
+    if (!interp) return 0;
+    return interp->nDeadlineUs;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_SetTimeLimitMs --
+ *
+ *	Bound the interpreter's real (wall-clock) run time to nMs
+ *	milliseconds from now, or clear the bound (TH8K-010).
+ *
+ * Why / How:
+ *	Relative-duration convenience over Th8_SetDeadline: reads the
+ *	current monotonic time and sets the absolute deadline to now +
+ *	nMs.  A value of 0 or less clears the deadline.  An absurdly large
+ *	nMs (which would overflow the microsecond deadline) is treated as
+ *	"no bound".  The clock is read once, here; the deadline is then
+ *	fixed and independent of later clock reads.
+ *
+ * Results:
+ *	TH8_OK, or TH8_ERROR if interp is NULL or the platform clock
+ *	could not be read while arming a positive limit.
+ *
+ * Side effects:
+ *	Updates interp->nDeadlineUs.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_SetTimeLimitMs(Th8_Interp *interp, th8_int64_t nMs)
+{
+    th8_int64_t nowUs = 0;
+
+    if (!interp) return TH8_ERROR;
+    if (nMs <= 0) {
+	interp->nDeadlineUs = 0; /* clear the deadline */
+	return TH8_OK;
+    }
+    /* Cap absurd durations so nMs * 1000 (+ now) cannot overflow the
+     * signed 64-bit microsecond deadline; such a "limit" is effectively
+     * none. */
+    if (nMs > 1000000000000000LL) {
+	interp->nDeadlineUs = 0;
+	return TH8_OK;
+    }
+    if (Th8_GetTimeUs(interp, &nowUs) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    interp->nDeadlineUs = nowUs + nMs * 1000;
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Th8_GetAllocLimit --
  *
  *	Return the current allocation limit.
@@ -19967,6 +21817,41 @@ Th8_GetAllocBytes(Th8_Interp *interp)
 /*
  *----------------------------------------------------------------------
  *
+ * Th8_GetAllocPeak --
+ *
+ *	Return the high-water mark of the interpreter's allocation
+ *	counter: the largest value nAllocBytes has reached over the
+ *	interpreter's life.
+ *
+ * Why / How:
+ *	Simple accessor for interp->nAllocPeak, maintained by
+ *	th8AccountAlloc on every allocation growth (TH8K-021).  Unlike
+ *	Th8_GetAllocBytes (current, transient) the peak persists after
+ *	blocks are freed, so an embedding host can measure the maximum
+ *	transient memory a workload demanded -- the quantity a memory
+ *	sandbox is really bounding -- rather than only the residual after
+ *	cleanup.
+ *
+ * Results:
+ *	The peak allocation in bytes (0 for a brand-new interpreter).
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+size_t
+Th8_GetAllocPeak(Th8_Interp *interp)
+{
+    if (!interp) return 0;
+    return interp->nAllocPeak;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Th8_EnableBigint --
  *
  *	Enable or disable arbitrary precision integers.
@@ -19982,6 +21867,15 @@ Th8_GetAllocBytes(Th8_Interp *interp)
  *	nBigintToken and nBigintOk.  The feature is active only when
  *	the two fields match, preventing script-level forgery.
  *	Disabling zeroes both fields.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR if interp is NULL, the platform
+ *	provides no xRandomBytes, or a non-trivial random token could
+ *	not be produced within the retry budget.
+ *
+ * Side effects:
+ *	When enabling, sets interp->nBigintToken and nBigintOk to the
+ *	same fresh random token; when disabling, zeroes both.
  *
  *----------------------------------------------------------------------
  */
@@ -20038,6 +21932,13 @@ Th8_EnableBigint(Th8_Interp *interp, int bEnable)
  *	nBigintOk is non-zero and matches nBigintToken exactly.
  *	This prevents scripts from enabling the feature by setting
  *	a single field.
+ *
+ * Results:
+ *	Non-zero if bigint is enabled (nBigintOk non-zero and equal
+ *	to nBigintToken); 0 if disabled; TH8_ERROR if interp is NULL.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -20110,13 +22011,21 @@ Th8_GetExprFeatures(Th8_Interp *interp)
  *	is a C-embedder-only switch.  An untrusted script cannot
  *	enable extensions on its own interpreter.
  *
+ * Why / How:
+ *	Masks `flags` with TH8_EXPR_ALL before storing so an embedder
+ *	built against a newer TH8 can pass bits an older library does
+ *	not know, and they are simply ignored rather than corrupting
+ *	the flag word.  Returning the prior value supports the
+ *	save/set/restore idiom around scoped enables.  No random-token
+ *	gate is used because these are syntactic, non-privilege bits.
+ *
  * Parameters:
  *	interp -- interpreter.  If NULL, returns `TH8_EXPR_NONE`
  *	          without effect (Bug 26 / Bug 31 family guard).
  *	flags  -- bitwise-OR of `TH8_EXPR_*` constants; unknown
  *	          bits are masked off.
  *
- * Returns:
+ * Results:
  *	The previous flag set (so the caller can restore it),
  *	or `TH8_EXPR_NONE` when `interp` is NULL.
  *
@@ -20376,8 +22285,8 @@ Th8_RestoreSignedOnly(Th8_Interp *interp, const void *pSaved)
  *
  *	Snapshot the interpreter's mutable execution context into
  *	a Th8_ExecCtx struct.  The saved fields are the NRE callback
- *	chain, frame stack, current namespace, eval depth, line
- *	number, suspended callbacks, and saved frame.
+ *	chain, frame stack, current namespace, eval depth, expression
+ *	depth, line number, suspended callbacks, and saved frame.
  *
  * Why / How:
  *	Coroutine context switches need to swap the entire execution
@@ -20401,6 +22310,7 @@ th8SaveExecCtx(Th8_Interp *interp, Th8_ExecCtx *pCtx)
     pCtx->pFrame = interp->pFrame;
     pCtx->pCurrentNs = interp->pCurrentNs;
     pCtx->nEvalDepth = interp->nEvalDepth;
+    pCtx->nExprDepth = interp->nExprDepth;
     pCtx->nLine = interp->nLine;
     pCtx->pSuspendedCallbacks = interp->pSuspendedCallbacks;
     pCtx->pSavedFrame = interp->pSavedFrame;
@@ -20425,8 +22335,8 @@ th8SaveExecCtx(Th8_Interp *interp, Th8_ExecCtx *pCtx)
  *
  * Side effects:
  *	The interpreter's callback chain, frame stack, namespace,
- *	eval depth, line number, and suspension state are all
- *	overwritten from pCtx.
+ *	eval depth, expression depth, line number, and suspension
+ *	state are all overwritten from pCtx.
  *
  *----------------------------------------------------------------------
  */
@@ -20438,6 +22348,7 @@ th8RestoreExecCtx(Th8_Interp *interp, const Th8_ExecCtx *pCtx)
     interp->pFrame = pCtx->pFrame;
     interp->pCurrentNs = pCtx->pCurrentNs;
     interp->nEvalDepth = pCtx->nEvalDepth;
+    interp->nExprDepth = pCtx->nExprDepth;
     interp->nLine = pCtx->nLine;
     interp->pSuspendedCallbacks = pCtx->pSuspendedCallbacks;
     interp->pSavedFrame = pCtx->pSavedFrame;
@@ -20726,7 +22637,11 @@ Th8_StringAppend(
 	/* Growth failed: leave *pzStr / *pnStr unmodified (last good
 	 * state) and report the error.  Callers must check this return
 	 * (see the TH8_STR_APPEND macro) and fail closed instead of
-	 * publishing a truncated string (Bug 61). */
+	 * publishing a truncated string (Bug 61).  Also flag the build
+	 * failure so that a caller which DOES ignore the return still
+	 * cannot report a truncated result as success -- the dispatcher
+	 * promotes it to an error (TH8K-030). */
+	interp->bResultBuildFailed = 1;
 	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
 	return TH8_ERROR;
     }
@@ -20806,6 +22721,13 @@ Th8_SetPolicyCallback(
  *	output pointer may be NULL if the caller does not need
  *	that field.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	None (writes only through the caller's optional pxProc/ppCtx
+ *	out-parameters).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -20824,21 +22746,364 @@ Th8_GetPolicyCallback(
 /*
  *----------------------------------------------------------------------
  *
- * Th8_CancelEval --
+ * th8CancelReqOr --
  *
- *	Request cancellation of the running script.  Thread-safe.
+ *	Atomically OR `bits` into interp->nCancelReq (TH8K-008), the single
+ *	cross-thread cancellation word.
  *
  * Why / How:
- *	The bCanceled flag is set via atomic CAS so that any thread
- *	(including signal handlers when TH8_CANCEL_SIGNAL is used)
- *	can request cancellation safely.  A memory barrier follows
- *	so the evaluator's Th8_Ready check sees the flag promptly.
+ *	Lock-free: a CAS retry that only re-loops when ANOTHER thread advanced
+ *	the same word.  It holds nothing, so it can never deadlock -- safe to
+ *	call from a signal handler.  Because the canceled bit and the flag bits
+ *	live in this one word, a cancel and its flags are published as a unit
+ *	and can never be torn or partially lost.
  *
  * Results:
- *	TH8_OK.
+ *	None.
  *
  * Side effects:
- *	Sets the bCanceled flag.
+ *	Sets bits in interp->nCancelReq; issues a memory barrier.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8CancelReqOr(Th8_Interp *interp, int bits)
+{
+    int old;
+
+    do {
+	old = Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0);
+    } while (Th8_IntCmpXchg(interp, &interp->nCancelReq, old | bits, old) !=
+             old);
+    th8MemBarrier(interp);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CancelMsgXchg --
+ *
+ *	Atomically exchange the cross-thread cancel-message buffer pointer
+ *	(interp->nCancelReqMsg, held as an integer) with `newVal`, returning the
+ *	previous pointer (TH8K-008).
+ *
+ * Why / How:
+ *	An atomic exchange hands the swapped-out pointer to EXACTLY ONE caller,
+ *	so whoever receives a non-NULL previous pointer owns it and frees it --
+ *	each buffer is freed exactly once (no leak, double-free, or UAF), with
+ *	no lock.  Lock-free CAS retry, same shape as th8CancelReqOr.
+ *
+ * Results:
+ *	The previous buffer pointer (NULL if the slot was empty).
+ *
+ * Side effects:
+ *	Publishes newVal into the slot.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void *
+th8CancelMsgXchg(Th8_Interp *interp, void *newVal)
+{
+    th8_uint64_t nv = (th8_uint64_t)(size_t)newVal;
+    th8_uint64_t old;
+
+    do {
+	old = Th8_Int64CmpXchg(interp, &interp->nCancelReqMsg, 0, 0);
+    } while (Th8_Int64CmpXchg(interp, &interp->nCancelReqMsg, nv, old) !=
+             old);
+    return (void *)(size_t)old;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CancelMsgBuild --
+ *
+ *	Copy a caller message into a self-describing cross-thread cancel buffer
+ *	laid out as [size_t length][bytes...][NUL] (TH8K-008).
+ *
+ * Why / How:
+ *	Called by a foreign NON-signal canceller, which MAY allocate (it must be
+ *	Th8_ThreadInit'd, like Th8_QueueEvent).  Embedding the length lets the
+ *	owner recover the EXACT length from the single published pointer, so
+ *	nothing is torn even under concurrent publishers.
+ *
+ * Results:
+ *	The buffer pointer, or NULL on overflow/allocation failure (the cancel
+ *	then carries no message and the owner uses the default text).
+ *
+ * Side effects:
+ *	Allocates interpreter memory (freed later by whoever swaps it out).
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void *
+th8CancelMsgBuild(Th8_Interp *interp, const char *zMsg, size_t nMsg)
+{
+    unsigned char *pBuf;
+    size_t nBuf;
+
+    if (!interp->pPlatform || !interp->pPlatform->xMalloc) return NULL;
+    if (TH8_SAFE_ADD_SIZE(nMsg, sizeof(size_t) + 1, &nBuf)) {
+	return NULL; /* size overflow */
+    }
+    /*
+     * Transient cross-thread COORDINATION memory: allocate via the RAW platform
+     * allocator, NOT the accounted Th8_*Malloc path.  The buffer is TH8-internal
+     * (never script-visible) and is written on the foreign thread and freed on
+     * another, so routing it through th8AccountAlloc would race the owner's
+     * per-interp nAllocBytes/nAllocPeak accounting (that state is owner-only).
+     * It is written in full below (length + bytes + NUL), so the un-zeroed raw
+     * block has no uninitialized read.  Freed via th8CancelMsgFree.
+     */
+    pBuf = (unsigned char *)interp->pPlatform
+               ->xMalloc(interp, interp->pPlatform->pCtx, nBuf);
+    if (!pBuf) return NULL;
+    Th8_Memcpy(interp, pBuf, &nMsg, sizeof(size_t));
+    if (nMsg) Th8_Memcpy(interp, pBuf + sizeof(size_t), zMsg, nMsg);
+    pBuf[sizeof(size_t) + nMsg] = 0;
+    return pBuf;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CancelMsgFree --
+ *
+ *	Free a cross-thread cancel message buffer built by th8CancelMsgBuild
+ *	(TH8K-008).  NULL-safe.
+ *
+ * Why / How:
+ *	The buffer was obtained from the RAW platform allocator (NOT the
+ *	accounted Th8_*Malloc path), so it must be returned the same way, via
+ *	the platform xFree -- keeping it out of the owner-only nAllocBytes
+ *	accounting that a foreign thread must never touch.  Safe to call from
+ *	either the allocating (foreign) or the adopting (owner) thread, since
+ *	the platform allocator is thread-safe.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Releases the buffer via the platform allocator.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8CancelMsgFree(Th8_Interp *interp, void *pBuf)
+{
+    if (pBuf && interp->pPlatform && interp->pPlatform->xFree) {
+	interp->pPlatform->xFree(interp, interp->pPlatform->pCtx, pBuf);
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CancelReqPublish --
+ *
+ *	Publish a cross-thread cancellation request from a FOREIGN (non-owner)
+ *	thread (TH8K-008).
+ *
+ * Why / How:
+ *	Lock-free.  For a NON-signal cancel with a message, copy it into a
+ *	self-describing buffer and atomic-exchange it in (freeing any buffer it
+ *	displaces).  Then OR (canceled + flags) into the single atomic word.  A
+ *	SIGNAL cancel never allocates and carries no message; the SIGNAL flag
+ *	tells the owner to report a fixed static text.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Sets interp->nCancelReq; may publish/free a message buffer.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8CancelReqPublish(
+    Th8_Interp *interp, /* Interpreter (owned by another thread). */
+    const char *zMsg, /* Caller message, or NULL. */
+    size_t nMsg, /* Message length (already resolved). */
+    int flags) /* Cancel flags. */
+{
+    /*
+     * Build a message buffer only when a non-empty message was handed off.  No
+     * explicit SIGNAL check is needed: Th8_CancelEval's signal path always calls
+     * this with zMsg == NULL, so a signal cancel never satisfies this condition
+     * (and testing the flag too would be a correlated condition that can never
+     * reach full MC/DC).
+     */
+    if (zMsg && nMsg > 0) {
+	void *pBuf = th8CancelMsgBuild(interp, zMsg, nMsg);
+	if (pBuf) {
+	    void *pOld = th8CancelMsgXchg(interp, pBuf);
+	    if (pOld)
+		th8CancelMsgFree(interp, pOld); /* free displaced buffer */
+	}
+    }
+    th8CancelReqOr(interp, TH8_CR_CANCELED | (flags & TH8_CANCEL_FLAG_MASK));
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CancelReqAdopt --
+ *
+ *	Owner-side adoption of a pending cross-thread cancellation (TH8K-008).
+ *	Runs ONLY on the owning thread.  Folds the request's flags into the
+ *	owner-only cancelFlags and, if a foreign non-signal message buffer is
+ *	pending and no message is installed yet, copies its exact-length text
+ *	into an owned message and frees the buffer.
+ *
+ * Why / How:
+ *	The flags live in the single atomic request word (nCancelReq), read
+ *	lock-free.  The message (if any) is a self-describing [len][bytes][NUL]
+ *	buffer that the owner atomic-exchanges out and copies into its owned
+ *	state, then frees -- so the exact length comes from the one published
+ *	pointer and nothing is torn.  Idempotent: a no-op if nothing pending.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	May set cancelFlags / install and own a cancel message; frees the
+ *	adopted cross-thread buffer.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8CancelReqAdopt(Th8_Interp *interp) /* Interpreter (owner thread). */
+{
+    int req = Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0);
+    void *pBuf;
+
+    if (!(req & TH8_CR_CANCELED)) return; /* nothing pending. */
+
+    /* Fold the requested flags into the owner-only cancelFlags. */
+    interp->cancelFlags |= (req & TH8_CANCEL_FLAG_MASK);
+
+    /* Adopt a foreign non-signal message buffer, if present and no message is
+     * installed yet.  Copy its exact-length data into an owned buffer. */
+    pBuf = th8CancelMsgXchg(interp, 0);
+    if (pBuf) {
+	if (!interp->zCancelMsg) {
+	    size_t nMsg = 0;
+
+	    Th8_Memcpy(interp, &nMsg, pBuf, sizeof(size_t));
+	    interp->zCancelMsg = (char *)TH8_ALLOC_STR(interp, nMsg);
+	    if (interp->zCancelMsg) {
+		if (nMsg) {
+		    Th8_Memcpy(
+		        interp, interp->zCancelMsg,
+		        (const char *)pBuf + sizeof(size_t), nMsg);
+		}
+		interp->zCancelMsg[nMsg] = 0;
+		interp->nCancelMsg = nMsg;
+		interp->bCancelMsgOwned = 1;
+	    }
+	}
+	th8CancelMsgFree(interp, pBuf);
+    }
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CancelReqClear --
+ *
+ *	Owner-side drop of the cross-thread cancellation request (TH8K-008),
+ *	used when cancellation is reset.  Owner thread only.
+ *
+ * Why / How:
+ *	Atomically stores 0 into the single request word and frees any
+ *	un-adopted message buffer (atomic-exchanged out).  No lock: because the
+ *	canceled bit and flags are one word, the reset is all-or-nothing -- a
+ *	cancel racing the reset is either fully cleared or fully survives, never
+ *	left in a torn/partial state.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Zeroes interp->nCancelReq; frees any pending message buffer.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8CancelReqClear(Th8_Interp *interp) /* Interpreter (owner thread). */
+{
+    int old;
+    void *pBuf;
+
+    do {
+	old = Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0);
+    } while (Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, old) != old);
+    pBuf = th8CancelMsgXchg(interp, 0);
+    if (pBuf) th8CancelMsgFree(interp, pBuf);
+    th8MemBarrier(interp);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_CancelEval --
+ *
+ *	Request cancellation of the running script.  Callable from any
+ *	thread, including signal handlers (with TH8_CANCEL_SIGNAL).
+ *
+ * Why / How:
+ *	The bCanceled flag is set via atomic CAS and a memory barrier
+ *	follows so the evaluator's Th8_Ready check sees it promptly.
+ *
+ *	TH8K-008 -- cancelFlags and the cancel MESSAGE state (zCancelMsg,
+ *	bCancelMsgOwned, nCancelMsg) are OWNER-ONLY: only the
+ *	interpreter's owning thread reads or writes them, so they need no
+ *	cross-thread synchronization.  Three publishers, one atomic request word
+ *	(nCancelReq holds the canceled bit OR'd with the flag bits, so a
+ *	cancel and its flags are published as one indivisible unit -- never
+ *	torn):
+ *
+ *	  Owner, non-signal: installs the flags and (optional) COPIED message
+ *	  directly into the owner-only state, then OR-publishes the request word.
+ *
+ *	  Foreign, non-signal: cannot touch the owner-only state, so it copies
+ *	  the message into a self-describing [len][bytes][NUL] buffer allocated
+ *	  from the RAW platform allocator (unaccounted -- the owner-only byte
+ *	  accounting must never be touched cross-thread) and atomic-EXCHANGES it
+ *	  into a single pointer word (nCancelReqMsg); whoever swaps a non-NULL
+ *	  pointer out owns and frees it, so there is no leak, double-free, or
+ *	  use-after-free.  The owner adopts the buffer at its next poll
+ *	  (th8AdoptCancelRequest), copying the exact-length text from the one
+ *	  published pointer into an owned message -- so a pointer can never be
+ *	  paired with another publisher's length.  Adoption never blocks, so a
+ *	  foreign publisher can never stall the evaluator.
+ *
+ *	  Signal, any thread (TH8_CANCEL_SIGNAL): async-signal-safe -- an atomic
+ *	  OR of the request word ONLY.  No allocation, no message, and the
+ *	  owner-only state is never touched, so a signal that interrupts the
+ *	  owner mid-cancel cannot corrupt it.  The SIGNAL flag makes the owner
+ *	  report a fixed static text ("eval canceled via signal") when no custom
+ *	  message is present.
+ *
+ *	A memory barrier follows the publish so the evaluator's Th8_Ready check
+ *	sees the request promptly.
+ *
+ * Results:
+ *	TH8_OK (TH8_ERROR only for a NULL interp).
+ *
+ * Side effects:
+ *	Sets the bCanceled flag (and, on the owner thread, the message).
  *
  *----------------------------------------------------------------------
  */
@@ -20852,81 +23117,70 @@ Th8_CancelEval(
 				 * or both (OR'd together). */
 {
     int bSignal = (flags & TH8_CANCEL_SIGNAL);
+    int bOwner;
     if (!interp) return TH8_ERROR;
-    interp->cancelFlags = flags;
-    if (zMsg) {
-	if (nMsg == TH8_NOLEN) {
-	    nMsg = Th8_Strlen(interp, zMsg);
-	}
 
+    bOwner = (Th8_GetInterpThreadId(interp) == Th8_GetThreadId(interp));
+
+    if (bSignal || !bOwner) {
 	/*
-	 * Two modes depending on TH8_CANCEL_SIGNAL:
+	 * Signal handler (any thread) OR foreign thread: use the lock-free
+	 * cross-thread path (TH8K-008).  Never touch the owner-only message
+	 * state and never call th8SignalAllStates (owner-only -- a blocked
+	 * vwait re-polls Th8_Ready within one slice, so it still wakes).
 	 *
-	 *   With TH8_CANCEL_SIGNAL: the zMsg pointer is stored directly
-	 *   (not copied).  No memory allocation occurs.  This mode is
-	 *   async-signal-safe and MUST be used from signal handlers.
+	 *   Signal (TH8_CANCEL_SIGNAL): async-signal-safe -- atomic bit + flags
+	 *   only, no allocation and no message; the SIGNAL flag tells the owner
+	 *   to report a fixed static text.  This holds even on the OWNER thread,
+	 *   so a signal that interrupts the owner mid-cancel cannot corrupt the
+	 *   owner-only message state.
 	 *
-	 *   Without TH8_CANCEL_SIGNAL (default): zMsg is copied into a
-	 *   Th8_Malloc'd buffer owned by the interpreter.  This mode is
-	 *   NOT signal-safe but allows dynamic messages.
+	 *   Foreign non-signal: may hand off a COPIED message (the caller's
+	 *   thread must be Th8_ThreadInit'd); th8CancelReqPublish copies it into
+	 *   a self-describing buffer and atomic-exchanges it in.
 	 */
-
 	if (bSignal) {
-	    /*
-	     * Static message: store pointer directly.
-	     * Safe to call from signal handlers.
-	     */
-
-	    if (!interp->zSavedCancelMsg && interp->bCancelMsgOwned &&
-	        interp->zCancelMsg) {
-		interp->zSavedCancelMsg = interp->zCancelMsg;
-		interp->zCancelMsg = 0;
-		interp->nCancelMsg = 0;
-		interp->bCancelMsgOwned = 0;
-	    }
-
-	    if (!interp->zCancelMsg) {
-		interp->zCancelMsg = (char *)zMsg;
-		interp->nCancelMsg = nMsg;
-		interp->bCancelMsgOwned = 0;
-	    }
+	    th8CancelReqPublish(interp, 0, 0, flags); /* no message */
 	} else {
-	    /*
-	     * Dynamic message: copy into owned buffer.
-	     * NOT async-signal-safe.
-	     */
+	    size_t nReq = 0;
 
-	    if (interp->zSavedCancelMsg) {
-		Th8_Free(interp, interp->zSavedCancelMsg);
-		interp->zSavedCancelMsg = 0;
-	    }
+	    if (zMsg)
+		nReq = (nMsg == TH8_NOLEN) ? Th8_Strlen(interp, zMsg) : nMsg;
+	    th8CancelReqPublish(interp, zMsg, nReq, flags);
+	}
+	return TH8_OK;
+    }
 
-	    /* State invariant: bCancelMsgOwned=1 only when
-	     * zCancelMsg is a valid owned buffer; the two flags
-	     * move together in every other Cancel-related path,
-	     * so `zCancelMsg` is ALWAYS non-NULL whenever
-	     * `bCancelMsgOwned` is set. */
-	    if (interp->bCancelMsgOwned && ALWAYS(interp->zCancelMsg)) {
-		Th8_Free(interp, interp->zCancelMsg);
-		interp->zCancelMsg = 0;
-		interp->nCancelMsg = 0;
-		interp->bCancelMsgOwned = 0;
-	    }
+    /*
+     * Owner thread, non-signal: install the flags and (optional) message
+     * directly -- this state is owner-only, so no cross-thread synchronization
+     * is needed -- then publish the canceled bit atomically and wake any
+     * blocked vwait immediately (owner-only registry walk).
+     */
+    interp->cancelFlags |= (flags & TH8_CANCEL_FLAG_MASK);
+    if (zMsg) {
+	if (nMsg == TH8_NOLEN) nMsg = Th8_Strlen(interp, zMsg);
 
-	    interp->zCancelMsg = (char *)TH8_ALLOC_STR(interp, nMsg);
-	    if (interp->zCancelMsg) {
-		Th8_Memcpy(interp, interp->zCancelMsg, zMsg, nMsg);
-		interp->zCancelMsg[nMsg] = 0;
-		interp->nCancelMsg = nMsg;
-		interp->bCancelMsgOwned = 1;
-	    }
+	/* State invariant: bCancelMsgOwned=1 only when zCancelMsg is a valid
+	 * owned buffer; the two flags move together in every other
+	 * Cancel-related path, so zCancelMsg is ALWAYS non-NULL when
+	 * bCancelMsgOwned is set. */
+	if (interp->bCancelMsgOwned && ALWAYS(interp->zCancelMsg)) {
+	    Th8_Free(interp, interp->zCancelMsg);
+	    interp->zCancelMsg = 0;
+	    interp->nCancelMsg = 0;
+	    interp->bCancelMsgOwned = 0;
+	}
+	interp->zCancelMsg = (char *)TH8_ALLOC_STR(interp, nMsg);
+	if (interp->zCancelMsg) {
+	    Th8_Memcpy(interp, interp->zCancelMsg, zMsg, nMsg);
+	    interp->zCancelMsg[nMsg] = 0;
+	    interp->nCancelMsg = nMsg;
+	    interp->bCancelMsgOwned = 1;
 	}
     }
-    Th8_IntCmpXchg(interp, &interp->bCanceled, 1, 0);
-    th8MemBarrier(interp);
-
-    if (!bSignal) th8SignalAllStates(interp);
-
+    th8CancelReqOr(interp, TH8_CR_CANCELED | (flags & TH8_CANCEL_FLAG_MASK));
+    th8SignalAllStates(interp);
     return TH8_OK;
 }
 
@@ -20988,6 +23242,16 @@ Th8_Freeze(Th8_Interp *interp) /* Interpreter. */
  *	state is set up before the first allocation; this routine
  *	is what guarantees that.
  *
+ * Why / How:
+ *	Exposing a uniform init hook (a no-op where the allocator
+ *	needs none) lets embedder worker-thread code stay portable
+ *	across builds.  On mimalloc it establishes the per-thread
+ *	allocator state and dedicated heap up front so DEBUG asserts
+ *	are satisfied before the first allocation.
+ *
+ * Results:
+ *	None.
+ *
  * Side effects:
  *	On mimalloc builds, sets up the calling thread's mimalloc
  *	heap state.  No-op otherwise.
@@ -21026,6 +23290,23 @@ Th8_ThreadInit(void)
  *	the event queue (Th8_QueueEvent producer thread allocates
  *	overflow nodes; main thread frees them on drain).
  *
+ * Why / How:
+ *	Uses mi_heap_delete (not mi_heap_destroy) so blocks this
+ *	thread allocated stay valid until whichever thread eventually
+ *	frees them -- the invariant the cross-thread allocate-here /
+ *	free-there event queue relies on.  Calling it explicitly
+ *	returns memory to the allocator sooner than the backend's
+ *	thread-exit hooks would.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	On mimalloc builds, tears down the calling thread's dedicated
+ *	heap (mi_heap_delete) only; the per-thread tld is left for
+ *	mimalloc's own single-owner thread-exit teardown (see body).
+ *	No-op otherwise.  Idempotent and safe on any thread.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -21033,8 +23314,27 @@ void
 Th8_ThreadDone(void)
 {
 #if defined(TH8_USE_MIMALLOC)
-    th8MiHeapDone(); /* lazy heap teardown */
-    mi_thread_done(); /* per-thread allocator state */
+    /*
+     * Tear down ONLY TH8's per-thread dedicated heap here.  We deliberately
+     * do NOT call mi_thread_done(): mimalloc's per-thread tld teardown has a
+     * single owner -- mimalloc's own thread-exit hook (a pthread-key
+     * destructor on POSIX / FLS callback on Win32), which runs
+     * _mi_thread_done() once when the thread actually exits, and reclaims the
+     * main thread at process exit (mimalloc issue #508).  Calling
+     * mi_thread_done() from here duplicated that teardown:
+     *   - on a WORKER, the explicit call frees the tld but does not clear
+     *     mimalloc's pthread-key value, so the later destructor re-ran
+     *     _mi_thread_done() on already-freed thread state (TH8K-027 -- a
+     *     use-after-free crash reproduced by the cancel-stress workers); and
+     *   - on the MAIN thread, freeing tld_main mid-process crashed a
+     *     subsequent Th8_Initialize's mi_thread_init() (Bug 86).
+     * Deleting only the dedicated heap avoids both: mi_heap_delete (NOT
+     * mi_heap_destroy) unregisters this heap from the thread's heap list and
+     * leaves its already-allocated blocks valid until freed -- the invariant
+     * the cross-thread allocate-here / free-there event queue relies on --
+     * and the eventual single mimalloc teardown frees whatever remains.
+     */
+    th8MiHeapDone();
 #endif
 }
 
@@ -21188,6 +23488,16 @@ Th8_IsSuspended(Th8_Interp *interp) /* Interpreter. */
  *	triggers, the breakpoint hash table is probed with a
  *	composite key of (script name + 4-byte line number).  If
  *	the callback returns TH8_BREAK, the interpreter is frozen.
+ *
+ * Results:
+ *	TH8_OK when no debug event fires (or none is configured);
+ *	otherwise the debug callback's return code, or TH8_SUSPEND
+ *	when the callback returned TH8_BREAK (the interpreter is then
+ *	frozen).
+ *
+ * Side effects:
+ *	May invoke the user debug callback; on a TH8_BREAK response
+ *	calls Th8_Freeze to suspend the interpreter.
  *
  *----------------------------------------------------------------------
  */
@@ -21705,10 +24015,32 @@ Th8_EvalAtFrame(
  */
 
 /*
+ *----------------------------------------------------------------------
+ *
  * coro_delete_proc --
  *
  *	Command delete callback: frees the coroutine state and
  *	any saved NRE callbacks.
+ *
+ * Why / How:
+ *	Simply freeing the saved callback nodes would leak everything
+ *	their pData[] slots own (argv, EvalState, CmdBuild, call
+ *	frames).  So it restores the coroutine's execution context and
+ *	drains its saved (and suspended) callbacks with TH8_CLEANUP --
+ *	a teardown return code that runs each callback's cleanup logic
+ *	without building error traces or pushing further iterations --
+ *	then restores the outer context before freeing the state.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Runs the coroutine's pending/suspended NRE callbacks for
+ *	cleanup (temporarily swapping the interpreter's execution
+ *	context) and frees the coroutine's body, yield/resume values,
+ *	name, and the Th8_CoroState itself.
+ *
+ *----------------------------------------------------------------------
  */
 
 static void
@@ -21785,9 +24117,36 @@ coro_delete_proc(Th8_Interp *interp, void *pCtx)
 
 
 /*
+ *----------------------------------------------------------------------
+ *
  * coro_resume_command --
  *
  *	The dynamically created command that resumes a coroutine.
+ *
+ * Why / How:
+ *	Resumes via a full execution-context switch: it saves the
+ *	caller's Th8_ExecCtx, restores the coroutine's, delivers the
+ *	optional resume value as the interpreter result, and drains the
+ *	coroutine's callbacks.  A re-yield (TH8_YIELD) re-saves the
+ *	coroutine context and re-suspends; normal completion marks the
+ *	coroutine done and renames its command away (Tcl 8.6 semantics).
+ *	The result is copied across the context switch so it survives.
+ *	Bug 69: the outer coroutine's yield prompt (pYieldingCoro) is
+ *	saved and restored so nested coroutines can still yield.
+ *
+ * Results:
+ *	TH8_OK when the body yields (interp result holds the yielded
+ *	value) or completes; TH8_ERROR on too many args, an invalid or
+ *	finished coroutine, or one that is not suspended; otherwise the
+ *	body's return code.
+ *
+ * Side effects:
+ *	Stores the resume value on the coroutine; swaps interpreter
+ *	execution context and result; on completion sets bDone and
+ *	deletes the coroutine command (deferring coro_delete_proc);
+ *	may set bSuspended on re-yield.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -21949,9 +24308,29 @@ coro_resume_command(
 
 
 /*
+ *----------------------------------------------------------------------
+ *
  * Th8_CoroYield --
  *
  *	Suspend the current coroutine, returning zValue to the caller.
+ *
+ * Why / How:
+ *	Stashes the yield value on the current coroutine (identified by
+ *	interp->pYieldingCoro) and returns the dedicated TH8_YIELD code,
+ *	which propagates synchronously up the NRE callback chain and
+ *	eval loop (no global suspend flag, no Th8_Ready check).  The
+ *	coroutine's resume/create handler recognizes TH8_YIELD and saves
+ *	the execution context there.
+ *
+ * Results:
+ *	TH8_YIELD on success; TH8_ERROR if interp is NULL or [yield] was
+ *	called outside any coroutine (interp result set to that error).
+ *
+ * Side effects:
+ *	Replaces the coroutine's stored yield value (freeing the prior
+ *	one); may set the interpreter result on the error path.
+ *
+ *----------------------------------------------------------------------
  */
 
 int
@@ -21996,9 +24375,37 @@ Th8_CoroYield(Th8_Interp *interp, const char *zValue, size_t nValue)
 
 
 /*
+ *----------------------------------------------------------------------
+ *
  * Th8_CoroCreate --
  *
  *	Create a coroutine named zName, evaluating zBody.
+ *
+ * Why / How:
+ *	Allocates the Th8_CoroState, registers a resume command bound to
+ *	it (coro_resume_command / coro_delete_proc), and keeps its own
+ *	copy of the body because the EvalState references the script
+ *	text by pointer until the coroutine's callbacks fully drain.
+ *	The body then runs immediately; a first-pass [yield] surfaces as
+ *	TH8_YIELD, at which point the whole interpreter execution context
+ *	(suspended callbacks, saved frame, eval depth) is captured into
+ *	the coroutine for later resume.  Bug 69: the outer coroutine's
+ *	yield prompt is saved and restored around this initial run.
+ *
+ * Results:
+ *	TH8_OK if the coroutine is created (whether the body yields --
+ *	interp result holds the yielded value -- or completes);
+ *	TH8_ERROR if interp is NULL, a command of that name already
+ *	exists, or an allocation fails (interp result set accordingly).
+ *
+ * Side effects:
+ *	Allocates the coroutine state and body copy; creates the resume
+ *	command; evaluates the body (with all the state changes that
+ *	entails); on an initial yield sets bSuspended and adjusts the
+ *	interpreter frame/callback/eval-depth state; sets the
+ *	interpreter result.
+ *
+ *----------------------------------------------------------------------
  */
 
 int
@@ -22134,6 +24541,40 @@ static int th8CheckCancel(Th8_Interp *interp); /* forward */
 /*
  *----------------------------------------------------------------------
  *
+ * th8AdoptCancelRequest --
+ *
+ *	Owner-side adoption of a pending cross-thread cancel request into the
+ *	owner-only cancel state (TH8K-008).  Merges the request's flags into
+ *	cancelFlags and installs its static message if none is set yet.  A
+ *	no-op when nothing is pending or a publisher is mid-write (the
+ *	underlying TRY-adopt never blocks).  Owner thread only.
+ *
+ * Why / How:
+ *	Bridges the coherent cross-thread request slot (populated by
+ *	th8CancelReqPublish, drained by th8CancelReqAdopt) into the
+ *	owner-only cancel state that the evaluator reads without locking.
+ *	Folding the request's flags into cancelFlags and only adopting
+ *	its static message when none is set preserves a
+ *	previously-installed message while still honoring the request.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	May set cancelFlags / the cancel message from an adopted request.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8AdoptCancelRequest(Th8_Interp *interp) /* Interpreter (owner thread). */
+{
+    th8CancelReqAdopt(interp);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Th8_IsCanceled --
  *
  *	Check if the interpreter has a pending cancellation.
@@ -22161,14 +24602,30 @@ Th8_IsCanceled(
     if (!interp) return TH8_ERROR;
     th8MemBarrier(interp);
     if (th8CheckCancel(interp)) {
-	const char *zMsg = interp->zCancelMsg;
-	size_t nMsg = interp->nCancelMsg;
+	/*
+	 * TH8K-008: adopt a foreign thread's cancellation (flags + any copied
+	 * message buffer) into the owner-only cancel state.  Runs on the owner
+	 * thread; the flags come from the single atomic request word and the
+	 * message from a self-describing buffer, so nothing can be torn.
+	 */
+	th8AdoptCancelRequest(interp);
+	{
+	    const char *zMsg = interp->zCancelMsg;
+	    size_t nMsg = interp->nCancelMsg;
 
-	if (!zMsg) {
-	    zMsg = "eval canceled";
-	    nMsg = 13;
+	    if (!zMsg) {
+		/* No custom message.  A signal cancel (which cannot carry one)
+		 * reports a fixed signal-specific text; otherwise the default. */
+		if (interp->cancelFlags & TH8_CANCEL_SIGNAL) {
+		    zMsg = "eval canceled via signal";
+		    nMsg = 24;
+		} else {
+		    zMsg = "eval canceled";
+		    nMsg = 13;
+		}
+	    }
+	    Th8_SetResult(interp, zMsg, nMsg);
 	}
-	Th8_SetResult(interp, zMsg, nMsg);
 	return TH8_ERROR;
     }
     return TH8_OK;
@@ -22203,6 +24660,16 @@ Th8_IsBeingUnwound(Th8_Interp *interp) /* Interpreter. */
 {
     if (!interp) return TH8_ERROR;
     th8MemBarrier(interp);
+    /*
+     * A foreign cancel may have requested TH8_CANCEL_UNWIND without the owner
+     * having adopted it yet (the flags ride in the cross-thread request slot,
+     * not in cancelFlags, until adopted).  Adopt here too so [catch] sees the
+     * unwind flag even if this runs before the next Th8_IsCanceled poll
+     * (TH8K-008).
+     */
+    if (th8CheckCancel(interp)) {
+	th8AdoptCancelRequest(interp);
+    }
     return th8CheckCancel(interp) &&
            (interp->cancelFlags & TH8_CANCEL_UNWIND);
 }
@@ -22272,19 +24739,32 @@ void
 th8SaveCancel(Th8_Interp *interp, char savedCancel[TH8_CANCEL_SAVE_SIZE])
 {
     Th8_CancelSave *pSave = (Th8_CancelSave *)savedCancel;
+    int req;
 
-    pSave->bCanceled = interp->bCanceled;
+    /*
+     * TH8K-008: fold any pending cross-thread request (flags + message buffer)
+     * into the owner state first, then snapshot the whole cancel state ATOMICALLY
+     * -- reading and clearing the request word via CAS -- so a foreign cancel
+     * racing the save is not lost to a plain-volatile read/write.
+     */
+    th8CancelReqAdopt(interp);
+    req = Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0);
+
+    pSave->bCanceled =
+        req; /* the whole request word (canceled bit + flags). */
     pSave->cancelFlags = interp->cancelFlags;
     pSave->bCancelMsgOwned = interp->bCancelMsgOwned;
     pSave->zCancelMsg = interp->zCancelMsg;
     pSave->nCancelMsg = interp->nCancelMsg;
 
     /*
-     * Clear cancel state so the finally block is not
-     * pre-canceled.  Do NOT free the cancel message -
-     * it's saved for later restoration.
+     * Clear cancel state so the finally block is not pre-canceled.  Clear the
+     * request word ONLY if it still equals the snapshot: a foreign cancel that
+     * arrived during the save (CAS fails) is left intact -- it is a NEW cancel,
+     * honored by th8RestoreCancel.  Do NOT free the cancel message: it is saved
+     * for restoration.
      */
-    interp->bCanceled = 0;
+    (void)Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, req);
     interp->cancelFlags = 0;
     interp->bCancelMsgOwned = 0;
     interp->zCancelMsg = 0;
@@ -22311,8 +24791,11 @@ th8SaveCancel(Th8_Interp *interp, char savedCancel[TH8_CANCEL_SAVE_SIZE])
  *	None.
  *
  * Side effects:
- *	The interpreter's cancel fields are restored from
- *	savedCancel (unless a new cancel occurred during finally).
+ *	The interpreter's cancel fields are restored from savedCancel.
+ *	If a new cancel occurred during finally, the saved state is
+ *	discarded instead -- and its owned message freed, since
+ *	th8SaveCancel had moved that buffer out of the interpreter and
+ *	this restore is its only remaining owner.
  *
  *----------------------------------------------------------------------
  */
@@ -22325,15 +24808,25 @@ th8RestoreCancel(
     const Th8_CancelSave *pSave = (const Th8_CancelSave *)savedCancel;
 
     /*
-     * If the finally block triggered its OWN cancellation,
-     * honor it - don't overwrite with the saved state.
+     * If the finally block triggered its OWN cancellation (or a foreign cancel
+     * landed during it), honor it -- don't overwrite with the saved state.
+     * Atomic read (TH8K-008).  th8SaveCancel moved the saved message out of the
+     * interpreter (interp->zCancelMsg was zeroed), so this restore is its only
+     * owner; free the owned buffer before discarding it, or it leaks (TH8K-008).
      */
-    if (interp->bCanceled) return;
+    if (Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0) & TH8_CR_CANCELED) {
+	if (pSave->bCancelMsgOwned) {
+	    Th8_Free(interp, pSave->zCancelMsg);
+	}
+	return;
+    }
 
     /*
-     * Restore the pre-finally cancel state.
+     * Restore the pre-finally cancel state.  th8CancelReqOr re-publishes the
+     * saved request word (canceled bit + flags) atomically; a saved word of 0
+     * (not canceled) is a no-op.
      */
-    interp->bCanceled = pSave->bCanceled;
+    th8CancelReqOr(interp, pSave->bCanceled);
     interp->cancelFlags = pSave->cancelFlags;
     interp->bCancelMsgOwned = pSave->bCancelMsgOwned;
     interp->zCancelMsg = pSave->zCancelMsg;
@@ -22454,11 +24947,6 @@ th8SetFinallyState(Th8_Interp *interp, const char *z, size_t n, int rc)
  *	Used during interpreter initialization and restoration to
  *	establish a known allocation baseline.  Normal allocation
  *	tracking is handled automatically by Th8_Malloc/Free/Realloc;
- * Why / How:
- *	This is the outermost trampoline entry point, called at the
- *	top level to drain all pending NRE callbacks.  It passes
- *	NULL as the bottom marker so th8RunCallbacks processes every
- *	callback in the chain.
  *	this function is for administrative reset only.
  *
  * Results:
@@ -22474,6 +24962,12 @@ void
 th8SetAllocBytes(Th8_Interp *interp, size_t n)
 {
     interp->nAllocBytes = n;
+    /* Keep the high-water mark monotonic across an administrative baseline
+     * (TH8K-021): a reset that establishes a larger baseline raises the peak,
+     * while a restore to a smaller value must not lower it. */
+    if (n > interp->nAllocPeak) {
+	interp->nAllocPeak = n;
+    }
 }
 
 
@@ -22567,6 +25061,13 @@ Th8_IsExited(Th8_Interp *interp)
  *	This is the only way to clear the exit state, ensuring
  *	the host explicitly opts in to continued execution.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Atomically clears the interpreter's bExit flag; no-op on a
+ *	NULL interp.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -22635,6 +25136,12 @@ Th8_NRAddCallback(
     if (!interp) return TH8_ERROR;
     pCb = (Th8_Callback *)TH8_ALLOC(interp, sizeof(Th8_Callback));
     if (!pCb) {
+	/* A continuation could not be scheduled (out of memory).  Many NRE
+	 * callers ignore this return, so also flag the failure (TH8K-030): the
+	 * eval/dispatch chokepoint then promotes a would-be success to an
+	 * out-of-memory error instead of silently completing with a missing
+	 * continuation and an "out of memory" result. */
+	interp->bResultBuildFailed = 1;
 	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
 	return TH8_ERROR;
     }
@@ -22843,6 +25350,14 @@ th8EvalTrampoline(Th8_Interp *interp) /* Interpreter. */
  *	pData slots and calls th8EvalLocal to set up the per-command
  *	iteration callbacks.
  *
+ * Results:
+ *	The return code from th8EvalLocal (the script's eventual
+ *	result flows through the callbacks it pushes).
+ *
+ * Side effects:
+ *	Sets up script evaluation, pushing per-command iteration
+ *	callbacks onto the NRE chain (whatever th8EvalLocal does).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -22909,6 +25424,20 @@ th8NREvalCallback(
  *	procedures with a dangling reference if this helper lived
  *	in the control plugin).
  *
+ * Why / How:
+ *	A one-slot free-and-passthrough callback: whatever heap buffer
+ *	a command stashed in pData[0] (a script copy, a ProcDefn) is
+ *	freed after the deferred eval completes, while rc is returned
+ *	untouched so it does not disturb the evaluation's result.
+ *	Placed in core so [apply]/[napply] keep a valid reference even
+ *	when the control plugin is compiled out (Bug 35).
+ *
+ * Results:
+ *	The incoming rc, unchanged.
+ *
+ * Side effects:
+ *	Frees pData[0].
+ *
  *----------------------------------------------------------------------
  */
 
@@ -22936,6 +25465,15 @@ th8EvalCleanup(Th8_Interp *interp, void *pData[], int rc)
  *	work without growing the C call stack.  Pair with
  *	`Th8_NREvalInFrame` when the eval needs a different frame.
  *
+ * Why / How:
+ *	Rather than recursing through Th8_Eval (which would grow the C
+ *	stack), it packs (zProg, nProg, zName, nName) into a
+ *	th8NREvalCallback added to the NRE chain and returns at once;
+ *	the trampoline later runs th8EvalLocal.  The script/name are
+ *	stored by pointer, not copied, so the caller owns their
+ *	lifetime.  The scheduling result is propagated so a failed
+ *	enqueue is not mistaken for a successful (but never-run) eval.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	zProg  -- script bytes to evaluate.
@@ -22945,7 +25483,7 @@ th8EvalCleanup(Th8_Interp *interp, void *pData[], int rc)
  *	          messages); may be NULL when no origin is known.
  *	nName  -- length of `zName`.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success.
  *	`TH8_ERROR` if `interp` is NULL, or if scheduling the callback
  *	fails (allocation failure -- interpreter result "out of
@@ -22998,6 +25536,13 @@ Th8_NREval(
  *	callback fires after the evaluated script returns, restoring
  *	the frame regardless of the return code.
  *
+ * Results:
+ *	The incoming rc, unchanged.
+ *
+ * Side effects:
+ *	Restores interp->pFrame to the saved frame (pData[0]) and
+ *	clears interp->pDownlevelFrame.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -23027,13 +25572,24 @@ th8FrameRestoreCallback(Th8_Interp *interp, void *pData[], int rc)
  *	  positive = absolute frame number (converted internally).
  *
  * Why / How:
- *	Splits the name on "::" to find the target namespace,
- *	creating intermediate namespaces as needed.  If a command
- *	with the same name already exists, its delete callback is
- *	fired and the Th8_Command struct is reused.  A secondary
- *	hash (token -> command) provides O(1) deletion by token.
+ *	Resolves iFrame to a target frame (converting a positive
+ *	absolute number to a relative offset, then walking pCaller),
+ *	switches interp->pFrame to it, and -- because callbacks run
+ *	LIFO -- pushes th8FrameRestoreCallback FIRST so it runs LAST,
+ *	after the eval.  When the target frame carries a different
+ *	namespace, a th8NsRestoreCallback is also pushed and
+ *	pCurrentNs is switched, so uplevel'd code resolves in the
+ *	right namespace and is restored on completion.  The actual
+ *	eval is then scheduled via Th8_NREval.
+ *
  * Results:
- *	TH8_OK, or TH8_ERROR if the frame is invalid.
+ *	TH8_OK, or TH8_ERROR if interp is NULL or the requested frame
+ *	does not exist ("no such frame").
+ *
+ * Side effects:
+ *	Switches interp->pFrame (and possibly pCurrentNs and
+ *	pDownlevelFrame) and pushes restore + eval callbacks onto the
+ *	NRE chain; may set the interpreter result on error.
  *
  *----------------------------------------------------------------------
  */
@@ -23143,6 +25699,12 @@ Th8_NREvalInFrame(
  *	that switch after the command returns, passing the return
  *	code through unchanged.
  *
+ * Results:
+ *	The incoming rc, unchanged.
+ *
+ * Side effects:
+ *	Restores interp->pCurrentNs to the saved namespace (pData[0]).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -23172,6 +25734,15 @@ th8NsRestoreCallback(
  *	error, pops the frame, frees the heap-allocated Th8_Frame,
  *	and translates TH8_RETURN -> TH8_OK and TH8_RETURN2 ->
  *	TH8_RETURN (Tcl's multi-level return unwinding).
+ *
+ * Results:
+ *	The incoming rc, except TH8_RETURN is mapped to TH8_OK and
+ *	TH8_RETURN2 to TH8_RETURN (one level of return unwinding).
+ *
+ * Side effects:
+ *	On error, appends a "(procedure ... line ...)" annotation to
+ *	::errorInfo (preserving the error result across the update);
+ *	pops the call frame and frees the heap-allocated Th8_Frame.
  *
  *----------------------------------------------------------------------
  */
@@ -23347,6 +25918,13 @@ th8NRInFrame(
  *	O(1) deletion.  This helper removes the stale entry
  *	whenever a command is deleted or replaced.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Removes the command's entry from the interpreter's token
+ *	index (paCmdToken); a no-op for a command with no token.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -23403,14 +25981,24 @@ Th8_CreateCommand(
 {
     Th8_HashEntry *pEntry;
     Th8_Command *pCmd;
+    Th8_Command *pOld;
     Th8_Hash *paCmd;
     const char *zNs;
     size_t nNs;
     const char *zTail;
     size_t nTail;
     size_t nName;
+    size_t nQ;
+    char *zNewQual;
+    int bNewEntry;
+    Th8_Namespace *pCreatedNs = 0; /* Namespace chain this call created. */
+    int bCreatedTokenHash =
+        0; /* True if we lazily created paCmdToken here. */
 
     if (!interp) return TH8_ERROR;
+
+    TH8_ASSERT_OWNER(interp);
+
     nName = Th8_Strlen(interp, zName);
 
     /*
@@ -23427,7 +26015,16 @@ Th8_CreateCommand(
 
 	Th8_Namespace *pNs;
 
-	pNs = th8FindNamespace(interp, zNs, nNs, 1);
+	/* Capture the created-namespace chain root so any later staged-
+	 * allocation failure below can roll the whole hierarchy back --
+	 * making qualified command creation 100% transactional (TH8K-005).
+	 * On its own create failure th8FindNamespaceEx has already rolled
+	 * back and leaves pCreatedNs NULL. */
+	pNs = th8FindNamespaceEx(interp, zNs, nNs, 1, &pCreatedNs);
+	if (!pNs) {
+	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	    return TH8_ERROR; /* Namespace create OOM (TH8K-005). */
+	}
 	paCmd = pNs->paCmd;
     } else {
 	/*
@@ -23439,107 +26036,168 @@ Th8_CreateCommand(
 	nTail = nName;
     }
 
-    pEntry = Th8_HashFind(interp, paCmd, zTail, nTail, 1);
-    if (pEntry->pData) {
-	pCmd = (Th8_Command *)pEntry->pData;
-	th8RemoveCmdTokenEntry(interp, pCmd);
-	if (pCmd->xDel) {
-	    pCmd->xDel(interp, pCmd->pContext);
-	}
+    /*
+     * TH8K-005: stage every allocation that can fail BEFORE mutating
+     * any existing command state, so a failed replacement leaves the
+     * old command intact and a failed new command leaves no hash-entry
+     * or token-index residue.
+     */
+
+    /* Is there already a command under this name?  Find-only: no
+     * mutation until every allocation below has succeeded. */
+    pEntry = Th8_HashFind(interp, paCmd, zTail, nTail, 0);
+    pOld = (pEntry && pEntry->pData) ? (Th8_Command *)pEntry->pData : NULL;
+
+    /* (a) Fully-qualified name copy -- for O(1) token-based delete. */
+    nQ = Th8_Strlen(interp, zName);
+    zNewQual = (char *)TH8_ALLOC_STR(interp, nQ);
+    if (!zNewQual) {
+	if (pCreatedNs) th8UnlinkFreeNamespace(interp, pCreatedNs);
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	return TH8_ERROR; /* Old command (if any) left intact. */
+    }
+    Th8_Memcpy(interp, zNewQual, zName, nQ);
+    zNewQual[nQ] = 0;
+
+    /* (b) The command struct itself, only when this is a new command. */
+    if (pOld) {
+	pCmd = pOld;
     } else {
 	pCmd = (Th8_Command *)TH8_ALLOC(interp, sizeof(Th8_Command));
 	if (!pCmd) {
+	    Th8_Free(interp, zNewQual);
+	    if (pCreatedNs) th8UnlinkFreeNamespace(interp, pCreatedNs);
 	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
-	    return TH8_ERROR;
+	    return TH8_ERROR; /* No residue. */
 	}
 	pCmd->zQualName = 0;
 	pCmd->nQualName = 0;
+	pCmd->paSubCommands = 0; /* Ordinary command until a sub-command is
+	                          * added; do not rely on platform zero-fill
+	                          * (th8InvokeCommand treats non-NULL as an
+	                          * ensemble). */
     }
-    pCmd->xProc = xProc;
-    pCmd->pContext = pContext;
-    pCmd->xDel = xDel;
-    pCmd->nToken = interp->nNextCmdToken++;
 
-    /* Store the fully qualified name for O(1) token-based delete. */
-    Th8_Free(interp, pCmd->zQualName);
-    {
-	size_t nQ = Th8_Strlen(interp, zName);
-
-	pCmd->zQualName = (char *)TH8_ALLOC_STR(interp, nQ);
-	if (pCmd->zQualName) {
-	    Th8_Memcpy(interp, pCmd->zQualName, zName, nQ);
-	    pCmd->zQualName[nQ] = 0;
-	    pCmd->nQualName = nQ;
-	} else {
-	    pCmd->nQualName = 0;
+    /* (c) The lazily-created token index hash.  Remember if WE created it
+     * this call so a later failure can tear it back down (strict byte-exact
+     * rollback -- interp->paCmdToken is interp-global infrastructure). */
+    if (!interp->paCmdToken) {
+	interp->paCmdToken = Th8_HashNew(interp);
+	if (!interp->paCmdToken) {
+	    if (!pOld) Th8_Free(interp, pCmd);
+	    Th8_Free(interp, zNewQual);
+	    if (pCreatedNs) th8UnlinkFreeNamespace(interp, pCreatedNs);
+	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	    return TH8_ERROR; /* No residue. */
 	}
+	bCreatedTokenHash = 1;
     }
 
-    /*
-     * Record the defining namespace.  When the command is
-     * invoked (even via import), the evaluator will set
-     * pCurrentNs to pDefNs so that [variable] and
-     * [namespace current] resolve correctly.
-     *
-     * Only set pDefNs for commands defined in a non-global
-     * namespace.  Commands in the global namespace use
-     * pDefNs = NULL, which tells the evaluator to leave
-     * pCurrentNs unchanged (so [namespace eval] works).
-     */
+    /* (d) The command hash entry.  For a replace this returns the
+     * existing entry; for a new command it is created here. */
+    pEntry = Th8_HashFind(interp, paCmd, zTail, nTail, 1);
+    if (!pEntry) {
+	if (!pOld) Th8_Free(interp, pCmd);
+	Th8_Free(interp, zNewQual);
+	if (bCreatedTokenHash) {
+	    Th8_HashDelete(interp, interp->paCmdToken);
+	    interp->paCmdToken = 0;
+	}
+	if (pCreatedNs) th8UnlinkFreeNamespace(interp, pCreatedNs);
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	return TH8_ERROR; /* Th8_HashFind failed -> no entry created. */
+    }
+    bNewEntry = (pEntry->pData == NULL);
 
+    /* (e) The token-index entry, keyed by the NEW token.  Reserve it
+     * now so a later failure cannot leave a half-registered command.
+     * nNextCmdToken is monotonic, so this key is always fresh. */
     {
-	Th8_Namespace *pNs;
-
-	if (zNs) {
-	    pNs = th8FindNamespace(interp, zNs, nNs, 0);
-	} else {
-	    pNs = interp->pCurrentNs;
+	th8_uint64_t newToken = interp->nNextCmdToken;
+	Th8_HashEntry *pTokEntry = Th8_HashFind(
+	    interp, interp->paCmdToken, (const char *)&newToken,
+	    sizeof(th8_uint64_t), 1);
+	if (!pTokEntry) {
+	    /* Undo the command hash entry only if WE just created it
+	     * (a new, still-empty entry).  A replace entry still holds
+	     * the old command and must be left untouched. */
+	    if (bNewEntry) {
+		Th8_HashRemove(interp, paCmd, zTail, nTail);
+	    }
+	    if (!pOld) Th8_Free(interp, pCmd);
+	    Th8_Free(interp, zNewQual);
+	    if (bCreatedTokenHash) {
+		Th8_HashDelete(interp, interp->paCmdToken);
+		interp->paCmdToken = 0;
+	    }
+	    if (pCreatedNs) th8UnlinkFreeNamespace(interp, pCreatedNs);
+	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	    return TH8_ERROR;
 	}
 
 	/*
-	 * Only set pDefNs for commands in a non-global
-	 * namespace.  Global commands (the vast majority)
-	 * use pDefNs = NULL so the evaluator leaves the
-	 * namespace context unchanged.
-	 *
-	 * pNs is ALWAYS non-NULL at this point: if zNs is
-	 * non-NULL the earlier L9454 call uses flag=1 (find
-	 * or create), so the same find-only at L9519 finds
-	 * the just-created namespace; if zNs is NULL,
-	 * pCurrentNs is non-NULL by construction
-	 * (pGlobalNs at startup). */
+	 * --- COMMIT.  Every allocation has succeeded; from here on
+	 * there are no fallible steps, so it is safe to retire the old
+	 * command and publish the new one.
+	 */
 
-	pCmd->pDefNs = (ALWAYS(pNs) && pNs != interp->pGlobalNs) ? pNs : 0;
-    }
-    pEntry->pData = (void *)pCmd;
-
-    /*
-     * Invalidate the cached resolution for this command name.
-     */
-    th8RemoveFromCache(interp, TH8_CACHE_COMMAND, zTail, nTail);
-
-    /*
-     * Secondary index: map token ==> Th8_Command*.
-     * If the command was replaced (already existed), remove
-     * the old token entry first.
-     */
-
-    if (!interp->paCmdToken) {
-	interp->paCmdToken = Th8_HashNew(interp);
-    }
-    if (interp->paCmdToken) {
-	Th8_HashEntry *pTokEntry;
-
-	pTokEntry = Th8_HashFind(
-	    interp, interp->paCmdToken, (const char *)&pCmd->nToken,
-	    sizeof(th8_uint64_t), 1);
-	if (pTokEntry) {
-	    pTokEntry->pData = pCmd;
+	if (pOld) {
+	    /* Replace: retire the old command's token index entry, free any
+	     * sub-command hash, and invoke its destructor before reusing the
+	     * struct. */
+	    th8RemoveCmdTokenEntry(interp, pOld);
+	    th8FreeSubCommands(interp, pOld);
+	    if (pOld->xDel) {
+		pOld->xDel(interp, pOld->pContext);
+	    }
 	}
-    }
 
-    if (pToken) *pToken = pCmd->nToken;
-    return TH8_OK;
+	pCmd->xProc = xProc;
+	pCmd->pContext = pContext;
+	pCmd->xDel = xDel;
+	pCmd->nToken = interp->nNextCmdToken++;
+
+	/* Store the fully qualified name (pre-allocated above). */
+	Th8_Free(interp, pCmd->zQualName);
+	pCmd->zQualName = zNewQual;
+	pCmd->nQualName = nQ;
+
+	/*
+	 * Record the defining namespace.  When the command is invoked
+	 * (even via import), the evaluator sets pCurrentNs to pDefNs so
+	 * that [variable] and [namespace current] resolve correctly.
+	 * Commands in the global namespace use pDefNs = NULL, which
+	 * tells the evaluator to leave pCurrentNs unchanged (so
+	 * [namespace eval] works).
+	 */
+
+	{
+	    Th8_Namespace *pNs;
+
+	    if (zNs) {
+		pNs = th8FindNamespace(interp, zNs, nNs, 0);
+	    } else {
+		pNs = interp->pCurrentNs;
+	    }
+
+	    /* pNs is ALWAYS non-NULL here: for a qualified name the
+	     * find-or-create above created it, and the current
+	     * namespace exists by construction. */
+	    pCmd->pDefNs = (ALWAYS(pNs) && pNs != interp->pGlobalNs) ? pNs
+	                                                             : 0;
+	}
+
+	pEntry->pData = (void *)pCmd;
+
+	/* Invalidate the cached resolution for this command name. */
+	th8RemoveFromCache(interp, TH8_CACHE_COMMAND, zTail, nTail);
+
+	/* Publish the secondary token ==> Th8_Command* index entry. */
+	pTokEntry->pData = pCmd;
+
+	if (pToken) *pToken = pCmd->nToken;
+	return TH8_OK;
+    }
 }
 
 
@@ -23561,6 +26219,11 @@ Th8_CreateCommand(
  * Results:
  *	TH8_OK if found and deleted, TH8_ERROR if not found.
  *
+ * Side effects:
+ *	Deletes the command via rename-to-empty: removes it from its
+ *	namespace and the token index, fires its delete callback, and
+ *	frees its storage (deferred if inside an eval).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -23569,6 +26232,8 @@ Th8_DeleteCommand(Th8_Interp *interp, th8_uint64_t token)
 {
     Th8_HashEntry *pTokEntry;
     Th8_Command *pCmd;
+
+    TH8_ASSERT_OWNER(interp);
 
     if (!interp->paCmdToken) {
 	Th8_SetResult(
@@ -23611,6 +26276,76 @@ Th8_DeleteCommand(Th8_Interp *interp, th8_uint64_t token)
 /*
  *----------------------------------------------------------------------
  *
+ * th8LookupCommand --
+ *
+ *	Resolve a command NAME to its Th8_Command record, or NULL if no such
+ *	command exists.  Shared by the command and sub-command lookup entry
+ *	points so they all resolve names identically.
+ *
+ * Why / How:
+ *	Applies the TH8_NOLEN "compute the length" sentinel (it is (size_t)-1,
+ *	so it MUST be detected before TH8_LEN() masks it to ~256 MiB and makes
+ *	th8SplitQualName scan past the end of the name); explicit lengths pass
+ *	through TH8_LEN to strip any high flag bits.  Then resolves the name the
+ *	way command evaluation does: a qualified name in its named namespace; a
+ *	bare name in the current namespace, then the global namespace (Tcl 8.4
+ *	order).  Sets NO error message -- each caller reports "no such command"
+ *	/ "not an ensemble" in its own words.
+ *
+ * Results:
+ *	The resolved Th8_Command *, or NULL if the name is unknown.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static Th8_Command *
+th8LookupCommand(
+    Th8_Interp *interp, /* Interpreter. */
+    const char *zName, /* Command name. */
+    size_t nName) /* Name length (or TH8_NOLEN). */
+{
+    Th8_HashEntry *pEntry = 0;
+    const char *zNs;
+    size_t nNs;
+    const char *zTail;
+    size_t nTail;
+
+    if (nName == TH8_NOLEN) {
+	nName = Th8_Strlen(interp, zName);
+    } else {
+	nName = TH8_LEN(nName);
+    }
+
+    th8SplitQualName(zName, nName, &zNs, &nNs, &zTail, &nTail);
+
+    if (zNs) {
+	/* Qualified name -- look up in the specific namespace. */
+	Th8_Namespace *pNs = th8FindNamespace(interp, zNs, nNs, 0);
+
+	if (pNs) {
+	    pEntry = Th8_HashFind(interp, pNs->paCmd, zTail, nTail, 0);
+	}
+    } else {
+	/* Simple name -- try current namespace, then global. */
+	pEntry =
+	    Th8_HashFind(interp, interp->pCurrentNs->paCmd, zName, nName, 0);
+	if (!pEntry && interp->pCurrentNs != interp->pGlobalNs) {
+	    pEntry = Th8_HashFind(
+	        interp, interp->pGlobalNs->paCmd, zName, nName, 0);
+	}
+    }
+
+    if (!pEntry || !pEntry->pData) return NULL;
+    return (Th8_Command *)pEntry->pData;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Th8_GetCommandInfo --
  *
  *	Look up a command by name and return its procedure pointer
@@ -23619,10 +26354,9 @@ Th8_DeleteCommand(Th8_Interp *interp, th8_uint64_t token)
  *	current namespace is tried first, then the global namespace.
  *
  * Why / How:
- *	Uses the same qualified-name splitting as Th8_CreateCommand.
- *	For simple names, the current namespace is searched first;
- *	if not found, the global namespace is tried as a fallback
- *	(matching Tcl 8.4 command resolution order).
+ *	Resolves the name via th8LookupCommand (shared with Th8_CreateCommand
+ *	and the sub-command entry points), then returns the command's stored
+ *	procedure and context.
  *
  * Results:
  *	TH8_OK if found, TH8_ERROR if not.
@@ -23641,61 +26375,21 @@ Th8_GetCommandInfo(
     Th8_CommandProc *pxProc, /* OUT: command procedure. */
     void **ppContext) /* OUT: command context. */
 {
-    Th8_HashEntry *pEntry = 0;
     Th8_Command *pCmd;
-    const char *zNs;
-    size_t nNs;
-    const char *zTail;
-    size_t nTail;
 
     if (!interp) return TH8_ERROR;
 
-    /*
-     * Resolve the name length.  TH8_NOLEN is the documented "NUL-
-     * terminated, compute the length" sentinel; it is (size_t)-1, so it
-     * MUST be detected before TH8_LEN() masks it -- TH8_LEN(TH8_NOLEN)
-     * yields TH8_LEN_MASK (0x0fffffff, ~256 MiB), which would make
-     * th8SplitQualName scan far past the end of the name and fault.
-     * Explicit lengths still pass through TH8_LEN to strip any high
-     * flag bits, matching every other length-taking entry point.
-     */
     if (nName == TH8_NOLEN) {
 	nName = Th8_Strlen(interp, zName);
     } else {
 	nName = TH8_LEN(nName);
     }
 
-    th8SplitQualName(zName, nName, &zNs, &nNs, &zTail, &nTail);
-
-    if (zNs) {
-	/*
-	 * Qualified name -- look up in the specific namespace.
-	 */
-
-	Th8_Namespace *pNs;
-
-	pNs = th8FindNamespace(interp, zNs, nNs, 0);
-	if (pNs) {
-	    pEntry = Th8_HashFind(interp, pNs->paCmd, zTail, nTail, 0);
-	}
-    } else {
-	/*
-	 * Simple name -- try current namespace, then global.
-	 */
-
-	pEntry =
-	    Th8_HashFind(interp, interp->pCurrentNs->paCmd, zName, nName, 0);
-	if (!pEntry && interp->pCurrentNs != interp->pGlobalNs) {
-	    pEntry = Th8_HashFind(
-	        interp, interp->pGlobalNs->paCmd, zName, nName, 0);
-	}
-    }
-
-    if (!pEntry) {
+    pCmd = th8LookupCommand(interp, zName, nName);
+    if (!pCmd) {
 	Th8_ErrorMessage(interp, "no such command:", zName, nName);
 	return TH8_ERROR;
     }
-    pCmd = (Th8_Command *)pEntry->pData;
     if (pxProc) {
 	*pxProc = pCmd->xProc;
     }
@@ -23741,59 +26435,142 @@ Th8_WrongNumArgs(
 /*
  *----------------------------------------------------------------------
  *
- * Th8_CallSubCommand --
+ * th8SubCountCb --
  *
- *	Dispatch a sub-command from an ensemble table.
+ *	Th8_HashIterateOrdered callback: count the live sub-commands of an
+ *	ensemble (pCtx points to an int accumulator).
  *
  * Why / How:
- *	Looks up argv[1] in the sub-command table by exact match.
- *	On mismatch, builds a Tcl-style error listing all valid
- *	sub-commands separated by commas with "or" before the last.
- *	On missing sub-command, uses the "wrong # args" format.
+ *	Used to learn how many sub-commands exist before formatting the
+ *	"must be a, b, or c" error, so the ", or " before the last name is
+ *	placed correctly.
  *
  * Results:
- *	Return code of the matched sub-command, or TH8_ERROR.
+ *	Always TH8_OK (never stops the iteration early).
  *
  * Side effects:
- *	Sets an error message listing valid sub-commands if no
- *	match is found.
+ *	Increments *(int *)pCtx for each populated entry.
  *
  *----------------------------------------------------------------------
  */
 
-int
-Th8_CallSubCommand(
+static int
+th8SubCountCb(Th8_HashEntry *pEntry, void *pCtx)
+{
+    if (pEntry->pData) (*(int *)pCtx)++;
+    return TH8_OK;
+}
+
+/*
+ * Context for th8SubMsgCb: builds the ordered sub-command name list.
+ */
+typedef struct th8SubMsgCtx {
+    Th8_Interp *interp;
+    char **pzMsg;
+    size_t *pnMsg;
+    int idx; /* index of the sub-command being appended */
+    int nTotal; /* total sub-command count (for the ", or " rule) */
+    int rc; /* set to TH8_ERROR if an append failed */
+} th8SubMsgCtx;
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubMsgCb --
+ *
+ *	Th8_HashIterateOrdered callback: append one sub-command name to the
+ *	"unknown ... must be ..." error, in insertion order, comma-separated
+ *	with ", or " before the last (matching Tcl's ensemble error style).
+ *
+ * Why / How:
+ *	Uses Th8_StringAppend directly (NOT the TH8_STR_APPEND macro, which
+ *	does `goto oom` and cannot be used inside a callback).  On an append
+ *	failure it records TH8_ERROR in the context and returns non-OK to stop
+ *	the iteration early.
+ *
+ * Results:
+ *	TH8_OK to continue; TH8_ERROR to stop early on an allocation failure.
+ *
+ * Side effects:
+ *	Grows the caller's message buffer; may set the context's rc.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8SubMsgCb(Th8_HashEntry *pEntry, void *pCtx)
+{
+    th8SubMsgCtx *c = (th8SubMsgCtx *)pCtx;
+    Th8_SubCmd *pSub = (Th8_SubCmd *)pEntry->pData;
+
+    if (!pSub) return TH8_OK;
+    if (c->idx > 0) {
+	const char *zSep;
+
+	if (c->idx == c->nTotal - 1) {
+	    /* Before the last name: Tcl uses " or " for two items and ", or "
+	     * for three or more (e.g. "a or b" vs "a, b, or c"). */
+	    zSep = (c->nTotal == 2) ? " or " : ", or ";
+	} else {
+	    zSep = ", ";
+	}
+
+	if (Th8_StringAppend(
+	        c->interp, c->pzMsg, c->pnMsg, zSep, TH8_NOLEN) != TH8_OK) {
+	    c->rc = TH8_ERROR;
+	    return TH8_ERROR;
+	}
+    }
+    if (Th8_StringAppend(
+            c->interp, c->pzMsg, c->pnMsg, pSub->zName, pSub->nName) !=
+        TH8_OK) {
+	c->rc = TH8_ERROR;
+	return TH8_ERROR;
+    }
+    c->idx++;
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8EnsembleError --
+ *
+ *	Build the standard ensemble error for a PURE ensemble command (one with
+ *	a NULL xProc) when no sub-command matched: "wrong # args" when argc < 2,
+ *	or "unknown or ambiguous subcommand \"X\": must be ..." listing the
+ *	registered sub-commands in registration order.
+ *
+ * Why / How:
+ *	Split out of the invoke chokepoint: the actual sub-command match happens
+ *	in th8InvokeCommand, which only calls this when there is no matching
+ *	sub-command AND no xProc fallback.  Because the list comes from the
+ *	per-interpreter hash, an unregistered (subsetted-out) sub-command is
+ *	neither invocable nor listed, with no separate filtering.
+ *
+ * Results:
+ *	Always TH8_ERROR.
+ *
+ * Side effects:
+ *	Sets the interpreter result to the error message.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8EnsembleError(
     Th8_Interp *interp, /* Interpreter. */
-    void *ctx, /* Command context. */
+    Th8_Command *pCmd, /* The pure ensemble command (xProc == NULL). */
     int argc, /* Argument count. */
     const char **argv, /* Argument values. */
-    size_t *argl, /* Argument lengths. */
-    const Th8_SubCommand *aSub) /* Sub-command table. */
+    size_t *argl) /* Argument lengths. */
 {
-    char *zMsg = 0; /* function-scope so the oom label can free it */
+    char *zMsg = 0;
     size_t nMsg = 0;
     char *z = 0;
 
-    if (!interp) return TH8_ERROR;
-    if (argc > 1) {
-	int i;
-
-	for (i = 0; aSub[i].zName; i++) {
-	    size_t nName = Th8_Strlen(interp, aSub[i].zName);
-
-	    if (nName == TH8_LEN(argl[1]) &&
-	        0 == Th8_Memcmp(
-	                 interp, aSub[i].zName, argv[1], TH8_LEN(argl[1]))) {
-		return aSub[i].xProc(interp, ctx, argc, argv, argl);
-	    }
-	}
-    }
-
     if (argc < 2) {
-	/*
-	 * No sub-command given.
-	 */
-
+	/* No sub-command given. */
 	Th8_ErrorMessage(
 	    interp, "wrong # args: should be \"", argv[0], TH8_LEN(argl[0]));
 	z = Th8_TakeResult(interp, 0);
@@ -23804,37 +26581,648 @@ Th8_CallSubCommand(
 	Th8_Free(interp, zMsg);
 	Th8_Free(interp, z);
     } else {
-	/*
-	 * Unknown sub-command -- list valid ones.
-	 */
-
-	int i;
+	/* Unknown sub-command -- list the registered ones in order. */
+	int nTotal = 0;
+	th8SubMsgCtx c;
 
 	TH8_STR_APPEND(
 	    interp, &zMsg, &nMsg, "unknown or ambiguous subcommand \"",
 	    TH8_NOLEN);
 	TH8_STR_APPEND(interp, &zMsg, &nMsg, argv[1], TH8_LEN(argl[1]));
 	TH8_STR_APPEND(interp, &zMsg, &nMsg, "\": must be ", TH8_NOLEN);
-	for (i = 0; aSub[i].zName; i++) {
-	    if (i > 0) {
-		if (aSub[i + 1].zName) {
-		    TH8_STR_APPEND(interp, &zMsg, &nMsg, ", ", TH8_NOLEN);
-		} else {
-		    TH8_STR_APPEND(interp, &zMsg, &nMsg, ", or ", TH8_NOLEN);
-		}
-	    }
-	    TH8_STR_APPEND(interp, &zMsg, &nMsg, aSub[i].zName, TH8_NOLEN);
-	}
+	(void)Th8_HashIterateOrdered(
+	    interp, pCmd->paSubCommands, th8SubCountCb, &nTotal);
+	c.interp = interp;
+	c.pzMsg = &zMsg;
+	c.pnMsg = &nMsg;
+	c.idx = 0;
+	c.nTotal = nTotal;
+	c.rc = TH8_OK;
+	(void)Th8_HashIterateOrdered(
+	    interp, pCmd->paSubCommands, th8SubMsgCb, &c);
+	if (c.rc != TH8_OK) goto oom;
 	Th8_SetResult(interp, zMsg, nMsg);
 	Th8_Free(interp, zMsg);
     }
     return TH8_ERROR;
 
 oom:
-    /* TH8_STR_APPEND growth failed; "out of memory" already set. */
     Th8_Free(interp, zMsg);
     Th8_Free(interp, z);
     return TH8_ERROR;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8InvokeCommand --
+ *
+ *	Invoke a resolved command: the single chokepoint the evaluator uses to
+ *	call a command's implementation.
+ *
+ * Why / How:
+ *	Sub-commands are an OVERLAY on a command.  If the command has a
+ *	sub-command hash and argv[1] names a registered sub-command, that
+ *	sub-command's handler runs (with the FULL argv: argv[0]=command,
+ *	argv[1]=sub).  Otherwise invocation falls back to the command's own
+ *	xProc (a "regular command extended with sub-commands").  A PURE ensemble
+ *	has no xProc, so an unmatched invocation there produces the standard
+ *	ensemble error via th8EnsembleError.  Centralising this here is what
+ *	makes ensembles a first-class command-system concept (no per-plugin
+ *	dispatcher, no static sub-command table).
+ *
+ *	TH8K-030 result-integrity chokepoint: because this is the single point
+ *	every command is invoked through, it also enforces that a command which
+ *	reports success actually produced its result.  A result-building
+ *	allocation failure (Th8_SetResult / Th8_StringAppend / Th8_ListAppend
+ *	set interp->bResultBuildFailed) is otherwise easy to ignore -- the vast
+ *	majority of commands do `Th8_SetResult(...); return TH8_OK;` without
+ *	checking the copy -- so under memory pressure a truncated or empty
+ *	result would be returned as success.  This function brackets each
+ *	invocation: it clears the flag before the command (saving and restoring
+ *	the caller's value, so nesting neither masks nor is masked) and, if the
+ *	command returns TH8_OK with the flag set, promotes the result to an
+ *	out-of-memory error.  It covers every non-NRE command (the whole
+ *	result-producing surface); NRE commands set their result in post
+ *	callbacks and either propagate a sub-command result -- itself checked
+ *	here at its own invocation -- or handle their own copy (e.g. [try]).
+ *
+ * Results:
+ *	The command's (or sub-command's) return code; TH8_ERROR (result "out of
+ *	memory") if the command returned TH8_OK but a result-building allocation
+ *	had failed.
+ *
+ * Side effects:
+ *	Whatever the invoked (sub-)command does; clears and restores
+ *	interp->bResultBuildFailed and may overwrite the result with an
+ *	out-of-memory error.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8InvokeCommand(
+    Th8_Interp *interp, /* Interpreter. */
+    Th8_Command *pCmd, /* Resolved command. */
+    int argc, /* Argument count. */
+    const char **argv, /* Argument values. */
+    size_t *argl) /* Argument lengths. */
+{
+    int rc;
+    int savedBuildFailed = interp->bResultBuildFailed;
+
+    /*
+     * TH8K-030: bracket this command's result-building.  Clear the flag so it
+     * reflects only THIS invocation; restore the caller's value at the end so a
+     * nested command neither masks nor is masked by an enclosing one.
+     */
+    interp->bResultBuildFailed = 0;
+
+    /* A matching sub-command wins (the overlay). */
+    if (pCmd->paSubCommands && argc >= 2) {
+	Th8_HashEntry *pE = Th8_HashFind(
+	    interp, pCmd->paSubCommands, argv[1], TH8_LEN(argl[1]), 0);
+
+	if (pE && pE->pData) {
+	    Th8_SubCmd *pSub = (Th8_SubCmd *)pE->pData;
+
+	    rc = pSub->xProc(interp, pSub->pContext, argc, argv, argl);
+	    goto done;
+	}
+    }
+    /* No sub-command matched: fall back to the command's own handler. */
+    if (pCmd->xProc) {
+	rc = pCmd->xProc(interp, pCmd->pContext, argc, argv, argl);
+	goto done;
+    }
+    /* Pure ensemble (no fallback handler): standard ensemble error. */
+    if (pCmd->paSubCommands) {
+	rc = th8EnsembleError(interp, pCmd, argc, argv, argl);
+	goto done;
+    }
+    /* Neither sub-commands nor a handler (e.g. a NULL-xProc shell before its
+     * first sub-command was registered). */
+    Th8_SetResultStatic(
+        interp, "wrong # args: ensemble command has no subcommands",
+        TH8_NOLEN);
+    rc = TH8_ERROR;
+
+done:
+    /*
+     * If the command returned a RESULT-CARRYING code (success, or a [return]
+     * that propagates a value: TH8_RETURN/TH8_RETURN2) but a result-building
+     * allocation failed, a truncated/empty result would otherwise be carried as
+     * if valid; promote it to an out-of-memory error (the static message cannot
+     * itself allocate).  Non-value codes (error, break, continue) are left as
+     * is.
+     */
+    if ((rc == TH8_OK || rc == TH8_RETURN || rc == TH8_RETURN2) &&
+        interp->bResultBuildFailed) {
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	rc = TH8_ERROR;
+    }
+    interp->bResultBuildFailed = savedBuildFailed;
+    return rc;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8RemoveSubTokenEntry --
+ *
+ *	Remove a sub-command's entry from the token index (interp->paSubToken).
+ *	Called from every path that frees a Th8_SubCmd, and from a replace
+ *	(which retires the old token).
+ *
+ * Why / How:
+ *	The token index maps token -> Th8_SubCmd* for O(1) Th8_DeleteSubCommand.
+ *	Removing the stale entry whenever a sub-command is freed or replaced
+ *	keeps the index and the sub-command hashes coherent.  A no-op for a
+ *	sub-command with no token or before the index is created.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Removes the sub-command's entry from interp->paSubToken.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8RemoveSubTokenEntry(Th8_Interp *interp, Th8_SubCmd *pSub)
+{
+    if (pSub->nToken && interp->paSubToken) {
+	Th8_HashFind(
+	    interp, interp->paSubToken, (const char *)&pSub->nToken,
+	    sizeof(th8_uint64_t), -1);
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8FreeSubCmdEntry --
+ *
+ *	Th8_HashIterate callback: free one Th8_SubCmd stored in an ensemble's
+ *	sub-command hash (drop its token-index entry, invoke its destructor,
+ *	free its name and struct).
+ *
+ * Why / How:
+ *	Th8_HashDelete frees the hash structure but not the pData, so the
+ *	sub-command records are released here first (mirrors th8FreeCmdEntry
+ *	for top-level commands).  The token-index entry is removed too so no
+ *	dangling token -> freed-record mapping survives.
+ *
+ * Results:
+ *	Always TH8_OK.
+ *
+ * Side effects:
+ *	Removes the token-index entry; runs the sub-command's xDel; frees its
+ *	zName and struct.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8FreeSubCmdEntry(Th8_HashEntry *pEntry, void *pCtx)
+{
+    Th8_Interp *interp = (Th8_Interp *)pCtx;
+    Th8_SubCmd *pSub = (Th8_SubCmd *)pEntry->pData;
+
+    if (pSub) {
+	th8RemoveSubTokenEntry(interp, pSub);
+	if (pSub->xDel) {
+	    pSub->xDel(interp, pSub->pContext);
+	}
+	Th8_Free(interp, pSub->zName);
+	Th8_Free(interp, pSub);
+    }
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8FreeSubCommands --
+ *
+ *	Free an ensemble command's entire sub-command hash, if any.  No-op for
+ *	an ordinary (non-ensemble) command.
+ *
+ * Why / How:
+ *	Releases every Th8_SubCmd (via th8FreeSubCmdEntry) then the hash, and
+ *	clears paSubCommands so the command is no longer an ensemble.  Called
+ *	from every command-destroy site (teardown, deferred-delete drain,
+ *	replace), so a converted ensemble cannot leak.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Frees the sub-command hash and its records; sets paSubCommands = NULL.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static void
+th8FreeSubCommands(Th8_Interp *interp, Th8_Command *pCmd)
+{
+    if (!pCmd->paSubCommands) return;
+    Th8_HashIterate(
+        interp, pCmd->paSubCommands, th8FreeSubCmdEntry, (void *)interp);
+    Th8_HashDelete(interp, pCmd->paSubCommands);
+    pCmd->paSubCommands = 0;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_CreateSubCommand --
+ *
+ *	Register (or replace) a sub-command of a command.  The first
+ *	sub-command gives the command a sub-command overlay: a matching
+ *	"cmd sub ..." then runs the sub-command's handler; anything unmatched
+ *	falls back to the command's own handler (a pure ensemble -- NULL xProc
+ *	-- instead reports the standard ensemble error).  Public: embedders may
+ *	add or replace sub-commands on any command (built-in or their own).
+ *
+ * Why / How:
+ *	Resolves the parent command by name, lazily creates its sub-command
+ *	hash, installs a Th8_SubCmd {xProc, pContext, xDel, token, name,
+ *	parent}, and registers the token in interp->paSubToken so the
+ *	sub-command can be removed by token (Th8_DeleteSubCommand).
+ *	Transactional: every allocation (the lazily-created sub-command hash,
+ *	the name copy, the hash entry, the record, the lazily-created token
+ *	index, and the token entry) is staged before any commit, so a failure
+ *	publishes nothing -- a failed call cannot turn a plain command into a
+ *	broken ensemble.  A replace runs the previous sub-command's destructor,
+ *	retires its token, and reuses its record with a fresh token.
+ *
+ * Results:
+ *	TH8_OK with the token in *pToken (if non-NULL); TH8_ERROR (with a
+ *	message) for a bad argument, an unknown parent command, or OOM.
+ *
+ * Side effects:
+ *	May create the parent's sub-command hash and the interpreter's
+ *	sub-command token index, and mutate both; on replace, runs the old
+ *	sub-command's destructor.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_CreateSubCommand(
+    Th8_Interp *interp, /* Interpreter. */
+    const char *zCmdName, /* Parent command name. */
+    const char *zSubName, /* Sub-command name. */
+    Th8_CommandProc xProc, /* Sub-command procedure. */
+    void *pContext, /* Context for the sub-command proc. */
+    void (*xDel)(Th8_Interp *, void *), /* Destructor (may be NULL). */
+    th8_uint64_t *pToken) /* OUT: sub-command token (NULL ok). */
+{
+    Th8_Command *pCmd;
+    Th8_HashEntry *pSubEntry = 0;
+    Th8_HashEntry *pTokEntry;
+    Th8_SubCmd *pSub = 0;
+    Th8_SubCmd *pOldSub = 0;
+    th8_uint64_t newToken;
+    size_t nSub;
+    char *zNameCopy = 0;
+    int bCreatedHash = 0;
+    int bCreatedTokenHash = 0;
+    int bNewEntry = 0;
+
+    if (!interp || !zCmdName || !zSubName || !xProc) {
+	if (interp) {
+	    Th8_SetResultStatic(
+	        interp, "subcommand: invalid arguments", TH8_NOLEN);
+	}
+	return TH8_ERROR;
+    }
+    TH8_ASSERT_OWNER(interp);
+
+    nSub = Th8_Strlen(interp, zSubName);
+
+    /* Resolve the parent command (shared resolver). */
+    pCmd = th8LookupCommand(interp, zCmdName, TH8_NOLEN);
+    if (!pCmd) {
+	Th8_ErrorMessage(
+	    interp, "no such command:", zCmdName,
+	    Th8_Strlen(interp, zCmdName));
+	return TH8_ERROR;
+    }
+
+    /* (a) Lazily create the sub-command hash (the overlay). */
+    if (!pCmd->paSubCommands) {
+	pCmd->paSubCommands = Th8_HashNew(interp);
+	if (!pCmd->paSubCommands) goto oom;
+	bCreatedHash = 1;
+    }
+
+    /* (b) The owned name copy. */
+    zNameCopy = (char *)TH8_ALLOC_STR(interp, nSub);
+    if (!zNameCopy) goto oom;
+    Th8_Memcpy(interp, zNameCopy, zSubName, nSub);
+    zNameCopy[nSub] = 0;
+
+    /* (c) The sub-command hash entry (new one, or the existing on replace). */
+    pSubEntry = Th8_HashFind(interp, pCmd->paSubCommands, zSubName, nSub, 1);
+    if (!pSubEntry) goto oom;
+    bNewEntry = (pSubEntry->pData == NULL);
+    pOldSub = (Th8_SubCmd *)pSubEntry->pData;
+
+    /* (d) The sub-command record (reuse on replace). */
+    if (pOldSub) {
+	pSub = pOldSub;
+    } else {
+	pSub = (Th8_SubCmd *)TH8_ALLOC(interp, sizeof(Th8_SubCmd));
+	if (!pSub) goto oom;
+    }
+
+    /* (e) The lazily-created token index. */
+    if (!interp->paSubToken) {
+	interp->paSubToken = Th8_HashNew(interp);
+	if (!interp->paSubToken) goto oom_freesub;
+	bCreatedTokenHash = 1;
+    }
+
+    /* (f) The token-index entry, keyed by the NEW token.  nNextCmdToken is
+     * monotonic, so this key is always fresh. */
+    newToken = interp->nNextCmdToken;
+    pTokEntry = Th8_HashFind(
+        interp, interp->paSubToken, (const char *)&newToken,
+        sizeof(th8_uint64_t), 1);
+    if (!pTokEntry) goto oom_freesub;
+
+    /*
+     * --- COMMIT.  Every allocation has succeeded; no fallible steps remain.
+     */
+
+    if (pOldSub) {
+	/* Replace: retire the old token entry, run its destructor, and free
+	 * its old name (the record and hash entry are reused). */
+	th8RemoveSubTokenEntry(interp, pOldSub);
+	if (pOldSub->xDel) {
+	    pOldSub->xDel(interp, pOldSub->pContext);
+	}
+	Th8_Free(interp, pOldSub->zName);
+    }
+    pSub->xProc = xProc;
+    pSub->pContext = pContext;
+    pSub->xDel = xDel;
+    pSub->nToken = interp->nNextCmdToken++;
+    pSub->zName = zNameCopy;
+    pSub->nName = nSub;
+    pSub->pParent = pCmd;
+    pSubEntry->pData = pSub;
+    pTokEntry->pData = pSub;
+    if (pToken) *pToken = pSub->nToken;
+    return TH8_OK;
+
+oom_freesub:
+    /* Reached after the record was (possibly) freshly allocated. */
+    if (!pOldSub) Th8_Free(interp, pSub);
+oom:
+    if (pSubEntry && bNewEntry) {
+	Th8_HashRemove(interp, pCmd->paSubCommands, zSubName, nSub);
+    }
+    if (bCreatedTokenHash) {
+	Th8_HashDelete(interp, interp->paSubToken);
+	interp->paSubToken = 0;
+    }
+    Th8_Free(interp, zNameCopy);
+    if (bCreatedHash) {
+	Th8_HashDelete(interp, pCmd->paSubCommands);
+	pCmd->paSubCommands = 0;
+    }
+    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+    return TH8_ERROR;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_DeleteSubCommand --
+ *
+ *	Delete a sub-command by its token (as returned from Th8_CreateSubCommand
+ *	or Th8_GetSubCommandInfo).  O(1) via the interpreter's sub-command token
+ *	index.
+ *
+ * Why / How:
+ *	Looks the token up in interp->paSubToken to find the Th8_SubCmd and its
+ *	parent command, runs the sub-command's destructor, and removes it from
+ *	both the parent's sub-command hash and the token index.  When the last
+ *	sub-command of a command is removed, the (now empty) sub-command hash is
+ *	freed and paSubCommands cleared, so the command reverts to a plain
+ *	command (or a bare ensemble shell if it had no xProc).
+ *
+ * Results:
+ *	TH8_OK if the token matched and the sub-command was deleted; TH8_ERROR
+ *	(with a message) if there is no such token.
+ *
+ * Side effects:
+ *	Runs the sub-command's destructor; mutates the parent's sub-command
+ *	hash and the token index; may free an emptied sub-command hash.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_DeleteSubCommand(Th8_Interp *interp, th8_uint64_t token)
+{
+    Th8_HashEntry *pTokEntry;
+    Th8_SubCmd *pSub;
+    Th8_Command *pCmd;
+
+    TH8_ASSERT_OWNER(interp);
+
+    if (!interp->paSubToken) {
+	Th8_SetResultStatic(
+	    interp, "subcommand not found (no token index)", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    pTokEntry = Th8_HashFind(
+        interp, interp->paSubToken, (const char *)&token,
+        sizeof(th8_uint64_t), 0);
+    if (!pTokEntry || !pTokEntry->pData) {
+	Th8_SetResultStatic(
+	    interp, "subcommand not found (token not matched)", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    pSub = (Th8_SubCmd *)pTokEntry->pData;
+    pCmd = pSub->pParent;
+
+    /* Remove the token entry and the sub-command hash entry, then free the
+     * record (running its destructor). */
+    th8RemoveSubTokenEntry(interp, pSub);
+    Th8_HashRemove(interp, pCmd->paSubCommands, pSub->zName, pSub->nName);
+    if (pSub->xDel) {
+	pSub->xDel(interp, pSub->pContext);
+    }
+    Th8_Free(interp, pSub->zName);
+    Th8_Free(interp, pSub);
+
+    /* If that was the last sub-command, drop the empty overlay so the command
+     * reverts to a plain command (or a bare ensemble shell). */
+    {
+	int nLeft = 0;
+
+	Th8_HashIterate(
+	    interp, pCmd->paSubCommands, th8SubCountCb, (void *)&nLeft);
+	if (nLeft == 0) {
+	    Th8_HashDelete(interp, pCmd->paSubCommands);
+	    pCmd->paSubCommands = 0;
+	}
+    }
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_GetSubCommandInfo --
+ *
+ *	Query the current binding of a sub-command: fill any of the OUT
+ *	parameters with the registered handler, context, destructor, and token.
+ *	Public counterpart of Th8_GetCommandInfo for ensembles.
+ *
+ * Why / How:
+ *	Resolves the parent command via th8LookupCommand and looks the
+ *	sub-command up in its per-interpreter hash.  The primary use is
+ *	save-and-restore around a temporary replacement: capture a built-in
+ *	sub-command's {xProc, pContext, xDel} here, install a replacement with
+ *	Th8_CreateSubCommand, then restore the captured binding the same way.
+ *
+ * Results:
+ *	TH8_OK if the sub-command exists (OUT params written); TH8_ERROR with a
+ *	message if the command is unknown, is not an ensemble, or has no such
+ *	sub-command.
+ *
+ * Side effects:
+ *	On error, sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_GetSubCommandInfo(
+    Th8_Interp *interp, /* Interpreter. */
+    const char *zCmdName, /* Parent (ensemble) command name. */
+    size_t nCmd, /* Command name length (or TH8_NOLEN). */
+    const char *zSubName, /* Sub-command name. */
+    size_t nSub, /* Sub-command name length (or TH8_NOLEN). */
+    Th8_CommandProc *pxProc, /* OUT: sub-command procedure (NULL ok). */
+    void **ppContext, /* OUT: sub-command context (NULL ok). */
+    void (**pxDel)(Th8_Interp *, void *), /* OUT: destructor (NULL ok). */
+    th8_uint64_t *pToken) /* OUT: sub-command token (NULL ok). */
+{
+    Th8_Command *pCmd;
+    Th8_HashEntry *pSubEntry;
+    Th8_SubCmd *pSub;
+
+    if (!interp || !zCmdName || !zSubName) return TH8_ERROR;
+    TH8_ASSERT_OWNER(interp);
+
+    if (nCmd == TH8_NOLEN) {
+	nCmd = Th8_Strlen(interp, zCmdName);
+    } else {
+	nCmd = TH8_LEN(nCmd);
+    }
+    if (nSub == TH8_NOLEN) {
+	nSub = Th8_Strlen(interp, zSubName);
+    } else {
+	nSub = TH8_LEN(nSub);
+    }
+
+    pCmd = th8LookupCommand(interp, zCmdName, nCmd);
+    if (!pCmd) {
+	Th8_ErrorMessage(interp, "no such command:", zCmdName, nCmd);
+	return TH8_ERROR;
+    }
+    if (!pCmd->paSubCommands) {
+	Th8_ErrorMessage(interp, "not an ensemble command:", zCmdName, nCmd);
+	return TH8_ERROR;
+    }
+    pSubEntry = Th8_HashFind(interp, pCmd->paSubCommands, zSubName, nSub, 0);
+    if (!pSubEntry || !pSubEntry->pData) {
+	Th8_ErrorMessage(interp, "no such subcommand:", zSubName, nSub);
+	return TH8_ERROR;
+    }
+    pSub = (Th8_SubCmd *)pSubEntry->pData;
+    if (pxProc) *pxProc = pSub->xProc;
+    if (ppContext) *ppContext = pSub->pContext;
+    if (pxDel) *pxDel = pSub->xDel;
+    if (pToken) *pToken = pSub->nToken;
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CommandSubCommands --
+ *
+ *	Return a command's per-interpreter sub-command hash, or NULL if the
+ *	command is unknown or is not an ensemble.  Internal accessor so the
+ *	introspection plugin ([info subcommands]) can enumerate exactly what
+ *	the evaluator would dispatch -- never a stale static catalogue.
+ *
+ * Why / How:
+ *	Resolves the command via th8LookupCommand (the shared resolver) and
+ *	returns its paSubCommands pointer.  Because dispatch, [info subcommands],
+ *	and the "must be a, b, or c" error all read this same hash, an omitted
+ *	(subsetted-out) or dynamically added/replaced sub-command is reflected
+ *	identically by all three -- introspection cannot drift from behavior.
+ *
+ * Results:
+ *	The command's Th8_Hash * of sub-commands, or NULL.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+Th8_Hash *
+th8CommandSubCommands(Th8_Interp *interp, const char *zName, size_t nName)
+{
+    Th8_Command *pCmd;
+
+    if (!interp || !zName) return NULL;
+    pCmd = th8LookupCommand(interp, zName, nName);
+    return pCmd ? pCmd->paSubCommands : NULL;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CommandExists --
+ *
+ *	Return 1 if a command named zName is registered in the interpreter, else
+ *	0.  A silent presence check (sets no result), used by named command
+ *	subsets to skip re-registering a command a prior subset already
+ *	installed -- re-running Th8_CreateCommand would REPLACE it and wipe an
+ *	ensemble's sub-commands.
+ *
+ * Why / How:
+ *	Resolves the name with the shared th8LookupCommand resolver.
+ *
+ * Results:
+ *	1 if the command exists, else 0.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8CommandExists(Th8_Interp *interp, const char *zName, size_t nName)
+{
+    return interp && zName && th8LookupCommand(interp, zName, nName) != NULL;
 }
 
 
@@ -24201,11 +27589,16 @@ static const unsigned char th8CharProp[256] = {
  *	(space, tab, newline, carriage return, vertical tab, form
  *	feed).
  *
+ * Why / How:
+ *	Table-driven: indexes th8CharProp[c] and ANDs the whitespace
+ *	bit, giving a branch-free, libc-free classifier safe to call
+ *	before platform init.  Out-of-range bytes short-circuit to 0.
+ *
  * Parameters:
  *	c -- byte value in `[0, 255]`; values outside this range
  *	     return 0.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is whitespace, 0 otherwise.
  *
  * Side effects:
@@ -24227,11 +27620,16 @@ th8IsSpace(int c)
  *	Decimal-digit classification.  Returns non-zero iff `c` is
  *	one of `'0'..'9'`.
  *
+ * Why / How:
+ *	Table-driven: indexes th8CharProp[c] and ANDs the digit bit,
+ *	giving a branch-free, libc-free classifier safe to call
+ *	before platform init.  Out-of-range bytes short-circuit to 0.
+ *
  * Parameters:
  *	c -- byte value in `[0, 255]`; values outside this range
  *	     return 0.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is a decimal digit, 0 otherwise.
  *
  * Side effects:
@@ -24254,11 +27652,17 @@ th8IsDigit(int c)
  *	iff `c` is an ASCII letter (`A`..`Z`, `a`..`z`) or `_`,
  *	matching the Tcl identifier-start character set.
  *
+ * Why / How:
+ *	Table-driven: indexes th8CharProp[c] and ANDs the
+ *	alpha/underscore bit, giving a branch-free, libc-free
+ *	classifier safe to call before platform init.  Out-of-range
+ *	bytes short-circuit to 0.
+ *
  * Parameters:
  *	c -- byte value in `[0, 255]`; values outside this range
  *	     return 0.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is alphabetic or underscore, 0 otherwise.
  *
  * Side effects:
@@ -24281,11 +27685,17 @@ th8IsAlpha(int c)
  *	iff `c` matches `th8IsAlpha` OR `th8IsDigit`; this is the
  *	Tcl identifier-continuation character set.
  *
+ * Why / How:
+ *	Table-driven: indexes th8CharProp[c] and ANDs the combined
+ *	alpha+digit bits, giving a branch-free, libc-free classifier
+ *	safe to call before platform init.  Out-of-range bytes
+ *	short-circuit to 0.
+ *
  * Parameters:
  *	c -- byte value in `[0, 255]`; values outside this range
  *	     return 0.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is alphanumeric or underscore, 0 otherwise.
  *
  * Side effects:
@@ -24309,11 +27719,17 @@ th8IsAlnum(int c)
  *	the list-grammar special characters (`;`, `[`, `]`, `\`,
  *	`{`, `}`, `$`).
  *
+ * Why / How:
+ *	Table-driven: indexes th8CharProp[c] and ANDs the combined
+ *	whitespace+list-special bits, giving a branch-free, libc-free
+ *	classifier safe to call before platform init.  Out-of-range
+ *	bytes short-circuit to 0.
+ *
  * Parameters:
  *	c -- byte value in `[0, 255]`; values outside this range
  *	     return 0.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is whitespace or a list-special character,
  *	0 otherwise.
  *
@@ -24336,11 +27752,17 @@ th8IsSpecial(int c)
  *	Hexadecimal-digit classification.  Returns non-zero iff `c`
  *	is one of `0..9`, `A..F`, or `a..f`.
  *
+ * Why / How:
+ *	Table-driven: indexes th8CharProp[c] and ANDs the combined
+ *	digit+hex-extension bits, giving a branch-free, libc-free
+ *	classifier safe to call before platform init.  Out-of-range
+ *	bytes short-circuit to 0.
+ *
  * Parameters:
  *	c -- byte value in `[0, 255]`; values outside this range
  *	     return 0.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is a hex digit, 0 otherwise.
  *
  * Side effects:
@@ -24364,10 +27786,16 @@ th8IsHexDig(int c)
  *	octal is the only Tcl-relevant property that fits the
  *	contiguous-range pattern).
  *
+ * Why / How:
+ *	Uses a direct '0'..'7' range check rather than the property
+ *	table: octal is the only Tcl-relevant class that fits the
+ *	contiguous-range pattern and is not needed elsewhere.  No libc
+ *	dependency; safe before platform init.
+ *
  * Parameters:
  *	c -- byte value.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is an octal digit, 0 otherwise.
  *
  * Side effects:
@@ -24389,10 +27817,15 @@ th8IsOctDig(int c)
  *	Binary-digit classification.  Returns non-zero iff `c` is
  *	`'0'` or `'1'`.  Direct comparison (no table lookup).
  *
+ * Why / How:
+ *	Uses a direct comparison against '0' and '1' rather than the
+ *	property table (the class is trivial and not needed
+ *	elsewhere).  No libc dependency; safe before platform init.
+ *
  * Parameters:
  *	c -- byte value.
  *
- * Returns:
+ * Results:
  *	Non-zero if `c` is `'0'` or `'1'`, 0 otherwise.
  *
  * Side effects:
@@ -24429,10 +27862,16 @@ th8IsBinDig(int c)
  *	delete paths; test code reads it to inspect the live
  *	command registry.
  *
+ * Why / How:
+ *	Trivial struct-field read, exposed via the internal stubs
+ *	table so testlib (which cannot include th8_int_core.h) can
+ *	inspect the live token registry without knowing the struct
+ *	layout.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The `Th8_Hash *` (may be NULL during teardown).
  *
  * Side effects:
@@ -24456,11 +27895,17 @@ th8GetInterpCmdToken(Th8_Interp *interp)
  *	registry for MC/DC drives that need to observe command-
  *	registration error paths.
  *
+ * Why / How:
+ *	Trivial struct-field store, exposed via the internal stubs
+ *	table so testlib can swap in a custom registry to drive
+ *	command-registration error paths; ownership stays with the
+ *	caller.
+ *
  * Parameters:
  *	interp     -- interpreter.  Must be non-NULL.
  *	paCmdToken -- replacement hash pointer; may be NULL.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -24485,10 +27930,15 @@ th8SetInterpCmdToken(Th8_Interp *interp, Th8_Hash *paCmdToken)
  *	code reads it to assert that namespace-walk operations
  *	settle on the expected scope.
  *
+ * Why / How:
+ *	Trivial struct-field read, exposed via the internal stubs
+ *	table so testlib can assert where namespace-walk operations
+ *	settle without knowing the struct layout.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The current `Th8_Namespace *`.  Always non-NULL for a
  *	fully-constructed interpreter (the global namespace is the
  *	bottom of the stack).
@@ -24513,10 +27963,16 @@ th8GetInterpCurrentNs(Th8_Interp *interp)
  *	hash that backs script-level `[set]`, `[unset]`,
  *	`[info exists]`, etc., at the innermost scope).
  *
+ * Why / How:
+ *	Trivial struct-field read, exposed via the internal stubs
+ *	table so testlib can inspect innermost-scope variables;
+ *	returns NULL when there is no frame or the build has no
+ *	variable support.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The frame's `Th8_Hash *`, or NULL when:
  *	  - `interp->pFrame` is NULL (no eval frame on the stack), or
  *	  - the build was compiled without `TH8_ENABLE_VARIABLES`
@@ -24547,10 +28003,15 @@ th8GetFramePaVar(Th8_Interp *interp)
  *	channel names (e.g., `stdout`, `stderr`, file tempnames)
  *	to their `Th8_Channel *` records.
  *
+ * Why / How:
+ *	Trivial struct-field read, exposed via the internal stubs
+ *	table so testlib can inspect the live channel registry
+ *	without knowing the struct layout.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *
- * Returns:
+ * Results:
  *	The `Th8_Hash *` (may be NULL during early init or
  *	teardown).
  *
@@ -24585,11 +28046,16 @@ th8GetInterpPaChannels(Th8_Interp *interp)
  *	Used to drive token-tamper detection paths in MC/DC tests
  *	without touching the token via the normal API.
  *
+ * Why / How:
+ *	One-statement XOR perturber, exposed via the internal stubs
+ *	table so testlib can corrupt the bigint-enable token to drive
+ *	tamper-detection MC/DC vectors without the normal API.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	mask   -- 64-bit XOR mask.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -24613,11 +28079,16 @@ th8XorInterpBigintToken(Th8_Interp *interp, th8_int64_t mask)
  *	field; tests rely on this to verify that the loader
  *	rejects scripts when the token has been corrupted.
  *
+ * Why / How:
+ *	One-statement XOR perturber, exposed via the internal stubs
+ *	table so testlib can corrupt the signed-only-policy token to
+ *	verify the loader's tamper detection.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	mask   -- 64-bit XOR mask.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -24640,11 +28111,16 @@ th8XorInterpSignedToken(Th8_Interp *interp, th8_int64_t mask)
  *	Drives tamper detection on the secure-variable persistence
  *	state.
  *
+ * Why / How:
+ *	One-statement XOR perturber, exposed via the internal stubs
+ *	table so testlib can corrupt the secure-persist-enable token
+ *	to drive its tamper-detection vectors.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	mask   -- 64-bit XOR mask.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -24668,11 +28144,16 @@ th8XorInterpSecurePersistToken(Th8_Interp *interp, th8_int64_t mask)
  *	guard secure-variable persistence; tampering it must be
  *	detected by the loader.
  *
+ * Why / How:
+ *	One-statement XOR perturber, exposed via the internal stubs
+ *	table so testlib can corrupt the second of the paired
+ *	secure-persist tokens to verify the loader detects tampering.
+ *
  * Parameters:
  *	interp -- interpreter.  Must be non-NULL.
  *	mask   -- 64-bit XOR mask.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -24715,11 +28196,17 @@ th8XorInterpSecurePersistOk(Th8_Interp *interp, th8_int64_t mask)
  *	`!pState->bMutexReady` and `bMutexReady && xMutexFinal`
  *	defensive guards.
  *
+ * Why / How:
+ *	Th8_AsyncState is opaque outside th8_int_core.h, so this XOR
+ *	helper (exposed via the internal stubs table) lets testlib
+ *	toggle bMutexReady into and back out of the partial-init /
+ *	mid-teardown window; returning the old value supports restore.
+ *
  * Parameters:
  *	pState -- async state to perturb.  Must be non-NULL.
  *	mask   -- XOR mask applied to bMutexReady.
  *
- * Returns:
+ * Results:
  *	The previous value of `bMutexReady`, so the caller can
  *	restore or assert on it.
  *
@@ -24737,14 +28224,31 @@ th8AsyncStateXorBMutexReady(Th8_AsyncState *pState, int mask)
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8XchgInterpPlatform --
+ *
  *	Exchange interp->pPlatform with a new (possibly NULL)
  *	pointer.  Returns the old platform pointer so testlib can
  *	NULL the field, immediately invoke a malloc / realloc to
- *	drive the L967 / L1585 (F,T) defensive guards, then
+ *	drive the malloc/realloc (F,T) defensive guards, then
  *	restore the original platform.  Must be called in
  *	balanced pairs with no intervening platform-dependent
  *	work (any allocation in the NULL window will fail).
+ *
+ * Why / How:
+ *	Exposed via the internal stubs table so testlib can enter a
+ *	NULL-platform window and back out again, driving the
+ *	"NULL interpreter or platform" guards in the allocators;
+ *	returning the old pointer is what lets the caller restore it.
+ *
+ * Results:
+ *	The previous interp->pPlatform pointer.
+ *
+ * Side effects:
+ *	Overwrites interp->pPlatform with pNew.
+ *
+ *----------------------------------------------------------------------
  */
 
 TH8_INTERNAL Th8_Platform *
@@ -24756,10 +28260,12 @@ th8XchgInterpPlatform(Th8_Interp *interp, Th8_Platform *pNew)
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8AsyncStateScrubField --
+ *
  *	Zero one of pState's finalize-time defensive fields so
- *	testlib can drive the (F,-) / (T,F) MC/DC vectors at
- *	th8_core.c L2645 + L2651 + L2709 by calling
+ *	testlib can drive the finalize-guard MC/DC vectors by calling
  *	Th8_FinalizeAsyncState afterward.  Caller does NOT restore
  *	(finalize frees the pState); each test-only call leaks at
  *	most one mutex or event handle on the platform side, which
@@ -24767,6 +28273,21 @@ th8XchgInterpPlatform(Th8_Interp *interp, Th8_Platform *pNew)
  *	field == 0: pEventHandle  -> NULL
  *	field == 1: xEventDestroy -> NULL
  *	field == 2: xMutexFinal   -> NULL
+ *
+ * Why / How:
+ *	Th8_AsyncState is opaque outside th8_int_core.h, so this
+ *	helper (exposed via the internal stubs table) nulls a single
+ *	teardown field to force Th8_FinalizeAsyncState down its
+ *	defensive (missing-handle / missing-callback) branches.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Sets the selected pState field to NULL (an unknown field is a
+ *	no-op).
+ *
+ *----------------------------------------------------------------------
  */
 TH8_INTERNAL void
 th8AsyncStateScrubField(Th8_AsyncState *pState, int field)
@@ -25232,7 +28753,7 @@ th8NextVarName(
  *	s -- parse stack to initialise.  Must be non-NULL and own a
  *	     valid `inlineBuf`.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -25259,13 +28780,21 @@ th8ParseStackInit(Th8ParseStack *s)
  *	buffer; subsequent overflows double the heap buffer.  The
  *	doubling capacity-check guards against `size_t` overflow.
  *
+ * Why / How:
+ *	Keeps the common shallow-nesting case allocation-free by
+ *	growing from the inline buffer only on overflow: the first
+ *	spill copies the inline bytes into a fresh heap buffer, and
+ *	later spills double it (checking for size_t overflow first).
+ *	Uses the attempt-realloc (non-panicking) allocator so parse
+ *	errors surface as TH8_ERROR rather than aborting.
+ *
  * Parameters:
  *	interp -- interpreter used for the (attempted) allocation.
  *	s      -- parse stack to push onto.  Must have been
  *		  initialised via `th8ParseStackInit`.
  *	c      -- scope marker byte to push.
  *
- * Returns:
+ * Results:
  *	TH8_OK on success.
  *	TH8_ERROR if the doubling capacity would overflow `size_t`,
  *	  or if the underlying `TH8_ATTEMPT_REALLOC` returns NULL
@@ -25322,6 +28851,11 @@ th8ParseStackPush(Th8_Interp *interp, Th8ParseStack *s, char c)
  *	inline capacity was sufficient for the parser's whole run);
  *	in that case it is a no-op.
  *
+ * Why / How:
+ *	Only frees when the stack actually spilled to the heap
+ *	(s->p != s->inlineBuf), and re-points s->p back at the inline
+ *	buffer afterward so a repeat call is a safe no-op.
+ *
  * Parameters:
  *	interp -- interpreter used for the (possible) free.
  *	s      -- parse stack to release.  Must have been
@@ -25329,7 +28863,7 @@ th8ParseStackPush(Th8_Interp *interp, Th8ParseStack *s, char c)
  *		  reset below leaves `s->p == s->inlineBuf`, which
  *		  guards the next call.
  *
- * Returns:
+ * Results:
  *	Nothing.
  *
  * Side effects:
@@ -25646,6 +29180,15 @@ done:
  *
  *	Tcl 8.6 reference: https://www.tcl-lang.org/man/tcl8.6/TclCmd/Tcl.htm
  *
+ * Why / How:
+ *	Selects the applicable word Rule from the first byte (quote,
+ *	brace, or bare) and scans with the same interleaving
+ *	brace/bracket/quote context stack as th8NextCommand so nested
+ *	sub-scopes are counted correctly.  It only measures the word's
+ *	byte length; the actual substitutions are applied later by
+ *	th8SubstWord.  Every unmatched opener is reported as an error
+ *	rather than leniently accepted, matching strict Tcl(n).
+ *
  * Results:
  *	TH8_OK on success.  *pnWord set to byte count.
  *
@@ -25698,6 +29241,17 @@ th8NextWord(
 
     while (iEnd < nInput) {
 	char c = zInput[iEnd];
+
+	/* No Th8_Ready poll here: th8NextWord is the parser, run on every word
+	 * during evaluation and on the debug suspend/resume path.  A cancel poll
+	 * inside it (a) treats TH8_SUSPEND as a fatal parse error and aborts a
+	 * resumed script (debug-8.1), and (b) inflates the step counter on every
+	 * short word (sandbox-resource-3.2).  Scanning a word is a LINEAR pass
+	 * over attacker-supplied input -- bounded by the input size the attacker
+	 * already delivered, not an amplification -- so it is dispositioned
+	 * bounded (PARSE) in loop_bounded.tsv rather than polled.  Cancellation
+	 * of the surrounding work is the eval loop's job (it polls per command).
+	 * (TH8K-009.) */
 
 	if (stack.top == 0) {
 	    /*
@@ -26391,7 +29945,13 @@ done:
  *
  * Results:
  *	TH8_OK on success.  The interpreter result is set to the
- *	substituted string.
+ *	substituted string.  Otherwise the code from a failing
+ *	command substitution (TH8_ERROR propagates out).
+ *
+ * Side effects:
+ *	Evaluates any embedded command substitutions (with all the
+ *	state changes those entail) and sets the interpreter result to
+ *	the substituted string; may set an error result.
  *
  *----------------------------------------------------------------------
  */
@@ -26573,6 +30133,15 @@ Th8_Subst(
  *	identical 30+-line scan exists in exactly one place.  Exposed
  *	to test/diagnostic plugins via the internal stubs table so
  *	testlib can drive the (T,F) "{}rest" branch directly.
+ *
+ * Why / How:
+ *	Factoring the `{tag}rest` scan into this single pure helper
+ *	(it reports via out-parameters instead of touching Th8_CmdBuild)
+ *	is what lets the parser and the substitution-time builder share
+ *	one implementation, and lets testlib exercise the malformed-brace
+ *	branches directly.  A `{tag}` is looked up in the expansion
+ *	registry; an unknown or empty tag with trailing bytes is a
+ *	syntax error.
  *
  * Results:
  *	TH8_OK     - scan succeeded.  *pbExpand reports whether the
@@ -26986,9 +30555,26 @@ static int th8NRCmdSubstDone(Th8_Interp *, void *[], int);
 static int th8NRCmdDispatch(Th8_Interp *, void *[], int);
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8FreeCmdBuild --
  *
  *	Free a Th8_CmdBuild and all its internal buffers.
+ *
+ * Why / How:
+ *	Tears down the heap word-splitting state used by the NRE
+ *	command path, first restoring interp->isListMode to the value
+ *	saved when the build started, then releasing each of its
+ *	string/length/word buffers and the struct itself.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Restores interp->isListMode; frees the build's strbuf, lenbuf,
+ *	wordBuf, and the Th8_CmdBuild.  A NULL p is a no-op.
+ *
+ *----------------------------------------------------------------------
  */
 
 static void
@@ -27003,9 +30589,26 @@ th8FreeCmdBuild(Th8_Interp *interp, Th8_CmdBuild *p)
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8CmdBuildAddWord --
  *
  *	Add a fully substituted word to the build buffers.
+ *
+ * Why / How:
+ *	Accumulates the finished argv for the command being built: the
+ *	word bytes plus a NUL go into the string buffer while the
+ *	word's length is appended (as a size_t) to the parallel length
+ *	buffer, keeping the two arrays index-aligned for dispatch.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Appends to the build's strbuf and lenbuf and increments its
+ *	word count (nCount).
+ *
+ *----------------------------------------------------------------------
  */
 
 static void
@@ -27022,12 +30625,29 @@ th8CmdBuildAddWord(
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8CmdHasBracket --
  *
  *	Quick scan: does the command text contain '[' ?
  *	Used to decide whether the NRE word-splitting path
  *	is needed.  False positives ([ inside braces) are
  *	harmless - the NRE path handles them correctly.
+ *
+ * Why / How:
+ *	A cheap linear byte scan lets the evaluator take the simpler
+ *	synchronous path for commands with no command substitution and
+ *	reserve the heavier NRE word-splitting path for those that
+ *	might contain [...].  Being conservative (false positives are
+ *	fine) keeps the test to a single pass with no parsing.
+ *
+ * Results:
+ *	1 if a '[' byte appears in z[0..n-1]; 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -27080,6 +30700,8 @@ th8CmdNameTainted(Th8_Interp *interp, const char *zName, size_t nName)
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8NRSubstAndBuild --
  *
  *	Process words from pBuild->zInput, performing substitution.
@@ -27090,6 +30712,15 @@ th8CmdNameTainted(Th8_Interp *interp, const char *zName, size_t nName)
  *
  *	Called initially from th8EvalIteration (to start processing)
  *	and from th8NRCmdSubstDone (to continue after a [...] eval).
+ *
+ * Why / How:
+ *	Command substitutions must be able to [yield] without losing
+ *	the word-splitting position, so instead of calling a blocking
+ *	Th8_Eval this function keeps all progress in the heap
+ *	Th8_CmdBuild and defers each [...] to the NRE trampoline.
+ *	bWordActive/goto continue_word let it resume mid-word after a
+ *	substitution completes; a per-word Th8_Ready check honors
+ *	cancel/suspend.
  *
  * Results:
  *	TH8_OK if all words are processed (or an async eval was
@@ -27678,9 +31309,8 @@ th8NRCmdDispatch(Th8_Interp *interp, void *pData[], int rc)
 		    if (TH8_SAFE_MUL_SIZE(
 		            sizeof(char *), (size_t)nNew, &u1)) {
 			overflowed = 1;
-		    } else if (
-		        TH8_SAFE_MUL_SIZE(
-		            sizeof(size_t), (size_t)nNew, &u2)) {
+		    } else if (TH8_SAFE_MUL_SIZE(
+		                   sizeof(size_t), (size_t)nNew, &u2)) {
 			overflowed = 1;
 		    } else if (TH8_SAFE_ADD_SIZE(u1, u2, &nUA)) {
 			overflowed = 1;
@@ -27722,9 +31352,8 @@ th8NRCmdDispatch(Th8_Interp *interp, void *pData[], int rc)
 		    azNew);
 		pCmd = (Th8_Command *)pUnk->pData;
 		interp->bInUnknown = 1;
-		rc = pCmd->xProc(
-		    interp, pCmd->pContext, nNew, (const char **)azNew,
-		    anNew);
+		rc = th8InvokeCommand(
+		    interp, pCmd, nNew, (const char **)azNew, anNew);
 		return rc;
 	    }
 	    Th8_ErrorMessage(
@@ -27741,8 +31370,8 @@ th8NRCmdDispatch(Th8_Interp *interp, void *pData[], int rc)
 
 	    p = (Th8_Command *)pEntry->pData;
 	    Th8_NRAddCallback(interp, th8EvalPostCmd, pState, azElem, 0, 0);
-	    rc = p->xProc(
-	        interp, p->pContext, argc, (const char **)azElem, anElem);
+	    rc = th8InvokeCommand(
+	        interp, p, argc, (const char **)azElem, anElem);
 	    return rc;
 	}
 
@@ -27966,7 +31595,8 @@ th8EvalStateCleanup(
      * deletion was deferred during eval.
      */
 
-    if (interp->nEvalDepth == 0 && interp->pPendingHead) {
+    if (interp->nEvalDepth == 0 &&
+        (interp->pPendingCmdHead || interp->pPendingNsHead)) {
 	th8DrainPendingDeletes(interp);
     }
 
@@ -28578,8 +32208,8 @@ th8EvalIteration(
 
 	    pCmd = (Th8_Command *)pUnk->pData;
 	    interp->bInUnknown = 1;
-	    rc = pCmd->xProc(
-	        interp, pCmd->pContext, nNew, (const char **)azNew, anNew);
+	    rc = th8InvokeCommand(
+	        interp, pCmd, nNew, (const char **)azNew, anNew);
 
 	    /*
 	     * Do NOT reset bInUnknown here -- the command
@@ -28627,7 +32257,7 @@ th8EvalIteration(
 	p = (Th8_Command *)pEntry->pData;
 
 	Th8_NRAddCallback(interp, th8EvalPostCmd, pState, argv, 0, 0);
-	rc = p->xProc(interp, p->pContext, argc, (const char **)argv, argl);
+	rc = th8InvokeCommand(interp, p, argc, (const char **)argv, argl);
 
 	/*
 	 * Return rc to the trampoline.  The command's NRE
@@ -28773,7 +32403,8 @@ th8EvalLocal(
 	    nInput, flags, TH8_OK, interp->pPolicyCbCtx);
 	if (rc != TH8_OK) {
 	    interp->nEvalDepth--;
-	    if (interp->nEvalDepth == 0 && interp->pPendingHead) {
+	    if (interp->nEvalDepth == 0 &&
+	        (interp->pPendingCmdHead || interp->pPendingNsHead)) {
 		th8DrainPendingDeletes(interp);
 	    }
 	    interp->nLine = nSavedLine;
@@ -28834,7 +32465,8 @@ th8EvalLocal(
 	 * PRE-policy reject path above.
 	 */
 	interp->nEvalDepth--;
-	if (interp->nEvalDepth == 0 && interp->pPendingHead) {
+	if (interp->nEvalDepth == 0 &&
+	    (interp->pPendingCmdHead || interp->pPendingNsHead)) {
 	    th8DrainPendingDeletes(interp);
 	}
 	interp->nLine = nSavedLine;
@@ -29444,7 +33076,7 @@ th8_spilornis_memsize(void *p)
  * so that Spilornis.h's prototypes use the correct se_* types.
  */
 /* amalgamation: th8_spilornis.h already included */
-#line 16116 "src/th8_core.c"
+#line 18956 "src/th8_core.c"
 /************** Begin file Spilornis.h *************/
 #line 1 "bin/Spilornis.h"
 /*
@@ -29642,7 +33274,7 @@ EAGLE_EXTERN se_HANDLE	Eagle_SetMemoryHeap(se_HANDLE hNewHeap);
 #endif /* _SPILORNIS_H_ */
 
 /************** End of Spilornis.h *************/
-#line 16117 "src/th8_core.c"
+#line 18957 "src/th8_core.c"
 
 /*
  *----------------------------------------------------------------------
@@ -30034,10 +33666,13 @@ Th8_SplitList(
  *	element), a brace-wrap fallback is used.
  *
  * Results:
- *	TH8_OK.
+ *	TH8_OK on success, or TH8_ERROR if a buffer growth fails
+ *	(out of memory) or interp is NULL.  On the OOM path the
+ *	function frees its own temporaries but leaves the partial
+ *	*pzList buffer allocated for the caller to free.
  *
  * Side effects:
- *	The list buffer is reallocated.
+ *	The list buffer (*pzList with length *pnList) is reallocated.
  *
  *----------------------------------------------------------------------
  */
@@ -30261,6 +33896,13 @@ Th8_ToInt(
  *	all characters match.  Used by Th8_ToBoolean to recognize
  *	"true", "false", "yes", "no", "on", "off".
  *
+ * Results:
+ *	1 if z (length n) equals the literal case-insensitively; 0
+ *	otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -30303,7 +33945,12 @@ th8StrNoCaseEq(
  *	representation cache for repeated lookups.
  *
  * Results:
- *	TH8_OK on success; TH8_ERROR on malformed input.
+ *	TH8_OK on success (with *pbVal set to 0 or 1); TH8_ERROR on
+ *	malformed input or a NULL-terminated string with a NULL interp.
+ *
+ * Side effects:
+ *	May populate the interpreter's boolean internal-representation
+ *	cache for the input.  Writes only through the caller's pbVal.
  *
  *----------------------------------------------------------------------
  */
@@ -31063,6 +34710,13 @@ th8OversizeString(Th8_Interp *interp) /* Interpreter. */
  *	struct.  This callback is invoked during [namespace import]
  *	to deep-copy proc contexts into the importing namespace.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Sets the resolved command's xCopy pointer.  A no-op if interp
+ *	is NULL or the command/namespace cannot be resolved.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -31557,9 +35211,26 @@ Th8_FindExpansion(
  */
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8ExpansionListCallback --
  *
  *	Hash iteration callback for Th8_ListAppendExpansions.
+ *
+ * Why / How:
+ *	Th8_HashIterate speaks in raw entries; this adapter unpacks the
+ *	(interp, list, len, pattern) tuple from the shared context
+ *	array and appends the entry's key to the caller's list when it
+ *	matches the glob (or when no pattern was supplied).
+ *
+ * Results:
+ *	Always TH8_OK (continue iterating).
+ *
+ * Side effects:
+ *	May append the entry's name to the caller's list buffer
+ *	(growing it) via Th8_ListAppend.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -31597,6 +35268,12 @@ th8ExpansionListCallback(Th8_HashEntry *pEntry, void *pCtx)
  *	`paExpansion` table installed) yields no entries, not an
  *	error.
  *
+ * Why / How:
+ *	Resolves the namespace (current, falling back to global),
+ *	then iterates its expansion hash via th8ExpansionListCallback,
+ *	which applies the glob filter and appends matches.  A namespace
+ *	with no expansion table simply contributes nothing.
+ *
  * Parameters:
  *	interp -- interpreter holding the namespace.  No-op if NULL.
  *	pzList -- output: pointer to the Tcl-list buffer.  No-op
@@ -31606,7 +35283,7 @@ th8ExpansionListCallback(Th8_HashEntry *pEntry, void *pCtx)
  *	zPat   -- glob pattern to match against expansion names.
  *	nPat   -- length of `zPat` in bytes (0 means "match all").
  *
- * Returns:
+ * Results:
  *	Nothing.  Errors from inner `Th8_ListAppend` surface as an
  *	error result on `interp` for the upper layer.
  *
@@ -31681,10 +35358,27 @@ Th8_ListAppendExpansions(
  */
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8IntToStr --
  *
  *	Format an int into a stack buffer.  Returns a pointer into
  *	zBuf (which must be at least 20 bytes).
+ *
+ * Why / How:
+ *	A libc-free integer formatter that writes digits backward from
+ *	the end of the caller's buffer and returns a pointer to the
+ *	first digit.  Negation is done on the unsigned magnitude
+ *	(-(v+1)+1) so INT_MIN is handled without signed overflow.
+ *
+ * Results:
+ *	A pointer into zBuf at the start of the NUL-terminated decimal
+ *	string.
+ *
+ * Side effects:
+ *	Writes the formatted digits into the caller-provided zBuf.
+ *
+ *----------------------------------------------------------------------
  */
 
 static const char *
@@ -31728,6 +35422,13 @@ th8IntToStr(int v, char *zBuf)
  *	4 line bytes); shorter keys are silently skipped, matching
  *	the iterate-anyway contract.
  *
+ * Why / How:
+ *	Th8_HashIterate speaks in raw entries; this adapter decodes the
+ *	packed breakpoint key (name, NUL, 4-byte little-endian line)
+ *	and the numeric id in pData, then appends the {id name line}
+ *	triple to the caller's list.  Malformed (too-short) keys are
+ *	skipped so one bad entry cannot abort the enumeration.
+ *
  * Parameters:
  *	pEntry -- hash entry to decode.
  *	pCtx   -- caller's `void *[3]`:
@@ -31735,7 +35436,7 @@ th8IntToStr(int v, char *zBuf)
  *	         [1] `char **` output list pointer,
  *	         [2] `size_t *` output list length.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` always (the iterate continues even when one entry
  *	is malformed, by design).
  *
@@ -31790,6 +35491,13 @@ th8BreakpointListCallback(Th8_HashEntry *pEntry, void *pCtx)
  *	no-op.  NULL arguments are tolerated (silently ignored)
  *	per the Bug 26 defensive-guard policy.
  *
+ * Why / How:
+ *	Iterates the interpreter's breakpoint hash via
+ *	th8BreakpointListCallback, which decodes each packed key into
+ *	the {id name line} triple.  A missing breakpoint hash (builds
+ *	without a debugger attached) yields an empty list rather than
+ *	an error.
+ *
  * Parameters:
  *	interp -- interpreter holding the breakpoint hash.  No-op
  *		  if NULL.
@@ -31798,7 +35506,7 @@ th8BreakpointListCallback(Th8_HashEntry *pEntry, void *pCtx)
  *	pnList -- output: pointer to the buffer length.  No-op
  *		  if NULL.
  *
- * Returns:
+ * Results:
  *	Nothing.  Cannot fail to the caller: malformed entries are
  *	skipped (see `th8BreakpointListCallback`) and allocation
  *	errors inside `Th8_ListAppend` surface as an error result
@@ -32086,6 +35794,13 @@ badLevel:
  *	exponent 0) are handled with the IEEE 754 unbiased rule
  *	v = frac * 2^-1074.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes the normalized mantissa to *pF and the binary exponent
+ *	to *pE.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -32140,6 +35855,13 @@ th8DoubleToDiyFp(
  *	on the dropped low 64 bits.  The reconstructed result is
  *	correct within 1 unit-in-the-last-place, which is the
  *	error budget Grisu accounts for.
+ *
+ * Results:
+ *	The top 64 bits of the 128-bit product x * y, rounded to
+ *	nearest.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -32248,6 +35970,14 @@ static const int th8Pow10E[87] =
  *	Returns the cached significand, its binary exponent, and
  *	the corresponding decimal exponent K.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes the selected cached significand, its binary exponent,
+ *	and decimal exponent K through *pSig, *pE, and *pK (a defensive
+ *	1.0 fallback for an out-of-range input).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -32310,6 +36040,13 @@ th8GetCachedPow10(
  *	shortest correct representation.
  *
  *	Assumes rVal > 0, finite, non-NaN, not zero.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes 17 digit characters into zDig and the decimal exponent
+ *	of the leading digit into *pExpn.
  *
  *----------------------------------------------------------------------
  */
@@ -33133,6 +36870,13 @@ static const struct {
  *	rounding).  Decomposes each input into 32-bit halves and
  *	assembles the four partial products with carry tracking.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes the high and low 64 bits of the product through *pHi
+ *	and *pLo.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -33184,6 +36928,16 @@ th8Mul64x64(
  *
  *	On allocator failure, returns 0 (conservative: keep the
  *	round-down candidate, which is within 1 ULP of correct).
+ *
+ * Results:
+ *	1 to round up (mantissa+1), 0 to round down (keep mantissa),
+ *	with halfway ties resolved to even.  Also 0 on allocator
+ *	failure.
+ *
+ * Side effects:
+ *	Allocates and frees libtommath big integers via the bigint
+ *	allocator bridge (bracketed by th8BigintSetup/Teardown); no
+ *	interpreter state is changed.
  *
  *----------------------------------------------------------------------
  */
@@ -33321,6 +37075,16 @@ th8BignumDecideRound(
  *	defined.  Without bignum support, we apply round-to-even
  *	based on the candidate's LSB -- close enough for typical
  *	use (off by at most 1 ULP on those rare ambiguous inputs).
+ *
+ * Results:
+ *	The correctly-rounded double for mantissa * 10^decExp; 0.0 for
+ *	a zero mantissa or a decExp below the table range, and +Inf
+ *	for a decExp above it.
+ *
+ * Side effects:
+ *	May allocate/free libtommath integers for the exact halfway
+ *	comparison (via th8BignumDecideRound) when bigint is enabled;
+ *	no interpreter state is changed.
  *
  *----------------------------------------------------------------------
  */
@@ -33961,6 +37725,13 @@ th8AppendHashKeys(
  *	(if different), appending every key.  This implements
  *	[info commands] with no pattern filter.
  *
+ * Results:
+ *	TH8_OK; TH8_ERROR if interp is NULL.
+ *
+ * Side effects:
+ *	Appends command names to the caller's list buffer (which may
+ *	grow/reallocate) via Th8_ListAppend.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -34139,6 +37910,13 @@ Th8_ListAppendCommandsMatching(
  *	nChar code points have been consumed or the byte limit is
  *	reached.  Returns a pointer past the last decoded character.
  *
+ * Results:
+ *	A pointer to the byte after nChar code points (or at the end
+ *	of the string if it has fewer).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -34174,6 +37952,13 @@ Th8_Utf8Advance(
  *	then checks that the resulting pointer is within bounds.
  *	Returns NULL for negative indices or out-of-range offsets.
  *
+ * Results:
+ *	A pointer to the iChar'th code point, or NULL for a negative
+ *	index or an offset past the end of the string.
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -34205,6 +37990,14 @@ Th8_Utf8Index(
  *	surrogate code points (U+D800..U+DFFF), and values above
  *	U+10FFFF.  On failure, *piOffset receives the byte offset
  *	of the first invalid byte.
+ *
+ * Results:
+ *	TH8_OK if the whole string is well-formed UTF-8; TH8_ERROR
+ *	otherwise (with the first bad byte's offset in *piOffset when
+ *	non-NULL).
+ *
+ * Side effects:
+ *	None (writes only through the caller's optional piOffset).
  *
  *----------------------------------------------------------------------
  */
@@ -34254,6 +38047,14 @@ Th8_Utf8Validate(
  *	measuring the string first.  Returns NULL on allocation
  *	failure.
  *
+ * Results:
+ *	A newly-allocated NUL-terminated copy of the n input bytes,
+ *	or NULL on allocation failure.  The caller owns and must free
+ *	it.
+ *
+ * Side effects:
+ *	Allocates memory (accounted against the interpreter).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -34300,6 +38101,16 @@ Th8_Strdup(
  *	::dir to the containing directory and evaluates the file
  *	contents.  Missing files are silently skipped.  This mirrors
  *	Tcl's pkgIndex.tcl sourcing convention.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	When the index file exists, evaluates it (which may register
+ *	packages and run arbitrary script), setting ::dir to its
+ *	directory; brackets the read+eval by saving/restoring
+ *	::th8_security and ::dir so those globals do not leak (Bug 34).
+ *	Allocates and frees the path buffer.
  *
  *----------------------------------------------------------------------
  */
@@ -34412,7 +38223,12 @@ oom:
  *	during Th8_CreateInterp and Th8_RestoreInterp.
  *
  * Results:
- *	None.
+ *	TH8_OK if every global was set, or TH8_ERROR on the first
+ *	failure (for example an allocation failure while setting a
+ *	variable or building the source/compileOptions list).  On
+ *	failure the caller (Th8_CreateInterp / Th8_RestoreInterp) tears
+ *	the interpreter down rather than publishing a partially
+ *	populated environment (TH8K-003).
  *
  * Side effects:
  *	Sets ::tcl_platform(engine), ::tcl_platform(platform),
@@ -34423,24 +38239,33 @@ oom:
  */
 
 #if defined(TH8_ENABLE_VARIABLES)
-static void
+static int
 th8InitGlobals(Th8_Interp *interp) /* Interpreter. */
 {
-    Th8_SetVar(interp, "::tcl_version", TH8_NOLEN, "8.6", TH8_NOLEN);
-    Th8_SetVar(interp, "::tcl_patchLevel", TH8_NOLEN, "8.6.19", TH8_NOLEN);
+    /*
+     * Every Th8_SetVar can fail on OOM.  Propagate the FIRST failure so the
+     * constructor's all-or-nothing rollback can run (TH8K-003); the previous
+     * void version silently produced a partially-populated environment.
+     */
+
+#  define TH8_INITVAR(name, val, vlen)                                       \
+      do {                                                                   \
+	  if (Th8_SetVar(interp, (name), TH8_NOLEN, (val), (vlen)) !=        \
+	      TH8_OK)                                                        \
+	      return TH8_ERROR;                                              \
+      } while (0)
+
+    TH8_INITVAR("::tcl_version", "8.6", TH8_NOLEN);
+    TH8_INITVAR("::tcl_patchLevel", "8.6.19", TH8_NOLEN);
 #  if defined(TH8_DEBUG)
-    Th8_SetVar(interp, "::tcl_platform(debug)", TH8_NOLEN, "1", TH8_NOLEN);
+    TH8_INITVAR("::tcl_platform(debug)", "1", TH8_NOLEN);
 #  endif
-    Th8_SetVar(interp, "::tcl_platform(engine)", TH8_NOLEN, "TH8", TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::tcl_platform(patchLevel)", TH8_NOLEN, TH8_PATCH_LEVEL,
-        TH8_NOLEN);
+    TH8_INITVAR("::tcl_platform(engine)", "TH8", TH8_NOLEN);
+    TH8_INITVAR("::tcl_platform(patchLevel)", TH8_PATCH_LEVEL, TH8_NOLEN);
 #  if defined(_WIN32) || defined(WIN32)
-    Th8_SetVar(
-        interp, "::tcl_platform(platform)", TH8_NOLEN, "windows", TH8_NOLEN);
+    TH8_INITVAR("::tcl_platform(platform)", "windows", TH8_NOLEN);
 #  else
-    Th8_SetVar(
-        interp, "::tcl_platform(platform)", TH8_NOLEN, "unix", TH8_NOLEN);
+    TH8_INITVAR("::tcl_platform(platform)", "unix", TH8_NOLEN);
 #  endif
 
     {
@@ -34451,12 +38276,33 @@ th8InitGlobals(Th8_Interp *interp) /* Interpreter. */
 
 	char *zSrc = 0;
 	size_t nSrc = 0;
+	int rc;
 
-	Th8_ListAppend(interp, &zSrc, &nSrc, TH8_SOURCE_ID, TH8_NOLEN);
-	Th8_ListAppend(interp, &zSrc, &nSrc, TH8_SOURCE_TIMESTAMP, TH8_NOLEN);
-	Th8_ListAppend(interp, &zSrc, &nSrc, TH8_SOURCE_TAGS, TH8_NOLEN);
-	Th8_SetVar(interp, "::tcl_platform(source)", TH8_NOLEN, zSrc, nSrc);
+	/*
+	 * Each Th8_ListAppend can fail on OOM: its oom: path returns
+	 * TH8_ERROR and leaves the partial buffer for the caller to free.
+	 * Check every append immediately and abort on the first failure
+	 * rather than publishing a truncated list through the later
+	 * Th8_SetVar -- the constructor is all-or-nothing (TH8K-003).  The
+	 * checks are chained through rc as single-condition ifs (no
+	 * compound decision) and zSrc is freed once on every exit.
+	 */
+
+	rc = Th8_ListAppend(interp, &zSrc, &nSrc, TH8_SOURCE_ID, TH8_NOLEN);
+	if (rc == TH8_OK) {
+	    rc = Th8_ListAppend(
+	        interp, &zSrc, &nSrc, TH8_SOURCE_TIMESTAMP, TH8_NOLEN);
+	}
+	if (rc == TH8_OK) {
+	    rc = Th8_ListAppend(
+	        interp, &zSrc, &nSrc, TH8_SOURCE_TAGS, TH8_NOLEN);
+	}
+	if (rc == TH8_OK) {
+	    rc = Th8_SetVar(
+	        interp, "::tcl_platform(source)", TH8_NOLEN, zSrc, nSrc);
+	}
 	Th8_Free(interp, zSrc);
+	if (rc != TH8_OK) return TH8_ERROR;
     }
 
     /*
@@ -34469,14 +38315,26 @@ th8InitGlobals(Th8_Interp *interp) /* Interpreter. */
 	char *zOpts = 0;
 	size_t nOpts = 0;
 	int k;
+	int rc = TH8_OK;
+
+	/*
+	 * As with the "source" list above, propagate the first
+	 * Th8_ListAppend OOM failure instead of publishing a truncated
+	 * compileOptions list (TH8K-003).  Single-condition loop guard
+	 * plus a break keeps this out of a compound MC/DC decision.
+	 */
 
 	for (k = 0; azOpts[k]; k++) {
-	    Th8_ListAppend(interp, &zOpts, &nOpts, azOpts[k], TH8_NOLEN);
+	    rc = Th8_ListAppend(interp, &zOpts, &nOpts, azOpts[k], TH8_NOLEN);
+	    if (rc != TH8_OK) break;
 	}
-	Th8_SetVar(
-	    interp, "::tcl_platform(compileOptions)", TH8_NOLEN,
-	    zOpts ? zOpts : "", zOpts ? nOpts : 0);
+	if (rc == TH8_OK) {
+	    rc = Th8_SetVar(
+	        interp, "::tcl_platform(compileOptions)", TH8_NOLEN,
+	        zOpts ? zOpts : "", zOpts ? nOpts : 0);
+	}
 	Th8_Free(interp, zOpts);
+	if (rc != TH8_OK) return TH8_ERROR;
     }
 
     /*
@@ -34491,31 +38349,27 @@ th8InitGlobals(Th8_Interp *interp) /* Interpreter. */
 	if (pPlat->xGetUserName &&
 	    pPlat->xGetUserName(interp, pPlat->pCtx, zBuf, sizeof(zBuf)) ==
 	        TH8_OK) {
-	    Th8_SetVar(
-	        interp, "::tcl_platform(user)", TH8_NOLEN, zBuf, TH8_NOLEN);
+	    TH8_INITVAR("::tcl_platform(user)", zBuf, TH8_NOLEN);
 	} else {
-	    Th8_SetVar(
-	        interp, "::tcl_platform(user)", TH8_NOLEN, "", TH8_NOLEN);
+	    TH8_INITVAR("::tcl_platform(user)", "", TH8_NOLEN);
 	}
 
 	if (pPlat->xGetHostName &&
 	    pPlat->xGetHostName(interp, pPlat->pCtx, zBuf, sizeof(zBuf)) ==
 	        TH8_OK) {
-	    Th8_SetVar(
-	        interp, "::tcl_platform(host)", TH8_NOLEN, zBuf, TH8_NOLEN);
+	    TH8_INITVAR("::tcl_platform(host)", zBuf, TH8_NOLEN);
 	} else {
-	    Th8_SetVar(
-	        interp, "::tcl_platform(host)", TH8_NOLEN, "", TH8_NOLEN);
+	    TH8_INITVAR("::tcl_platform(host)", "", TH8_NOLEN);
 	}
     }
 
-    Th8_SetVar(interp, "::argv", TH8_NOLEN, "", TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::auto_path", TH8_NOLEN,
-        "lib/th8 lib/sqlite3 lib/testlib lib/Standard1.0", TH8_NOLEN);
-    Th8_SetVar(interp, "::errorCode", TH8_NOLEN, "NONE", TH8_NOLEN);
-    Th8_SetVar(interp, "::errorInfo", TH8_NOLEN, "", TH8_NOLEN);
-    Th8_SetVar(interp, "::tcl_precision", TH8_NOLEN, "0", TH8_NOLEN);
+    TH8_INITVAR("::argv", "", TH8_NOLEN);
+    TH8_INITVAR(
+        "::auto_path", "lib/th8 lib/sqlite3 lib/testlib lib/Standard1.0",
+        TH8_NOLEN);
+    TH8_INITVAR("::errorCode", "NONE", TH8_NOLEN);
+    TH8_INITVAR("::errorInfo", "", TH8_NOLEN);
+    TH8_INITVAR("::tcl_precision", "0", TH8_NOLEN);
     /* NOTE: 0 = "shortest representation that round-trips exactly".
      * Th8_SetResultDouble implements the round-trip check. */
 
@@ -34533,8 +38387,12 @@ th8InitGlobals(Th8_Interp *interp) /* Interpreter. */
      * the DNS-mock sweep in plat_wrappers) should locally lower
      * the value to a fraction of a second before issuing the
      * call, and restore the previous value afterwards. */
-    Th8_SetVar(interp, "::th8_timeout", TH8_NOLEN, "30000", 5);
+    TH8_INITVAR("::th8_timeout", "30000", 5);
+
+    return TH8_OK;
+#  undef TH8_INITVAR
 }
+
 #endif
 
 
@@ -34556,6 +38414,17 @@ th8InitGlobals(Th8_Interp *interp) /* Interpreter. */
  *	splits it as a Tcl list, and calls th8SourcePkgIndex for
  *	each directory.  The pkgIndex.th8 files register packages
  *	via [package ifneeded], populating the package registry.
+ *
+ * Results:
+ *	TH8_OK on success (including when ::auto_path is empty or
+ *	unset with no explicit value); TH8_ERROR if interp is NULL,
+ *	the auto-path cannot be obtained, or list-splitting fails.
+ *
+ * Side effects:
+ *	Sources each directory's pkgIndex.th8 (see th8SourcePkgIndex),
+ *	which registers packages and may run arbitrary script;
+ *	allocates and frees the split list and, when defaulted, the
+ *	taken ::auto_path value.
  *
  *----------------------------------------------------------------------
  */
@@ -34781,6 +38650,13 @@ th8ParseCommand(
 
     while (n > 0 &&
            (th8IsSpace(*z) || *z == '\n' || *z == '\r' || *z == ';')) {
+	/* No Th8_Ready poll in the parser (here or in th8NextWord): [info
+	 * complete] scans a value that already occupies memory, so the scan is
+	 * a LINEAR pass bounded by the (allocation-quota-limited) size of that
+	 * value -- not an amplification -- and the parser is shared with the
+	 * debug suspend/resume path, where a cancel poll would treat TH8_SUSPEND
+	 * as a fatal error.  Dispositioned bounded (PARSE) in loop_bounded.tsv.
+	 * (TH8K-009.) */
 	if (*z == '\n') nLine++;
 	z++;
 	n--;
@@ -35103,6 +38979,14 @@ Th8_ByteToUtf16Col(
  *	`xFinalize` -- those are per-platform-instance lifecycle
  *	callbacks that must not be overwritten by composition.
  *
+ * Why / How:
+ *	"Destination wins" (fill only NULL slots, via MERGE_SLOT) is
+ *	what lets a host layer several platform modules without them
+ *	knowing about each other, an override always beating a base.
+ *	The nVersion equality gate ensures both structs share a field
+ *	layout so slot-by-slot copying stays offset-correct; the two
+ *	lifecycle callbacks and pCtx are deliberately left untouched.
+ *
  * Parameters:
  *	pDst -- target platform; modified in place.  Caller owns
  *	        the storage.  Must be non-NULL and previously
@@ -35110,7 +38994,7 @@ Th8_ByteToUtf16Col(
  *	pSrc -- source platform; read-only.  Must be non-NULL and
  *	        have the same `nVersion` as `pDst`.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on a successful merge.
  *	`TH8_ERROR` if `pDst->nVersion != pSrc->nVersion`
  *	(struct-layout mismatch; merge would corrupt offsets).
@@ -35245,8 +39129,11 @@ Th8_MergePlatform(
     MERGE_SLOT(xDnsResolve);
     MERGE_SLOT(xDnsResolveFree);
 
-    /* Diagnostics (nVersion 5) */
+    /* Diagnostics */
     MERGE_SLOT(xStackBackTrace);
+
+    /* 64-bit atomics */
+    MERGE_SLOT(xIntCmpXchg64);
     return TH8_OK;
 }
 
@@ -35268,6 +39155,13 @@ Th8_MergePlatform(
  *	struct-copies all fields.  The clone can be freely modified
  *	without affecting the original.  Used by
  *	Th8_MergePlatformInterp to create per-interpreter overrides.
+ *
+ * Results:
+ *	A newly-allocated, freely-mutable copy of *pSrc, or NULL if
+ *	pSrc (or its xMalloc) is NULL or the allocation fails.
+ *
+ * Side effects:
+ *	Allocates memory via pSrc->xMalloc (with a NULL interp).
  *
  *----------------------------------------------------------------------
  */
@@ -35300,6 +39194,13 @@ Th8_ClonePlatform(const Th8_Platform *pSrc)
  *	Safe to call with NULL.  Must only be used on cloned
  *	platforms, not on the original static platform.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Frees the platform struct via its own xFree (NULL interp).
+ *	A NULL pPlatform (or one without xFree) is a no-op.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -35328,6 +39229,16 @@ Th8_FreePlatform(Th8_Platform *pPlatform)
  *	Th8_MergePlatform, then swaps the interpreter's platform
  *	pointer.  The bPlatformCloned flag tracks ownership so
  *	Th8_DeleteInterp knows to free the clone.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR if interp or pSrc is NULL, the
+ *	clone allocation fails, or the version-checked merge fails.
+ *
+ * Side effects:
+ *	Replaces interp->pPlatform with a newly-cloned, merged
+ *	platform and sets bPlatformCloned; frees the previous clone
+ *	when the interpreter owned it.  On failure frees the partial
+ *	clone and leaves the interpreter unchanged.
  *
  *----------------------------------------------------------------------
  */
@@ -35417,6 +39328,56 @@ Th8_Platform th8GlobalPlatform;
 /*
  *----------------------------------------------------------------------
  *
+ * th8ValidatePlatform --
+ *
+ *	Validate a caller-supplied platform table before any of its
+ *	callbacks are used (TH8K-001).  Checks that the pointer is
+ *	non-NULL, the ABI version matches TH8_PLATFORM_VERSION, and
+ *	every mandatory callback is present: the allocator quartet
+ *	(xMalloc/xRealloc/xFree/xMemorySize) and the byte-operation
+ *	quartet (xMemcpy/xMemmove/xMemset/xMemcmp), all of which the
+ *	core dereferences unconditionally during interpreter setup.
+ *
+ * Why / How:
+ *	A malformed platform must produce a clean creation failure,
+ *	not a NULL function-pointer dereference.  The check reads only
+ *	the function-pointer slots -- it never CALLS a callback on the
+ *	suspect platform, and it uses TH8_TRACE_ERR(NULL, ...) so it
+ *	does not rely on the platform for diagnostics either.  Called
+ *	from both Th8_Initialize and Th8_CreateInterp.
+ *
+ * Results:
+ *	TH8_OK if the platform is usable; TH8_ERROR otherwise.
+ *
+ * Side effects:
+ *	None (pure validation).
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8ValidatePlatform(const Th8_Platform *pPlatform) /* Platform to validate. */
+{
+    if (!pPlatform) {
+	TH8_TRACE_ERR(NULL, "platform is NULL");
+	return TH8_ERROR;
+    }
+    if (pPlatform->nVersion != TH8_PLATFORM_VERSION) {
+	TH8_TRACE_ERR(NULL, "platform ABI version mismatch");
+	return TH8_ERROR;
+    }
+    if (!pPlatform->xMalloc || !pPlatform->xRealloc || !pPlatform->xFree ||
+        !pPlatform->xMemorySize || !pPlatform->xMemcpy ||
+        !pPlatform->xMemmove || !pPlatform->xMemset || !pPlatform->xMemcmp) {
+	TH8_TRACE_ERR(NULL, "platform missing a mandatory callback");
+	return TH8_ERROR;
+    }
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * Th8_Initialize --
  *
  *	Initialize the TH8 library-wide global state.  Must be called
@@ -35424,20 +39385,25 @@ Th8_Platform th8GlobalPlatform;
  *	call.  Subsequent calls return TH8_ERROR.
  *
  * Why / How:
- *	Copies the platform function table into the global
- *	th8GlobalPlatform, calls xInitialize if provided, initializes
- *	the global mutex, and sets the current working directory to
- *	the base path (".").  An atomic CAS on th8Initialized prevents
- *	double-initialization.
+ *	Validates the platform (th8ValidatePlatform), copies its
+ *	function table into the global th8GlobalPlatform, calls
+ *	xInitialize if provided, initializes the global mutex, and sets
+ *	the current working directory to the base path (".").  An atomic
+ *	CAS on th8Initialized prevents double-initialization.  The
+ *	stages run in a fixed order and, on any failure, are undone in
+ *	reverse (TH8K-004) so a failed attempt leaves no global state
+ *	behind for a later retry.
  *
  * Results:
- *	TH8_OK on success; TH8_ERROR if already initialized or if
- *	xInitialize or xSetCwd fails.
+ *	TH8_OK on success; TH8_ERROR if already initialized, if the
+ *	platform is NULL / wrong-version / missing a mandatory callback
+ *	(TH8K-001), or if xInitialize or xSetCwd fails (with rollback).
  *
  * Side effects:
- *	th8GlobalPlatform is populated; th8GlobalMutex is initialized;
- *	xSetCwd may change the process working directory;
- *	th8Initialized is set to 1.
+ *	On success: th8GlobalPlatform is populated; th8GlobalMutex is
+ *	initialized; xSetCwd may change the process working directory;
+ *	th8Initialized is set to 1.  On failure every side effect is
+ *	rolled back.
  *
  *----------------------------------------------------------------------
  */
@@ -35445,10 +39411,28 @@ Th8_Platform th8GlobalPlatform;
 int
 Th8_Initialize(Th8_Platform *pPlatform) /* Platform (for mutex callbacks). */
 {
+    int bThreadInit = 0; /* Th8_ThreadInit ran -> undo with Th8_ThreadDone. */
+    int bXInit = 0; /* xInitialize ran -> undo with xFinalize. */
+    int bPlatCopied =
+        0; /* th8GlobalPlatform populated -> zero on rollback. */
+    int bMutexReady =
+        0; /* mutex-ready flag claimed -> release on rollback. */
+
     if (Th8_IntCmpXchg(NULL, &th8Initialized, 0, 0)) {
 	TH8_TRACE_ERR(NULL, "already initialized");
 	return TH8_ERROR; /* Already initialized. */
     }
+
+    /*
+     * TH8K-001: reject a NULL / wrong-version / incomplete platform
+     * BEFORE any callback is used, so a malformed platform fails
+     * cleanly instead of NULL-dereferencing a mandatory callback.
+     */
+
+    if (th8ValidatePlatform(pPlatform) != TH8_OK) {
+	return TH8_ERROR;
+    }
+
     /*
      * Register the calling (main) thread with TH8's allocator BEFORE
      * the platform's xInitialize runs.  On mimalloc builds this
@@ -35457,37 +39441,73 @@ Th8_Initialize(Th8_Platform *pPlatform) /* Platform (for mutex callbacks). */
      * on the correct heap.  Worker threads call Th8_ThreadInit
      * themselves at thread entry.                                  */
     Th8_ThreadInit();
-    if (pPlatform) {
-	if (pPlatform->xInitialize) {
-	    if (pPlatform->xInitialize(NULL, pPlatform->pCtx) != TH8_OK) {
-		TH8_TRACE_ERR(NULL, "xInitialize callback failed");
-		return TH8_ERROR;
-	    }
+    bThreadInit = 1;
+
+    if (pPlatform->xInitialize) {
+	if (pPlatform->xInitialize(NULL, pPlatform->pCtx) != TH8_OK) {
+	    TH8_TRACE_ERR(NULL, "xInitialize callback failed");
+	    goto th8InitRollback;
 	}
-	th8GlobalPlatform = *pPlatform;
-	if (Th8_IntCmpXchg(NULL, &th8GlobalMutexReady, 1, 0) == 0 &&
-	    pPlatform->xMutexInit) {
+	bXInit = 1;
+    }
+    th8GlobalPlatform = *pPlatform;
+    bPlatCopied = 1;
+    if (Th8_IntCmpXchg(NULL, &th8GlobalMutexReady, 1, 0) == 0) {
+	bMutexReady = 1;
+	if (pPlatform->xMutexInit) {
 	    pPlatform->xMutexInit(NULL, pPlatform->pCtx, &th8GlobalMutex);
 	    th8MemBarrier(NULL);
 	}
+    }
 
-	/*
-	 * Set (or reset) the current working directory to the
-	 * base directory.  This establishes "." as the base path
-	 * for all subsequent file system operations.  If xSetCwd
-	 * is not available, this step is silently skipped.  If
-	 * xSetCwd is available but fails, initialization fails.
-	 */
+    /*
+     * Set (or reset) the current working directory to the base
+     * directory.  This establishes "." as the base path for all
+     * subsequent file system operations.  If xSetCwd is not available,
+     * this step is silently skipped.  If xSetCwd is available but
+     * fails, initialization fails and rolls back.
+     */
 
-	if (pPlatform->xSetCwd) {
-	    if (pPlatform->xSetCwd(NULL, pPlatform->pCtx, ".", 1) != TH8_OK) {
-		TH8_TRACE_ERR(NULL, "xSetCwd callback failed");
-		return TH8_ERROR;
-	    }
+    if (pPlatform->xSetCwd) {
+	if (pPlatform->xSetCwd(NULL, pPlatform->pCtx, ".", 1) != TH8_OK) {
+	    TH8_TRACE_ERR(NULL, "xSetCwd callback failed");
+	    goto th8InitRollback;
 	}
     }
+
     Th8_IntCmpXchg(NULL, &th8Initialized, 1, 0);
     return TH8_OK;
+
+th8InitRollback:
+    /*
+     * TH8K-004: undo the completed initialization stages in reverse
+     * order (mirroring Th8_Finalize) so a failed attempt leaves no
+     * leftover global state -- mutex, platform copy, or thread
+     * registration -- for a subsequent retry to trip over.
+     */
+    if (bMutexReady) {
+	if (pPlatform->xMutexFinal) {
+	    pPlatform->xMutexFinal(NULL, pPlatform->pCtx, &th8GlobalMutex);
+	}
+	Th8_IntCmpXchg(NULL, &th8GlobalMutexReady, 0, 1);
+    }
+    if (bXInit && pPlatform->xFinalize) {
+	pPlatform->xFinalize(NULL, pPlatform->pCtx);
+    }
+    if (bPlatCopied) {
+	/*
+	 * Clear the copied platform so no stale table survives.  As in
+	 * Th8_UseDefaultPlatform, use aggregate zeroing (not Th8_Memset):
+	 * we are tearing the global platform down and must not route
+	 * through it.
+	 */
+	static const Th8_Platform zero = {0};
+	th8GlobalPlatform = zero;
+    }
+    if (bThreadInit) {
+	Th8_ThreadDone();
+    }
+    return TH8_ERROR;
 }
 
 /*
@@ -35517,8 +39537,8 @@ Th8_Initialize(Th8_Platform *pPlatform) /* Platform (for mutex callbacks). */
  */
 
 int
-Th8_Finalize(
-    Th8_Platform *pPlatform) /* Platform (reserved for future use). */
+Th8_Finalize(Th8_Platform
+                 *pPlatform) /* Platform (reserved for future use). */
 {
     (void)pPlatform;
     if (!Th8_IntCmpXchg(NULL, &th8Initialized, 0, 0)) {
@@ -35593,12 +39613,22 @@ Th8_Finalize(
  */
 
 Th8_Interp *
-Th8_CreateInterp(
-    Th8_Platform *pPlatform) /* Platform abstraction (not owned). */
+Th8_CreateInterp(Th8_Platform
+                     *pPlatform) /* Platform abstraction (not owned). */
 {
     size_t nByte;
     Th8_Interp *p;
     Th8_Frame *pGlobalFrame;
+
+    /*
+     * TH8K-001: validate the platform before dereferencing any of its
+     * callbacks.  A NULL, wrong-version, or incomplete platform yields
+     * a clean NULL return instead of a mandatory-callback crash.
+     */
+
+    if (th8ValidatePlatform(pPlatform) != TH8_OK) {
+	return 0;
+    }
 
     /*
      * STEP 1: Allocate interpreter + global frame as a single block.
@@ -35612,10 +39642,14 @@ Th8_CreateInterp(
     if (!p) {
 	return 0;
     }
-    if (pPlatform->xMemset) {
-	pPlatform->xMemset(NULL, pPlatform->pCtx, p, 0, nByte);
-    }
-    p->nVersion = 4; /* Bumped: added xEvent* manual-reset event callbacks. */
+    /*
+     * xMemset is a validated mandatory callback, so this is
+     * unconditional: zero the whole block so the later NULL-pointer
+     * construction invariants (e.g. the TH8K-002 rollback, which relies
+     * on unallocated hash slots reading NULL) hold.
+     */
+    pPlatform->xMemset(NULL, pPlatform->pCtx, p, 0, nByte);
+    p->nVersion = 1; /* Pre-RTM: single ABI version. */
     {
 #ifdef TH8_DECLS_H
 	extern const Th8StubsTable th8StubsTableData;
@@ -35631,10 +39665,22 @@ Th8_CreateInterp(
     /*
      * STEP 2: The global frame lives right after the interpreter
      * struct.  Push it as the bottom of the call stack.
+     *
+     * th8PushFrame allocates the frame's variable hash (paVar) and
+     * returns TH8_ERROR -- WITHOUT setting interp->pFrame -- if that
+     * allocation fails.  Its result must be checked (Bug 84): ignoring it
+     * on a transient OOM left interp->pFrame NULL while construction
+     * continued, and th8InitGlobals then crashed dereferencing the NULL
+     * frame while setting the first global.  Only the combined
+     * interp+frame block exists at this point, so the rollback is the same
+     * single Th8_Free(p, p) used by the STEP 3/4 OOM guards below.
      */
 
     pGlobalFrame = (Th8_Frame *)&p[1];
-    th8PushFrame(p, pGlobalFrame);
+    if (th8PushFrame(p, pGlobalFrame) != TH8_OK) {
+	Th8_Free(p, p);
+	return 0;
+    }
 
     /*
      * STEP 3: Create the global namespace "::".
@@ -35657,11 +39703,30 @@ Th8_CreateInterp(
     Th8_Memcpy(p, p->pGlobalNs->zName, "::", 3);
     p->pGlobalNs->nName = 2;
     p->pGlobalNs->pParent = 0;
+    p->pGlobalNs->nDepth = 0; /* root of the namespace tree (TH8K-011). */
     p->pGlobalNs->paCmd = Th8_HashNew(p);
 #if defined(TH8_ENABLE_VARIABLES)
     p->pGlobalNs->paVar = Th8_HashNew(p);
 #endif
     p->pGlobalNs->paChild = Th8_HashNew(p);
+    /*
+     * TH8K-002: every eager hash allocation is checked.  A single
+     * combined test keeps the common (success) path branch-free; on
+     * OOM, th8FreeNamespace safely tears down whatever partial state
+     * exists (it and Th8_HashIterate/Th8_HashDelete are NULL-safe), so
+     * we never dereference a half-built namespace.  The normal
+     * Th8_DeleteInterp is NOT used here -- the object is not yet a
+     * complete interp.
+     */
+    if (!p->pGlobalNs->paCmd ||
+#if defined(TH8_ENABLE_VARIABLES)
+        !p->pGlobalNs->paVar ||
+#endif
+        !p->pGlobalNs->paChild) {
+	th8FreeNamespace(p, p->pGlobalNs);
+	Th8_Free(p, p);
+	return 0;
+    }
     p->pCurrentNs = p->pGlobalNs;
     pGlobalFrame->pNs = p->pGlobalNs;
 
@@ -35670,13 +39735,29 @@ Th8_CreateInterp(
      */
 
     p->paPackage = Th8_HashNew(p);
+    if (!p->paPackage) {
+	th8FreeNamespace(p, p->pGlobalNs);
+	Th8_Free(p, p);
+	return 0;
+    }
 
     /*
      * STEP 5: Standard global variables.
      */
 
 #if defined(TH8_ENABLE_VARIABLES)
-    th8InitGlobals(p);
+    /*
+     * TH8K-003: th8InitGlobals now propagates the first OOM instead of
+     * silently producing a partially-populated environment.  Roll back
+     * the completed construction stages (namespace + package registry)
+     * in reverse order and fail the whole constructor.
+     */
+    if (th8InitGlobals(p) != TH8_OK) {
+	th8FreeNamespace(p, p->pGlobalNs);
+	Th8_HashDelete(p, p->paPackage);
+	Th8_Free(p, p);
+	return 0;
+    }
 #endif
 
     /*
@@ -35711,27 +39792,40 @@ Th8_CreateInterp(
     p->nLoadToken = 0;
     p->nLoadOk = 0;
     if (pPlatform->xRandomBytes) {
-	int retries = 0;
+	int retries;
 	unsigned char buf[8];
 
-retry:
+	for (retries = 0; retries < 100 && p->nLoadToken == 0; retries++) {
+	    if (TH8_OK == pPlatform->xRandomBytes(NULL, NULL, buf, 8)) {
+		size_t j;
+		th8_int64_t tok = 0;
 
-	if (++retries > 100) {
-	    TH8_TRACE_ERR(p, "could not generate first load token");
-	    pPlatform->xPanic(
-	        NULL, NULL, "could not generate first load token", 35);
-	}
-
-	if (TH8_OK == pPlatform->xRandomBytes(NULL, NULL, buf, 8)) {
-	    size_t j;
-	    th8_int64_t tok = 0;
-
-	    for (j = 0; j < 8; j++) {
-		tok |= ((th8_uint64_t)buf[j]) << (j * 8);
+		for (j = 0; j < 8; j++) {
+		    tok |= ((th8_uint64_t)buf[j]) << (j * 8);
+		}
+		/* Reject sentinel values (0, all-ones, 1). */
+		if (tok != 0 && tok != ~(th8_int64_t)0 && tok != 1) {
+		    p->nLoadToken = tok;
+		}
 	    }
-	    if (tok == 0 || tok == ~0 || tok == 1)
-		goto retry; /* Never zero. */
-	    p->nLoadToken = tok;
+	}
+	if (p->nLoadToken == 0) {
+	    /*
+	     * Could not obtain a suitable random load token (TH8K-022): a
+	     * broken or exhausted RNG produced only sentinel values (or kept
+	     * failing) for 100 attempts.  This is NOT fatal to interpreter
+	     * creation -- token-based [load] management simply stays
+	     * unavailable (nLoadToken 0).  Report via xPanic ONLY if the
+	     * platform supplies one (the contract permits a NULL xPanic):
+	     * never dereference a NULL callback, and never spin forever if a
+	     * non-terminating xPanic returns.
+	     */
+	    TH8_TRACE_ERR(p, "could not generate first load token");
+	    if (pPlatform->xPanic) {
+		pPlatform->xPanic(
+		    NULL, pPlatform->pCtx,
+		    "could not generate first load token", 35);
+	    }
 	}
     }
 #endif /* TH8_ENABLE_LOAD */
@@ -35762,22 +39856,127 @@ retry:
     }
 
     /*
+     * STEP 6b: Capture the owning-thread id.  The creating thread owns
+     * this interpreter for its entire lifetime; every subsequent API
+     * call (except the documented thread-safe exceptions) MUST be made
+     * on this thread.  Publish it atomically via the 64-bit interlocked
+     * CAS so foreign threads that legally read it (Th8_GetInterpThreadId,
+     * TH8_ASSERT_OWNER) always observe a consistent value.  threadId
+     * stays 0 on hosts whose platform provides no xGetThreadId, which
+     * disables affinity checking (single-threaded assumption).
+     */
+
+    Th8_Int64CmpXchg(p, &p->threadId, Th8_GetThreadId(p), 0);
+
+    /*
      * STEP 7: Internal-representation cache.
      */
 
     th8CacheInit(p);
 
 #if defined(TH8_ENABLE_VARIABLES) && defined(TH8_ENABLE_CRYPTOGRAPHY)
-    /* Non-fatal: interpreter works without secure variables. */
-    (void)th8SecureInit(p);
+    /*
+     * Secure-variable init is part of the all-or-nothing construction contract
+     * (project-wide transactional rule / TH8K-002): rather than return a
+     * degraded interpreter that silently lacks secure-variable support when
+     * th8SecureInit hits OOM, treat that failure as fatal.  th8SecureInit is
+     * itself transactional -- on failure it frees its key store and stores
+     * nothing into the interpreter -- so the interpreter is otherwise complete
+     * and Th8_DeleteInterp tears the whole thing down cleanly before we report
+     * construction failure (NULL).  A one-shot/transient OOM has already
+     * resumed, so the teardown's own temporary allocations succeed.
+     */
+    if (th8SecureInit(p) != TH8_OK) {
+	Th8_DeleteInterp(p);
+	return 0;
+    }
 #endif
 
     /* Plugin system: no plugins registered, token counter starts at 1. */
     p->pPlugins = 0;
     p->nNextCmdToken = 1;
     p->paCmdToken = 0; /* Created lazily on first CreateCommand. */
+    p->paSubToken = 0; /* Created lazily on first CreateSubCommand. */
 
     return p;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_GetInterpThreadId --
+ *
+ *	Return the id of the thread that owns the interpreter (the
+ *	thread that called Th8_CreateInterp).  Read atomically via the
+ *	64-bit interlocked compare-exchange.
+ *
+ * Why / How:
+ *	The owning-thread id enforces the single-threaded-per-
+ *	interpreter affinity contract.  A foreign thread MAY call this
+ *	safely (it is one of the documented thread-safe exceptions) to
+ *	discover the owner and compare it against Th8_GetThreadId (its
+ *	own thread).  The read uses Th8_Int64CmpXchg(...,0,0), a non-
+ *	mutating compare-with-0 that returns the current value.
+ *
+ * Results:
+ *	The owning-thread id, or 0 if it was never captured (the
+ *	platform provides no xGetThreadId).
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+th8_uint64_t
+Th8_GetInterpThreadId(Th8_Interp *interp) /* Interpreter. */
+{
+    if (!interp) return 0;
+    return Th8_Int64CmpXchg(interp, &interp->threadId, 0, 0);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CheckThreadOwner --
+ *
+ *	Return non-zero if the calling thread is permitted to operate
+ *	on the interpreter under the single-threaded-per-interpreter
+ *	affinity contract.  Used only by the TH8_ASSERT_OWNER debug
+ *	assertion.
+ *
+ * Why / How:
+ *	Compares the owning-thread id (captured in Th8_CreateInterp)
+ *	against the caller's current thread id, both read atomically.
+ *	Returns 1 (permitted) when either id is 0 -- i.e. the platform
+ *	cannot report thread ids -- so affinity is simply not enforced
+ *	on such hosts rather than falsely tripping.  A NULL interp is
+ *	also treated as permitted (callers handle NULL elsewhere).
+ *
+ * Results:
+ *	1 if the caller owns interp or affinity cannot be enforced;
+ *	0 if the caller is provably on a foreign thread.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8CheckThreadOwner(Th8_Interp *interp) /* Interpreter. */
+{
+    th8_uint64_t owner;
+    th8_uint64_t self;
+
+    if (!interp) return 1;
+    owner = Th8_GetInterpThreadId(interp);
+    if (owner == 0) return 1; /* Affinity not trackable on this host. */
+    self = Th8_GetThreadId(interp);
+    if (self == 0) return 1; /* Current thread id unavailable. */
+    return owner == self;
 }
 
 
@@ -35860,6 +40059,7 @@ th8FreeCmdEntry(
 	Th8_Command *pCmd = (Th8_Command *)pEntry->pData;
 
 	th8RemoveCmdTokenEntry(interp, pCmd);
+	th8FreeSubCommands(interp, pCmd);
 	if (pCmd->xDel) {
 	    pCmd->xDel(interp, pCmd->pContext);
 	}
@@ -35901,13 +40101,14 @@ Th8_RestoreInterp(
 {
     if (!interp) return TH8_ERROR;
     if (flags & TH8_RESTORE_COMMANDS) {
-	Th8_RegisterLanguage(interp);
-	/* Static plugins (lists, regexp, etc.) are registered
-	 * by th8RegisterStaticPlugins inside RegisterLanguage. */
+	/* Static plugins (lists, regexp, etc.) are registered by
+	 * th8RegisterStaticPlugins inside RegisterLanguage.  Propagate a
+	 * real registration failure (TH8K-006). */
+	if (Th8_RegisterLanguage(interp) != TH8_OK) return TH8_ERROR;
     }
 #if defined(TH8_ENABLE_VARIABLES)
     if (flags & TH8_RESTORE_VARIABLES) {
-	th8InitGlobals(interp);
+	if (th8InitGlobals(interp) != TH8_OK) return TH8_ERROR;
     }
 #endif
     return TH8_OK;
@@ -35951,6 +40152,8 @@ Th8_DeleteInterp(Th8_Interp *interp) /* Interpreter to destroy. */
 
     if (!interp) return;
 
+    TH8_ASSERT_OWNER(interp);
+
     /*
      * Save the free callback and context at the top of cleanup.
      * These function pointers live in read-only code memory and
@@ -35968,6 +40171,8 @@ Th8_DeleteInterp(Th8_Interp *interp) /* Interpreter to destroy. */
      */
 
     interp->nAllocLimit = 0;
+    interp
+        ->nDeadlineUs = 0; /* no wall-clock deadline by default (TH8K-010). */
 
     /*
      * STEP 0: Notify the platform that the interpreter is about
@@ -36083,10 +40288,6 @@ Th8_DeleteInterp(Th8_Interp *interp) /* Interpreter to destroy. */
      */
 
     Th8_SetResult(interp, 0, 0);
-    if (interp->zSavedCancelMsg) {
-	Th8_Free(interp, interp->zSavedCancelMsg);
-	interp->zSavedCancelMsg = 0;
-    }
     if (interp->bCancelMsgOwned) {
 	Th8_Free(interp, interp->zCancelMsg);
     }
@@ -36241,6 +40442,18 @@ Th8_DeleteInterp(Th8_Interp *interp) /* Interpreter to destroy. */
     }
 
     /*
+     * STEP 6d-bis: Free the sub-command token secondary index.  The
+     * Th8_SubCmd* pointers it held were already freed with their parent
+     * commands during namespace cleanup (STEP 3, via th8FreeSubCommands),
+     * which also removed each token entry; just delete the hash structure.
+     */
+
+    if (interp->paSubToken) {
+	Th8_HashDelete(interp, interp->paSubToken);
+	interp->paSubToken = 0;
+    }
+
+    /*
      * STEP 6e: Free the per-callback context hash.
      * The pData pointers belong to extensions and are NOT freed
      * here (ownership is with the extension's _Unload).
@@ -36288,19 +40501,38 @@ Th8_DeleteInterp(Th8_Interp *interp) /* Interpreter to destroy. */
 
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8CheckCancel --
  *
  *	Check the interpreter's cancellation flag.
+ *
+ * Why / How:
+ *	Reads bCanceled with an atomic compare-exchange (0->0 is a
+ *	no-op that returns the current value), so the owner's poll
+ *	does not race a foreign thread's Th8_CancelEval write.
+ *
+ * Results:
+ *	Non-zero if a cancellation is pending; 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
 th8CheckCancel(Th8_Interp *interp)
 {
-    return Th8_IntCmpXchg(interp, &interp->bCanceled, 0, 0);
+    /* TH8K-008: the canceled bit lives in the single atomic request word. */
+    return Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0) &
+           TH8_CR_CANCELED;
 }
 
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8ClearCancel --
  *
  *	Reset the interpreter's cancellation state: clear the
@@ -36308,17 +40540,36 @@ th8CheckCancel(Th8_Interp *interp)
  *	reset cancelFlags.  Called by [catch] when intercepting
  *	a non-unwind cancellation, and by the outermost Th8_Eval
  *	cleanup.
+ *
+ * Why / How:
+ *	An atomic test-and-clear of bCanceled means the cleanup work
+ *	runs exactly once even if several callers race.  Only an
+ *	interpreter-owned cancel message is freed; a static (foreign,
+ *	borrowed) message is not.  th8CancelReqClear drops any
+ *	un-adopted cross-thread request so it cannot re-fire.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Clears bCanceled and cancelFlags, frees an owned cancel
+ *	message, and clears the pending cross-thread cancel request.
+ *	A no-op when no cancellation was pending.
+ *
+ *----------------------------------------------------------------------
  */
 
 static void
 th8ClearCancel(Th8_Interp *interp)
 {
     /*
-     * Atomically test-and-clear: if bCanceled is 1, set it
-     * to 0 and clean up.  If already 0, do nothing.
+     * Owner-only reset (TH8K-008).  If a cancel is pending (the canceled bit in
+     * the single atomic request word), release the owner-only message state and
+     * then zero the request word + free any un-adopted cross-thread message
+     * buffer via th8CancelReqClear.  A no-op when nothing is pending.  Only an
+     * interpreter-owned message is freed; the cross-thread buffer is owned here.
      */
-
-    if (Th8_IntCmpXchg(interp, &interp->bCanceled, 0, 1)) {
+    if (Th8_IntCmpXchg(interp, &interp->nCancelReq, 0, 0) & TH8_CR_CANCELED) {
 	interp->cancelFlags = 0;
 	if (interp->bCancelMsgOwned) {
 	    Th8_Free(interp, interp->zCancelMsg);
@@ -36326,6 +40577,7 @@ th8ClearCancel(Th8_Interp *interp)
 	interp->zCancelMsg = 0;
 	interp->nCancelMsg = 0;
 	interp->bCancelMsgOwned = 0;
+	th8CancelReqClear(interp);
     }
 }
 
@@ -36396,6 +40648,17 @@ th8ClearCancel(Th8_Interp *interp)
  *	(nSavedDepth==0), and converts TH8_RETURN to TH8_OK at
  *	the top level.
  *
+ * Results:
+ *	The script's TH8 return code (TH8_RETURN mapped to TH8_OK at
+ *	the outermost level); TH8_SUSPEND/TH8_YIELD when the eval was
+ *	suspended; an error code on evaluation failure.
+ *
+ * Side effects:
+ *	Executes commands (arbitrary interpreter state changes) and
+ *	sets the interpreter result; temporarily switches and restores
+ *	the frame pointer; clears cancellation state at the outermost
+ *	level.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -36413,6 +40676,9 @@ th8EvalCommon(
     Th8_Frame *pSavedFrame = interp->pFrame;
     int nSavedDepth = interp->nEvalDepth;
     size_t nInput;
+    int savedBuildFailed = 0; /* TH8K-030: saved across this eval. */
+
+    TH8_ASSERT_OWNER(interp);
 
     /*
      * Resolve TH8_NOLEN, but otherwise carry the taint bit through to
@@ -36469,6 +40735,18 @@ th8EvalCommon(
 
     {
 	Th8_Callback *pBottom = interp->pCallbacks;
+
+	/*
+	 * TH8K-030: bracket this eval's result-building.  th8InvokeCommand
+	 * already promotes a per-command result-build failure to an error, but
+	 * an allocation that fails in the eval machinery AFTER a command (e.g.
+	 * building the returned result) is outside that bracket; clear the flag
+	 * here and check it at the return so such a failure cannot leave a
+	 * success code with a truncated/"out of memory" result.  Saved and
+	 * restored so a nested eval neither masks nor is masked.
+	 */
+	savedBuildFailed = interp->bResultBuildFailed;
+	interp->bResultBuildFailed = 0;
 
 	rc = th8EvalLocal(interp, zProg, nInput, zName, nName, flags);
 	if (interp->pCallbacks != pBottom) {
@@ -36563,6 +40841,17 @@ th8EvalCommon(
 	rc = TH8_OK;
     }
 
+    /*
+     * TH8K-030: if the eval reports success but a result-building allocation
+     * failed outside a command's own dispatch bracket, promote to an
+     * out-of-memory error; then restore the caller's flag.
+     */
+    if (rc == TH8_OK && interp->bResultBuildFailed) {
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	rc = TH8_ERROR;
+    }
+    interp->bResultBuildFailed = savedBuildFailed;
+
     return rc;
 }
 
@@ -36623,6 +40912,15 @@ Th8_Eval(
  *	[load] or [source] of specific paths) that would be denied
  *	for untrusted scripts.  Only the embedder can call this API,
  *	so the trust assertion cannot be forged from script level.
+ *
+ * Results:
+ *	The script's TH8 return code (as th8EvalCommon); TH8_ERROR if
+ *	interp is NULL.
+ *
+ * Side effects:
+ *	Those of th8EvalCommon (executes commands, sets the
+ *	interpreter result), with TH8_EVAL_TRUSTED visible to the
+ *	policy callback.
  *
  *----------------------------------------------------------------------
  */
@@ -36742,6 +41040,14 @@ Th8_EvalDownlevel(
  *	The returned string is immediately freed since only
  *	existence is being tested, not the value.
  *
+ * Results:
+ *	1 if the environment variable exists; 0 if it does not;
+ *	TH8_ERROR if interp is NULL.
+ *
+ * Side effects:
+ *	Allocates and immediately frees the variable's value (via
+ *	Th8_GetEnv/Th8_Free); no lasting state change.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -36850,10 +41156,12 @@ Th8_DoesEnvExist(
  * SECURITY
  *
  * Overflow checks on integer arithmetic, division-by-zero detection,
- * recursion bounded by nEvalDepth (Th8_Ready check at every parse
- * iteration and tree-build entry), bareword rejection so that
- * untrusted expressions cannot accidentally invoke unrelated Tcl
- * commands.
+ * expression recursion bounded EXPLICITLY at TH8_MX_EXPR_DEPTH (via
+ * interp->nExprDepth in the th8ExprEval wrapper and the depth argument
+ * to th8ExprMakeTree, with the tree teardown th8ExprFree made iterative)
+ * so deeply nested or long-chained expressions cannot overflow the
+ * native C stack (TH8K-019), bareword rejection so that untrusted
+ * expressions cannot accidentally invoke unrelated Tcl commands.
  *
  * Copyright (c) 2026 by Joe Mistachkin.  All rights reserved.
  *
@@ -36862,18 +41170,18 @@ Th8_DoesEnvExist(
  */
 
 /* amalgamation: th8_plat.h already included */
-#line 96 "src/th8_expr.c"
+#line 98 "src/th8_expr.c"
 #include "th8.h"
 /* amalgamation: th8_int.h already included */
-#line 98 "src/th8_expr.c"
-/* amalgamation: th8_int_core.h already included */
-#line 99 "src/th8_expr.c"
-/* amalgamation: th8_expr.h already included */
 #line 100 "src/th8_expr.c"
+/* amalgamation: th8_int_core.h already included */
+#line 101 "src/th8_expr.c"
+/* amalgamation: th8_expr.h already included */
+#line 102 "src/th8_expr.c"
 
 #if defined(TH8_ENABLE_BIGINT)
 /* amalgamation: th8_bigint.h already included */
-#line 103 "src/th8_expr.c"
+#line 105 "src/th8_expr.c"
 #endif
 
 #if defined(TH8_ENABLE_EXPRESSIONS)
@@ -37421,7 +41729,8 @@ static Th8_Operator th8Operators[] = {
  *	etc.) are registered callbacks in th8_math.c.  If no
  *	registered function matches, returns TH8_ERROR.
  *
- * Why / How (expr-grammar, NOT Tcl-syntax):
+ * Why / How:
+ *	(expr-grammar, NOT Tcl-syntax.)
  *	expr(n) "MATH FUNCTIONS": "When the expression parser
  *	encounters a mathematical function such as sin($x), it
  *	replaces it with a call to an ordinary Tcl command in the
@@ -37501,17 +41810,21 @@ th8ExprEvalFunc(
  *
  * th8ExprFree --
  *
- *	Recursively free an expression tree node and all of its
- *	descendants.
+ *	Free an expression tree node and all of its descendants.
  *
  * Why / How:
  *	Expression trees are built from individually heap-allocated
  *	Th8_ExprNode structs, each owning a heap-allocated zValue
- *	string for literal nodes.  This function performs a post-order
- *	traversal (left, right, then self) to ensure children are
- *	freed before the parent.  NULL-safe: silently returns if
- *	pExpr is NULL, which simplifies cleanup of partially-built
- *	trees after parse errors.
+ *	string for literal nodes.  The teardown is ITERATIVE, using
+ *	O(1) auxiliary space via left-rotation ("rotate the left child
+ *	up until a node has no left child, then free it and descend
+ *	right").  This matters because an operator chain such as
+ *	`1+1+1+...+1` builds a tree whose depth equals the term count;
+ *	the previous recursive post-order free was unbounded and could
+ *	overflow the native C stack tearing such a tree down, even for
+ *	a tree the depth-limited evaluator refused to evaluate
+ *	(TH8K-019).  NULL-safe: a NULL pExpr frees nothing, which
+ *	simplifies cleanup of partially-built trees after parse errors.
  *
  * Results:
  *	None.
@@ -37526,19 +41839,94 @@ th8ExprEvalFunc(
 static void
 th8ExprFree(Th8_Interp *interp, Th8_ExprNode *pExpr)
 {
-    if (pExpr) {
-	th8ExprFree(interp, pExpr->pLeft);
-	th8ExprFree(interp, pExpr->pRight);
-	Th8_Free(interp, pExpr->zValue);
-	Th8_Free(interp, pExpr);
+    Th8_ExprNode *p = pExpr;
+
+    while (p) {
+	if (p->pLeft) {
+	    /*
+	     * Right-rotate at p: lift the left child, push p into the
+	     * lifted node's right subtree.  Repeats until the current
+	     * node has no left child, without recursing.
+	     */
+	    Th8_ExprNode *pLeft = p->pLeft;
+
+	    p->pLeft = pLeft->pRight;
+	    pLeft->pRight = p;
+	    p = pLeft;
+	} else {
+	    /* No left child: free this node, then descend to its right. */
+	    Th8_ExprNode *pRight = p->pRight;
+
+	    Th8_Free(interp, p->zValue);
+	    Th8_Free(interp, p);
+	    p = pRight;
+	}
     }
+}
+
+
+static int th8ExprEvalNode(
+    Th8_Interp *interp,
+    Th8_ExprNode *pExpr,
+    const char *zName,
+    size_t nName);
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8ExprEval --
+ *
+ *	Depth-limited entry wrapper around the recursive tree evaluator
+ *	th8ExprEvalNode.
+ *
+ * Why / How:
+ *	Every recursive descent into a child node goes through this
+ *	wrapper (the inner evaluator's recursive calls name
+ *	th8ExprEval, not th8ExprEvalNode), so a single per-interpreter
+ *	counter bounds the expression-tree recursion depth EXPLICITLY
+ *	at TH8_MX_EXPR_DEPTH rather than relying on the host native
+ *	stack (TH8K-019).  The counter is incremented on entry and
+ *	decremented on exit; it is snapshotted with the rest of the
+ *	execution context across coroutine switches (Th8_ExecCtx), so
+ *	it stays balanced exactly like nEvalDepth.  When the limit is
+ *	reached a clean "expression nested too deeply" error is
+ *	reported instead of a native stack overflow.
+ *
+ * Results:
+ *	TH8_OK or TH8_ERROR (with the interpreter result set on the
+ *	depth-limit error, or by the inner evaluator otherwise).
+ *
+ * Side effects:
+ *	Adjusts interp->nExprDepth; see th8ExprEvalNode for the rest.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8ExprEval(
+    Th8_Interp *interp,
+    Th8_ExprNode *pExpr,
+    const char *zName,
+    size_t nName)
+{
+    int rc;
+
+    if (interp->nExprDepth >= TH8_MX_EXPR_DEPTH) {
+	Th8_SetResult(interp, "expression nested too deeply", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    interp->nExprDepth++;
+    rc = th8ExprEvalNode(interp, pExpr, zName, nName);
+    interp->nExprDepth--;
+    return rc;
 }
 
 
 /*
  *----------------------------------------------------------------------
  *
- * th8ExprEval -- phase 3, recursive tree evaluator
+ * th8ExprEvalNode -- phase 3, recursive tree evaluator
  *
  *	Recursively evaluate an expression tree node (post-order
  *	traversal).  Most of this function is expression-grammar
@@ -37591,7 +41979,8 @@ th8ExprFree(Th8_Interp *interp, Th8_ExprNode *pExpr)
  *	    TH8_ARG_STRING  -- compare raw bytes for `eq`/`ne`/
  *	                       `in`/`ni`.
  *
- * Why / How (security envelope around expr-grammar):
+ * Why / How:
+ *	(Security envelope around expr-grammar.)
  *	  - Integer overflow: every arithmetic operation (add,
  *	    subtract, multiply, divide, negate, exponent) checks
  *	    for signed 64-bit overflow before computing the result,
@@ -37608,8 +41997,14 @@ th8ExprFree(Th8_Interp *interp, Th8_ExprNode *pExpr)
  *	    and logical OR (||) avoid evaluating unused branches
  *	    per expr(n) lazy semantics, preventing side effects
  *	    from unreachable sub-expressions.
- *	  - Recursion depth: bounded by Th8_Ready() check at entry,
- *	    which enforces nEvalDepth limits.
+ *	  - Recursion depth: bounded EXPLICITLY by the th8ExprEval
+ *	    wrapper, which caps interp->nExprDepth at
+ *	    TH8_MX_EXPR_DEPTH before entering this function, so a
+ *	    deeply nested or long-chained expression yields a clean
+ *	    "expression nested too deeply" error rather than a native
+ *	    C-stack overflow (TH8K-019).  The per-node Th8_Ready()
+ *	    check below is for cancellation / step limits (and remains
+ *	    an adaptive native-stack backstop), not depth enforcement.
  *
  *	Intermediate results are taken via Th8_TakeResult and freed
  *	in a unified "finish" label to prevent leaks on error
@@ -37628,7 +42023,7 @@ th8ExprFree(Th8_Interp *interp, Th8_ExprNode *pExpr)
  */
 
 static int
-th8ExprEval(
+th8ExprEvalNode(
     Th8_Interp *interp,
     Th8_ExprNode *pExpr,
     const char *zName,
@@ -37637,7 +42032,9 @@ th8ExprEval(
     int rc = TH8_OK;
 
     /*
-     * Security: unified readiness check per expression node.
+     * Security: unified readiness check per expression node (for
+     * cancellation and step limits; the explicit recursion-depth bound
+     * lives in the th8ExprEval wrapper, TH8K-019).
      */
 
     if (Th8_Ready(interp) != TH8_OK) {
@@ -38546,8 +42943,8 @@ finish:
  *	Th8_ExprNode pointers, ready for tree construction by
  *	th8ExprMakeTree.
  *
- * GRAMMAR BOUNDARY:
- *
+ * Why / How:
+ *	(Grammar boundary.)
  *	This function is the densest mix of the two grammars in the
  *	file.  At the OUTER level it implements the expr(n)
  *	"OPERANDS" form selector and the operator scanner.  Inside
@@ -39348,15 +43745,19 @@ th8ExprParse(
  *	out and the operator slot retains the subtree root.  This
  *	avoids extra allocations during tree construction.
  *
- *	Security: Th8_Ready() is checked at entry to enforce
- *	recursion depth limits for deeply nested parentheses,
- *	preventing stack overflow from malicious expressions like
- *	`((((((...))))))`.  Unmatched parentheses and missing
- *	operands produce TH8_ERROR rather than undefined behavior.
+ *	Security: recursion (one level per parenthesis nesting) is
+ *	bounded EXPLICITLY by the `depth` parameter against
+ *	TH8_MX_EXPR_DEPTH, so a malicious expression like
+ *	`((((((...))))))` yields a clean "expression nested too
+ *	deeply" error rather than a native C-stack overflow
+ *	(TH8K-019).  The per-call Th8_Ready() check covers cancellation
+ *	and step limits.  Unmatched parentheses and missing operands
+ *	produce TH8_ERROR rather than undefined behavior.
  *
  * Results:
  *	TH8_OK on success; TH8_ERROR if the token array cannot form
- *	a valid expression tree (syntax error).
+ *	a valid expression tree (syntax error) or the parenthesis
+ *	nesting exceeds TH8_MX_EXPR_DEPTH.
  *
  * Side effects:
  *	Modifies the apToken array in-place (NULLs consumed slots,
@@ -39367,7 +43768,11 @@ th8ExprParse(
  */
 
 static int
-th8ExprMakeTree(Th8_Interp *interp, Th8_ExprNode **apToken, int nToken)
+th8ExprMakeTree(
+    Th8_Interp *interp,
+    Th8_ExprNode **apToken,
+    int nToken,
+    int depth)
 {
     int jj;
     int iLeft;
@@ -39375,9 +43780,14 @@ th8ExprMakeTree(Th8_Interp *interp, Th8_ExprNode **apToken, int nToken)
     int p;
 
     /*
-     * Security: readiness check for deeply nested parentheses.
+     * Security: explicit parenthesis-nesting depth bound (TH8K-019),
+     * plus a readiness check for cancellation / step limits.
      */
 
+    if (depth > TH8_MX_EXPR_DEPTH) {
+	Th8_SetResult(interp, "expression nested too deeply", TH8_NOLEN);
+	return TH8_ERROR;
+    }
     if (Th8_Ready(interp) != TH8_OK) {
 	return TH8_ERROR;
     }
@@ -39412,7 +43822,8 @@ th8ExprMakeTree(Th8_Interp *interp, Th8_ExprNode **apToken, int nToken)
 	    }
 	    if ((jj - iStart) > 1) {
 		if (th8ExprMakeTree(
-		        interp, &apToken[iStart + 1], jj - iStart - 1)) {
+		        interp, &apToken[iStart + 1], jj - iStart - 1,
+		        depth + 1)) {
 		    return TH8_ERROR;
 		}
 		th8ExprFree(interp, apToken[jj]);
@@ -39719,6 +44130,28 @@ th8ExprMakeTree(Th8_Interp *interp, Th8_ExprNode **apToken, int nToken)
  *	with the full input and the behaviour is identical to the
  *	previous monolithic implementation.
  *
+ * Why / How:
+ *	Runs the three expression phases in order: th8ExprParse
+ *	(tokenize), th8ExprMakeTree (build the operator tree), and
+ *	th8ExprEval (evaluate the root).  Structural failures from the
+ *	tree builder are mapped to a generic "syntax error" message,
+ *	except the TH8K-019 "expression nested too deeply" text, which
+ *	is preserved.  On success a bare non-decimal integer literal
+ *	(0x/0o/0b/legacy-octal) is normalized to decimal so integer
+ *	results always print in decimal form.  Factoring this out of
+ *	Th8_Expr lets the caller invoke it once or once per top-level
+ *	comma-separated sub-expression.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the expression's
+ *	value; TH8_ERROR (with an interpreter error message) on empty
+ *	input, syntax/structural error, allocation failure, or an
+ *	evaluation error.
+ *
+ * Side effects:
+ *	Sets the interpreter result.  Allocates and frees the token
+ *	array and its Th8_ExprNode tree.  May set an error message.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -39746,10 +44179,32 @@ th8ExprEvalOne(
 	goto cleanup;
     }
 
-    rc = th8ExprMakeTree(interp, apToken, nToken);
+    rc = th8ExprMakeTree(interp, apToken, nToken, 0);
     if (rc != TH8_OK) {
-	Th8_ErrorMessage(
-	    interp, "syntax error in expression: \"", zExpr, nExpr);
+	/*
+	 * th8ExprMakeTree returns a bare TH8_ERROR for structural
+	 * problems (unmatched parens, missing operands) and leaves the
+	 * specific "expression nested too deeply" message set only for
+	 * the TH8K-019 depth-limit case; preserve the latter, and
+	 * supply the generic syntax-error text otherwise.
+	 */
+	size_t nMsg = 0;
+	const char *zMsg = Th8_GetResult(interp, &nMsg);
+	static const char zDeep[] = "expression nested too deeply";
+	int bDeep = 0;
+
+	/* Nested single-condition guards (not one compound `||`) so the
+	 * length/content match stays out of the MC/DC denominator;
+	 * see FINDINGS.md Finding 005 sec 5b. */
+	if (nMsg == sizeof(zDeep) - 1) {
+	    if (Th8_Memcmp(interp, zMsg, zDeep, nMsg) == 0) {
+		bDeep = 1;
+	    }
+	}
+	if (!bDeep) {
+	    Th8_ErrorMessage(
+	        interp, "syntax error in expression: \"", zExpr, nExpr);
+	}
 	goto cleanup;
     }
 
@@ -39844,6 +44299,22 @@ cleanup:
  *
  *	Used ONLY when TH8_EXPR_TOP_COMMA is set; with the flag
  *	clear, Th8_Expr never invokes this scanner.
+ *
+ * Why / How:
+ *	The optional TH8_EXPR_TOP_COMMA feature lets a single [expr]
+ *	body hold several comma-separated sub-expressions; splitting
+ *	them safely requires finding commas that belong to the OUTER
+ *	expression and not to nested grammar.  A single forward pass
+ *	tracks paren/bracket/brace/quote nesting depth and skips
+ *	backslash-escaped bytes, reporting the first comma seen while
+ *	every depth counter is zero.
+ *
+ * Results:
+ *	1 with *piComma set to the offset of the next top-level comma;
+ *	0 with *piComma set to nExpr when none remains.
+ *
+ * Side effects:
+ *	None.  Reads zExpr and writes only *piComma.
  *
  *----------------------------------------------------------------------
  */
@@ -39959,6 +44430,17 @@ th8ExprFindTopComma(
  *
  *	Gated on `TH8_ENABLE_EXPRESSIONS`.
  *
+ * Why / How:
+ *	This is a thin public dispatcher over th8ExprEvalOne (the
+ *	real parse/build/eval core).  It exists so every call site can
+ *	share one entry point, one length-resolution convention
+ *	(TH8_NOLEN), and one taint check: because expressions can
+ *	perform command substitution and thus execute code, a tainted
+ *	complete expression is rejected outright here.  Only when the
+ *	embedder opts into TH8_EXPR_TOP_COMMA does it loop, splitting
+ *	on top-level commas via th8ExprFindTopComma and returning the
+ *	final sub-expression's result; otherwise it delegates once.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	zExpr  -- expression string (not necessarily
@@ -39968,7 +44450,7 @@ th8ExprFindTopComma(
  *	zName  -- origin name (NULL if unknown).
  *	nName  -- origin-name length.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with the value in the interpreter result;
  *	`TH8_ERROR` on parse / type / overflow / canceled
  *	(interpreter result: diagnostic).
@@ -40270,6 +44752,23 @@ struct Th8_LoadedLib {
  *	If there is no ':', the whole string is the library and the
  *	symbol is empty.
  *
+ * Why / How:
+ *	Load names carry both the shared-library path and an optional
+ *	entry-point symbol separated by a colon; every consumer that
+ *	must reason about the two parts (matching, canonicalizing)
+ *	needs them split identically, so the scan-to-first-colon logic
+ *	is centralized here.  The output pointers alias into zName (no
+ *	copy is made); the empty-symbol case points just past the end
+ *	of the string with a length of 0.
+ *
+ * Results:
+ *	None (void).  On return *pzLib and *pnLib describe the library
+ *	portion and *pzSym and *pnSym the symbol portion, both
+ *	aliasing the input buffer.
+ *
+ * Side effects:
+ *	None.  Only the caller-supplied output pointers are written.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -40316,6 +44815,23 @@ th8SplitLoadName(
  *	when a file cannot be stat'd (e.g. removed between load and
  *	unload, or no xSameFile callback).
  *
+ * Why / How:
+ *	Th8_Unload must find the tracking entry created at load time
+ *	even when the caller supplies a different-but-equivalent path
+ *	(symlink, ./ prefix, relative vs absolute).  Both names are
+ *	split into library/symbol; the symbols must be byte-equal, and
+ *	the library parts match either by a fast byte-identical
+ *	comparison or, failing that, by Th8_SameFile's (st_dev,
+ *	st_ino) physical-file identity check.
+ *
+ * Results:
+ *	1 if the two load names denote the same tracked library; 0
+ *	otherwise.
+ *
+ * Side effects:
+ *	None.  May invoke the platform xSameFile callback (which
+ *	stat()s the two paths) but changes no interpreter state.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -40357,6 +44873,25 @@ th8LoadNameMatch(
  *	xGetRealPath, file missing, or buffer too small) the original
  *	name is used unchanged.  Sets *pzOut and *pnOut to either zBuf
  *	or the original zName.
+ *
+ * Why / How:
+ *	So that a library is tracked under one stable identity no
+ *	matter which alias first loaded it, the library portion is run
+ *	through Th8_GetRealPath and the "<real>:symbol" string is
+ *	rebuilt in the caller's zBuf.  Canonicalization is best-effort:
+ *	if the real path cannot be obtained or would not fit in zBuf,
+ *	the untouched original name is handed back so loading still
+ *	proceeds.
+ *
+ * Results:
+ *	None (void).  *pzOut and *pnOut point at either the
+ *	canonicalized string in zBuf or, on any failure, the original
+ *	zName.
+ *
+ * Side effects:
+ *	May write the canonical "<real>:symbol" string into zBuf.  May
+ *	invoke the platform xGetRealPath callback (which resolves the
+ *	path on disk).  Changes no interpreter state.
  *
  *----------------------------------------------------------------------
  */
@@ -41079,12 +45614,20 @@ Th8_SetPreLoadCallback(
  *	can drive the gate from C without going through the
  *	public enable / disable wrappers.
  *
+ * Why / How:
+ *	`[load]` is gated by a pair of random-token fields; the gate
+ *	is "open" only when the two fields agree.  Applying the same
+ *	mask to `nLoadToken` here and to `nLoadOk` in th8_core.c flips
+ *	the gate between the enabled and disabled states without
+ *	storing a plaintext boolean an attacker could patch.  A plain
+ *	XOR is used so the operation is its own inverse.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	mask   -- XOR mask to apply.
  *
- * Returns:
- *	None.
+ * Results:
+ *	None (void).
  *
  * Side effects:
  *	Mutates `interp->nLoadToken`.
@@ -41113,12 +45656,19 @@ th8XorInterpLoadToken(Th8_Interp *interp, th8_int64_t mask)
  *	library can drive the gate from C without going
  *	through the public enable / disable wrappers.
  *
+ * Why / How:
+ *	`[unload]` uses the same dual-field random-token gate as
+ *	`[load]`; applying the same mask to `nUnloadToken` here and to
+ *	`nUnloadOk` in th8_core.c toggles the gate between enabled and
+ *	disabled without a patchable plaintext boolean.  XOR is used so
+ *	the operation is its own inverse.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	mask   -- XOR mask to apply.
  *
- * Returns:
- *	None.
+ * Results:
+ *	None (void).
  *
  * Side effects:
  *	Mutates `interp->nUnloadToken`.
@@ -41147,11 +45697,17 @@ th8XorInterpUnloadToken(Th8_Interp *interp, th8_int64_t mask)
  *	callers should use `Th8_EnableUnload` /
  *	`Th8_DisableUnload`.
  *
+ * Why / How:
+ *	Test vectors need each run to start from a known unload-mode
+ *	state; clearing the whole `nUnloadFlags` mask in one store
+ *	withdraws every previously granted flag at once, which is
+ *	simpler and more reliable than clearing them individually.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *
- * Returns:
- *	None.
+ * Results:
+ *	None (void).
  *
  * Side effects:
  *	Zeros `interp->nUnloadFlags`.
@@ -41341,7 +45897,16 @@ Th8_DeclareSystemVar(Th8_Interp *interp, const char *zName, size_t nName)
 	if (!interp->paSystemVar) return TH8_ERROR;
     }
     pEntry = Th8_HashFind(interp, interp->paSystemVar, zName, nName, 1);
-    if (pEntry) pEntry->pData = (void *)(size_t)1;
+    if (!pEntry) {
+	/* create=1 hash insert can fail on OOM (Th8_HashFind returns NULL).
+	 * The old code returned TH8_OK regardless, so a transient allocation
+	 * failure left the variable NOT marked as a system var (writable from
+	 * scripts) while reporting success -- e.g. leaving ::th8_security
+	 * script-writable after Th8_RegisterLanguage returned TH8_OK
+	 * (TH8K-006 / Bug 85 class). */
+	return TH8_ERROR;
+    }
+    pEntry->pData = (void *)(size_t)1;
     return TH8_OK;
 }
 
@@ -41751,6 +46316,8 @@ Th8_GetVar(
 
     if (!interp) return TH8_ERROR;
 
+    TH8_ASSERT_OWNER(interp);
+
     pVar = th8FindValue(interp, zVar, nVar, 0);
     if (!pVar) {
 	Th8_ErrorMessage(interp, "no such variable: \"", zVar, nVar);
@@ -42021,6 +46588,8 @@ Th8_SetVar(
     size_t nTag = 0; /* taint bit of the incoming value, if any */
 
     if (!interp) return TH8_ERROR;
+
+    TH8_ASSERT_OWNER(interp);
 
     pVar = th8FindValue(interp, zVar, nVar, 1);
     if (!pVar) {
@@ -42347,6 +46916,16 @@ typedef struct {
  *	restore is a no-op in that case.  All allocations are
  *	rolled back on any intermediate failure.
  *
+ * Why / How:
+ *	Security-sensitive operations often need to mutate a system
+ *	array transiently and then put it back exactly as it was;
+ *	this captures a deep, owned copy so the restore is independent
+ *	of any later change to the live array.  It enumerates the
+ *	element names (Th8_ListAppendArray + Th8_SplitList), reads and
+ *	copies each element's value, and packs them into an opaque
+ *	Th8_SysVarState.  Every partial allocation is rolled back on
+ *	failure so the caller never receives a half-built handle.
+ *
  * Parameters:
  *	interp  -- live interpreter.
  *	zArr    -- array name (e.g. `"::th8_security"`).
@@ -42355,7 +46934,7 @@ typedef struct {
  *		array was empty), suitable for
  *		`Th8_RestoreSystemVar`.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` on allocation
  *	failure or element-read failure (interpreter result:
  *	diagnostic).
@@ -42582,6 +47161,9 @@ Th8_UnsetVar(
     Th8_Frame *pFrame;
 
     if (!interp) return TH8_ERROR;
+
+    TH8_ASSERT_OWNER(interp);
+
     th8AnalyzeVarName(
         zVar, nVar, &zOuter, &nOuter, &zInner, &nInner, &bGlobal);
 
@@ -42827,6 +47409,9 @@ Th8_ExistsArrayVar(
  *	Th8_ExistsArrayVar to distinguish "epoch 0 on a fresh
  *	array" from "no such array").
  *
+ * Side effects:
+ *	None.  Only reads the variable's stored epoch counter.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -42887,6 +47472,9 @@ th8GetArrayEpoch(
  *	pHash allocation), or -1 if the variable does not exist
  *	or has no element hash.
  *
+ * Side effects:
+ *	None.  Only reads the variable's stored generation counter.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -42942,6 +47530,10 @@ th8GetArrayGeneration(
  * Results:
  *	The element-hash pointer, or NULL if the variable does
  *	not exist or is not an array.
+ *
+ * Side effects:
+ *	None.  Returns a borrowed pointer to the array's existing
+ *	element hash; the caller must not free it.
  *
  *----------------------------------------------------------------------
  */
@@ -43957,9 +48549,9 @@ Th8_Memcmp(
 void *
 Th8_Memcpy(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    void *dst,   /* Destination buffer. */
-    const void *src,  /* Source buffer. */
-    size_t n)   /* Number of bytes. */
+    void *dst, /* Destination buffer. */
+    const void *src, /* Source buffer. */
+    size_t n) /* Number of bytes. */
 {
     const Th8_Platform *pPlatform;
 
@@ -44004,9 +48596,9 @@ Th8_Memcpy(
 void *
 Th8_Memset(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    void *dst,   /* Destination buffer. */
-    int c,   /* Fill byte. */
-    size_t n)   /* Number of bytes. */
+    void *dst, /* Destination buffer. */
+    int c, /* Fill byte. */
+    size_t n) /* Number of bytes. */
 {
     const Th8_Platform *pPlatform;
 
@@ -44069,9 +48661,9 @@ Th8_Memset(
 void *
 th8Memmove(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    void *dst,   /* Destination buffer. */
-    const void *src,  /* Source buffer. */
-    size_t n)   /* Number of bytes. */
+    void *dst, /* Destination buffer. */
+    const void *src, /* Source buffer. */
+    size_t n) /* Number of bytes. */
 {
     const Th8_Platform *pPlatform = Th8_GetPlatform(interp);
 
@@ -44111,8 +48703,8 @@ th8Memmove(
 int
 th8Strcmp(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    const char *s1,  /* First string. */
-    const char *s2)  /* Second string. */
+    const char *s1, /* First string. */
+    const char *s2) /* Second string. */
 {
     const Th8_Platform *pPlatform = Th8_GetPlatform(interp);
 
@@ -44151,8 +48743,8 @@ th8Strcmp(
 char *
 th8Strchr(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    const char *s,  /* String to search. */
-    int c)   /* Byte to find. */
+    const char *s, /* String to search. */
+    int c) /* Byte to find. */
 {
     const Th8_Platform *pPlatform = Th8_GetPlatform(interp);
 
@@ -44193,8 +48785,8 @@ th8Strchr(
 char *
 th8Strrchr(
     Th8_Interp *interp, /* Interpreter (unused; for API uniformity). */
-    const char *s,  /* String to search. */
-    int c)   /* Byte to find. */
+    const char *s, /* String to search. */
+    int c) /* Byte to find. */
 {
     const char *last = 0;
     (void)interp;
@@ -44234,7 +48826,7 @@ th8Strrchr(
 int
 th8Atoi(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    const char *s)  /* String to convert. */
+    const char *s) /* String to convert. */
 {
     const Th8_Platform *pPlatform = Th8_GetPlatform(interp);
 
@@ -44272,9 +48864,9 @@ th8Atoi(
 void
 th8Qsort(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    void *base,  /* Array base. */
-    size_t nmemb,  /* Number of elements. */
-    size_t size,  /* Element size. */
+    void *base, /* Array base. */
+    size_t nmemb, /* Number of elements. */
+    size_t size, /* Element size. */
     int (*cmp)(const void *, const void *))
 {
     const Th8_Platform *pPlatform = Th8_GetPlatform(interp);
@@ -44316,10 +48908,10 @@ th8Qsort(
 int
 th8Vsnprintf(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    char *buf,   /* Output buffer. */
-    size_t size,  /* Buffer size. */
-    const char *fmt,  /* Format string. */
-    va_list ap)  /* Argument list. */
+    char *buf, /* Output buffer. */
+    size_t size, /* Buffer size. */
+    const char *fmt, /* Format string. */
+    va_list ap) /* Argument list. */
 {
     const Th8_Platform *pPlatform = Th8_GetPlatform(interp);
 
@@ -44358,9 +48950,9 @@ th8Vsnprintf(
 int
 th8Snprintf(
     Th8_Interp *interp, /* Interpreter for platform access. */
-    char *buf,   /* Output buffer. */
-    size_t size,  /* Buffer size. */
-    const char *fmt,  /* Format string. */
+    char *buf, /* Output buffer. */
+    size_t size, /* Buffer size. */
+    const char *fmt, /* Format string. */
     ...)
 {
     va_list ap;
@@ -44403,8 +48995,8 @@ th8Snprintf(
 
 static size_t
 th8TranslateCrLfToLf(
-    char *z,   /* Buffer to modify in-place. */
-    size_t n)   /* Current byte length. */
+    char *z, /* Buffer to modify in-place. */
+    size_t n) /* Current byte length. */
 {
     size_t r = 0; /* Read index. */
     size_t w = 0; /* Write index. */
@@ -44456,8 +49048,8 @@ th8TranslateCrLfToLf(
 
 int
 th8TranslateLineEndings(
-    char *zBuf,   /* Buffer to modify in-place. */
-    size_t *pnBuf)  /* IN/OUT: byte length. */
+    char *zBuf, /* Buffer to modify in-place. */
+    size_t *pnBuf) /* IN/OUT: byte length. */
 {
     size_t n = *pnBuf;
     size_t i;
@@ -44515,9 +49107,9 @@ th8TranslateLineEndings(
 int
 Th8_Input(
     Th8_Interp *interp, /* Interpreter. */
-    char **pzOut,  /* OUT: data buffer (caller frees). */
-    size_t *pnOut,  /* OUT: data length. */
-    int flags)   /* TH8_TRANSLATE_EOL or 0. */
+    char **pzOut, /* OUT: data buffer (caller frees). */
+    size_t *pnOut, /* OUT: data length. */
+    int flags) /* TH8_TRANSLATE_EOL or 0. */
 {
     const Th8_Platform *pPlatform;
     int rc;
@@ -44583,9 +49175,9 @@ Th8_Input(
 int
 Th8_Output(
     Th8_Interp *interp, /* Interpreter. */
-    const char *z,  /* Output string. */
-    size_t n,   /* Byte length. */
-    int flags)   /* TH8_TRANSLATE_EOL or 0. */
+    const char *z, /* Output string. */
+    size_t n, /* Byte length. */
+    int flags) /* TH8_TRANSLATE_EOL or 0. */
 {
     const Th8_Platform *pPlatform;
 
@@ -44669,8 +49261,8 @@ oom:
 int
 Th8_OutputError(
     Th8_Interp *interp, /* Interpreter. */
-    const char *z,  /* Output string. */
-    size_t n)   /* Byte length. */
+    const char *z, /* Output string. */
+    size_t n) /* Byte length. */
 {
     const Th8_Platform *pPlatform;
 
@@ -44961,9 +49553,9 @@ Th8_RedirectErrorOutput(Th8_Interp *interp, void *channel)
 int
 Th8_DataExists(
     Th8_Interp *interp, /* Interpreter. */
-    const char *zName,  /* Data name to test. */
-    size_t nName,  /* Byte length (TH8_NOLEN = NUL). */
-    int *pAttrs)  /* OUT: file type attrs (may be NULL). */
+    const char *zName, /* Data name to test. */
+    size_t nName, /* Byte length (TH8_NOLEN = NUL). */
+    int *pAttrs) /* OUT: file type attrs (may be NULL). */
 {
     const Th8_Platform *pPlatform;
 
@@ -45008,8 +49600,8 @@ Th8_DataExists(
 char *
 Th8_NormalizePath(
     Th8_Interp *interp, /* Interpreter. */
-    const char *zPath,  /* Path to normalize. */
-    size_t nPath)  /* Byte length (TH8_NOLEN = NUL). */
+    const char *zPath, /* Path to normalize. */
+    size_t nPath) /* Byte length (TH8_NOLEN = NUL). */
 {
     const Th8_Platform *pPlatform;
 
@@ -45340,11 +49932,11 @@ Th8_SameFile(
 int
 Th8_GetData(
     Th8_Interp *interp, /* Interpreter. */
-    const char *zName,  /* Opaque name. */
-    size_t nName,  /* Name length. */
-    char **pzOut,  /* OUT: data buffer (caller frees). */
-    size_t *pnOut,  /* OUT: data length. */
-    int flags)   /* TH8_TRANSLATE_EOL or 0. */
+    const char *zName, /* Opaque name. */
+    size_t nName, /* Name length. */
+    char **pzOut, /* OUT: data buffer (caller frees). */
+    size_t *pnOut, /* OUT: data length. */
+    int flags) /* TH8_TRANSLATE_EOL or 0. */
 {
     const Th8_Platform *pPlatform;
 
@@ -45447,7 +50039,7 @@ Th8_GetData(
 int
 Th8_GetTimeMs(
     Th8_Interp *interp, /* Interpreter. */
-    th8_int64_t *pMs)  /* OUT: milliseconds. */
+    th8_int64_t *pMs) /* OUT: milliseconds. */
 {
     const Th8_Platform *pPlatform;
 
@@ -45491,7 +50083,7 @@ Th8_GetTimeMs(
 int
 Th8_GetTimeUs(
     Th8_Interp *interp, /* Interpreter. */
-    th8_int64_t *pUs)  /* OUT: microseconds. */
+    th8_int64_t *pUs) /* OUT: microseconds. */
 {
     const Th8_Platform *pPlatform;
 
@@ -45634,17 +50226,23 @@ Th8_GetParentPid(Th8_Interp *interp) /* Interpreter. */
  *
  * Th8_GetThreadId --
  *
- *	Get the current thread ID via the platform.  Returns 0 if the
- *	callback is NULL (unsupported or unavailable).
+ *	Get the CURRENT (calling) thread ID via the platform.  Returns 0
+ *	if the callback is NULL (unsupported or unavailable).
  *
  * Why / How:
- *	Used for diagnostic tracing and thread-safety assertions.
+ *	Used for diagnostic tracing and thread-affinity assertions.
  *	Delegates to the platform's xGetThreadId callback.  Returns
  *	0 when the callback is missing, which is safe for single-
  *	threaded environments.
  *
+ *	THREAD SAFETY: callable from any thread.  It reports the
+ *	caller's own thread and reads only immutable interpreter state
+ *	(the platform pointer), so it is exempt from the single-
+ *	threaded-per-interpreter affinity contract -- this is how a
+ *	foreign thread can compare itself against Th8_GetInterpThreadId.
+ *
  * Results:
- *	Thread ID, or 0.
+ *	The calling thread's ID, or 0.
  *
  * Side effects:
  *	None.
@@ -45701,7 +50299,7 @@ Th8_GetThreadId(Th8_Interp *interp) /* Interpreter. */
 char *
 Th8_GetEnv(
     Th8_Interp *interp, /* Interpreter (may be NULL). */
-    const char *zName)  /* Variable name. */
+    const char *zName) /* Variable name. */
 {
     const Th8_Platform *p = interp ? Th8_GetPlatform(interp) : NULL;
 
@@ -45764,11 +50362,11 @@ Th8_GetEnv(
 int
 Th8_KeyValue(
     Th8_Interp *interp, /* Interpreter (may be NULL). */
-    int op,   /* TH8_KV_* operation code. */
-    const char *zName,  /* Key name (or glob pattern). */
-    size_t nName,  /* Length of zName. */
-    const char *zValue,  /* Value (SET only; NULL otherwise). */
-    size_t nValue)  /* Length of zValue. */
+    int op, /* TH8_KV_* operation code. */
+    const char *zName, /* Key name (or glob pattern). */
+    size_t nName, /* Length of zName. */
+    const char *zValue, /* Value (SET only; NULL otherwise). */
+    size_t nValue) /* Length of zValue. */
 {
     const Th8_Platform *p = interp ? Th8_GetPlatform(interp) : NULL;
 
@@ -45830,8 +50428,8 @@ Th8_KeyValue(
 int
 Th8_RandomBytes(
     Th8_Interp *interp, /* Interpreter. */
-    void *pBuf,   /* Output buffer. */
-    size_t nByte)  /* Number of bytes to fill. */
+    void *pBuf, /* Output buffer. */
+    size_t nByte) /* Number of bytes to fill. */
 {
     const Th8_Platform *pPlatform;
 
@@ -45859,6 +50457,15 @@ Th8_RandomBytes(
  *	Th8_DnsResolve returns TH8_ERROR -- the caller is
  *	expected to fall back to a non-pinned resolution path or
  *	fail closed.
+ *
+ * Why / How:
+ *	DNS resolution is platform-specific and, for the DNSSEC-
+ *	validating path, may need a resolver library the core does
+ *	not link directly; routing through the xDnsResolve platform
+ *	callback keeps that policy in one place.  This wrapper only
+ *	null-checks its inputs, clears *ppResult, and dispatches --
+ *	the guards are split into separate ifs (Finding 005) so each
+ *	is independently MC/DC-reachable.
  *
  * Results:
  *	TH8_OK on success (check pResult->bogus for DNSSEC
@@ -45908,13 +50515,21 @@ Th8_DnsResolve(
  *	per FINDINGS.md Finding 005 sec. 5b so each guard's
  *	MC/DC C-pair is independently reachable.
  *
+ * Why / How:
+ *	A Th8_DnsResult is allocated by the platform's resolver, so it
+ *	must be released by that same platform's allocator; freeing it
+ *	from the core could cross allocator boundaries.  This routes
+ *	the teardown back through xDnsResolveFree, guarding against a
+ *	NULL interp/result or a platform that supplies no free
+ *	callback (in which case it simply does nothing).
+ *
  * Parameters:
  *	interp  -- live interpreter.
  *	pResult -- result returned by `Th8_DnsResolve`, or
  *		NULL.
  *
- * Returns:
- *	None.
+ * Results:
+ *	None (void).
  *
  * Side effects:
  *	Frees every resource owned by the result via the
@@ -46249,6 +50864,64 @@ Th8_IntCmpXchg(
 }
 
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_Int64CmpXchg --
+ *
+ *	64-bit atomic integer compare-and-exchange via the platform's
+ *	xIntCmpXchg64 callback.  Compares *pTarget with iComparand; if
+ *	equal, stores iExchange in *pTarget.  Returns the original value
+ *	of *pTarget.  Falls back to a non-atomic operation if the
+ *	callback is NULL (single-threaded assumption).
+ *
+ * Why / How:
+ *	The 64-bit sibling of Th8_IntCmpXchg.  It exists because the
+ *	32-bit primitive is too narrow to hold a thread id: the owning-
+ *	thread id (Th8_Interp.threadId) is read and published through
+ *	this call so the affinity contract can be enforced without a
+ *	lock.  The two-tier dispatch tries the per-interpreter platform
+ *	first, then the global platform, then a non-atomic fallback that
+ *	is correct only under single-threaded assumptions.
+ *
+ * Results:
+ *	The original value of *pTarget.
+ *
+ * Side effects:
+ *	May atomically update *pTarget.
+ *
+ *----------------------------------------------------------------------
+ */
+
+th8_uint64_t
+Th8_Int64CmpXchg(
+    Th8_Interp *interp,
+    volatile th8_uint64_t *pTarget,
+    th8_uint64_t iExchange,
+    th8_uint64_t iComparand)
+{
+    const Th8_Platform *p = interp ? Th8_GetPlatform(interp) : NULL;
+
+    if (p && p->xIntCmpXchg64) {
+	return p->xIntCmpXchg64(
+	    interp,
+	    th8ResolveCtx(
+	        interp, (Th8_PlatformFunc)p->xIntCmpXchg64, p->pCtx),
+	    pTarget, iExchange, iComparand);
+    }
+    if (th8GlobalPlatform.xIntCmpXchg64) {
+	return th8GlobalPlatform.xIntCmpXchg64(
+	    interp, th8GlobalPlatform.pCtx, pTarget, iExchange, iComparand);
+    }
+    /* Fallback: non-atomic, single-threaded */
+    {
+	th8_uint64_t old = *pTarget;
+	if (old == iComparand) *pTarget = iExchange;
+	return old;
+    }
+}
+
+
 #if defined(__OpenBSD__)
 #  include <unistd.h>
 #endif
@@ -46282,7 +50955,7 @@ Th8_IntCmpXchg(
 
 int
 Th8_Pledge(
-    Th8_Interp *interp,  /* Interpreter (reserved). */
+    Th8_Interp *interp, /* Interpreter (reserved). */
     const char *zPromises, /* Pledge promises string. */
     const char *zExecPromises) /* Exec promises (or NULL). */
 {
@@ -46327,8 +51000,8 @@ Th8_Pledge(
 
 int
 Th8_Unveil(
-    Th8_Interp *interp,  /* Interpreter (reserved). */
-    const char *zPath,  /* Path to reveal (NULL to lock). */
+    Th8_Interp *interp, /* Interpreter (reserved). */
+    const char *zPath, /* Path to reveal (NULL to lock). */
     const char *zPermissions) /* "r", "w", "x", "c" (NULL to lock). */
 {
     (void)interp;
@@ -46565,6 +51238,20 @@ typedef struct Th8_PluginEntry {
  *	the pNext field that points to the found entry (for
  *	unlinking).
  *
+ * Why / How:
+ *	Registration, duplicate-detection, and unregistration all
+ *	need to locate a plugin by name; centralizing the lookup here
+ *	keeps that one linear walk of the interpreter's singly-linked
+ *	plugin list (comparing length then bytes).  The list is short
+ *	(one node per registered plugin) so a linear scan is fine.
+ *
+ * Results:
+ *	Pointer to the matching Th8_PluginEntry, or NULL if no plugin
+ *	with that name is registered.
+ *
+ * Side effects:
+ *	None.  Returns a borrowed pointer into the plugin list.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -46587,13 +51274,55 @@ th8PluginFind(Th8_Interp *interp, const char *zName, size_t nName)
 /*
  *----------------------------------------------------------------------
  *
+ * th8PluginRegistered --
+ *
+ *	Report whether a plugin with the given name is already
+ *	registered in the interpreter.  Lets a re-registering caller
+ *	(TH8K-006) distinguish the harmless "already present" case from
+ *	a real registration failure so it can propagate the latter.
+ *
+ * Why / How:
+ *	Thin predicate over th8PluginFind: it exposes only a yes/no
+ *	answer so callers outside this file can test membership
+ *	without seeing (or depending on) the Th8_PluginEntry layout.
+ *
+ * Results:
+ *	Non-zero if the named plugin is registered; 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8PluginRegistered(Th8_Interp *interp, const char *zName, size_t nName)
+{
+    return th8PluginFind(interp, zName, nName) != NULL;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8RemoveCommandByToken --
  *
- *	Walk ALL commands in ALL namespaces looking for a command
- *	whose nToken matches.  If found, remove it.
+ *	Remove the command identified by the given creation token,
+ *	if it still exists.
  *
- *	This is O(total commands) per call -- acceptable because
- *	plugin unregistration is rare.
+ * Why / How:
+ *	Plugin unregistration must delete exactly the commands the
+ *	plugin created, identified by the tokens recorded at
+ *	registration.  Rather than scanning every namespace, it
+ *	delegates to Th8_DeleteCommand, which resolves the token in
+ *	O(1) via the interpreter's secondary token index; a token that
+ *	no longer maps to a live command is silently ignored.
+ *
+ * Results:
+ *	None (void).  Any delete failure is intentionally ignored.
+ *
+ * Side effects:
+ *	Deletes the matching command from the interpreter (if present).
  *
  *----------------------------------------------------------------------
  */
@@ -46610,6 +51339,29 @@ th8RemoveCommandByToken(Th8_Interp *interp, th8_uint64_t token)
  *----------------------------------------------------------------------
  *
  * Th8_RegisterPlugin --
+ *
+ *	Register a named command plugin with the interpreter, creating every
+ *	command the plugin supplies.
+ *
+ * Why / How:
+ *	A plugin is a named group of commands produced by a single
+ *	Th8_GetCommandsProc.  This validates its arguments, rejects a name
+ *	that is already registered, then calls xGetCommands(NULL, &nCommand)
+ *	to size the command table, allocates and zero-fills it, calls
+ *	xGetCommands again to fill it, and creates each command -- recording
+ *	the created command tokens in a plugin entry linked onto the
+ *	interpreter's plugin list so Th8_UnregisterPlugin can later remove
+ *	them.  Any failure frees what was allocated and leaves no command or
+ *	plugin entry behind.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR (with an interpreter result message) on
+ *	invalid arguments, a duplicate name, an empty or failed command
+ *	table, allocation failure, or a command-creation failure.
+ *
+ * Side effects:
+ *	Creates commands in the interpreter and adds a plugin entry to its
+ *	plugin list.
  *
  *----------------------------------------------------------------------
  */
@@ -46723,6 +51475,24 @@ Th8_RegisterPlugin(
  *
  * Th8_UnregisterPlugin --
  *
+ *	Unregister a previously registered plugin by name, removing every
+ *	command it created.
+ *
+ * Why / How:
+ *	Looks up the plugin entry by name on the interpreter's plugin list;
+ *	if found, deletes each command it created (by the tokens recorded at
+ *	registration), unlinks the entry from the list, and frees the entry's
+ *	token array, name, and the entry itself.  It is the inverse of
+ *	Th8_RegisterPlugin.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR (with an interpreter result message) on
+ *	a NULL interpreter/name or a name that is not registered.
+ *
+ * Side effects:
+ *	Deletes the plugin's commands from the interpreter and frees the
+ *	plugin entry.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -46785,6 +51555,20 @@ Th8_UnregisterPlugin(Th8_Interp *interp, const char *zName)
  *
  * Th8_ListAppendPlugins --
  *
+ *	Append the name of every registered plugin to a Tcl-list string.
+ *
+ * Why / How:
+ *	Walks the interpreter's plugin list and appends each plugin's name as
+ *	one element to the caller's growing list buffer (*pz / *pn) via
+ *	Th8_ListAppend, in registration order.  Used to report the set of
+ *	loaded plugins (e.g. for introspection).
+ *
+ * Results:
+ *	TH8_OK.
+ *
+ * Side effects:
+ *	Grows the caller's list buffer (*pz / *pn), reallocating as needed.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -46810,6 +51594,21 @@ Th8_ListAppendPlugins(Th8_Interp *interp, char **pz, size_t *pn)
  *	Free all plugin metadata during interpreter deletion.
  *	Commands are already freed by namespace cleanup; this
  *	only frees the plugin entries themselves.
+ *
+ * Why / How:
+ *	By the time an interpreter is torn down its commands have
+ *	already been destroyed with the namespaces that held them, so
+ *	the plugin entries would otherwise leak.  This walks the
+ *	plugin list once, freeing each entry's recorded token array,
+ *	its name, and the entry node, then clears the interpreter's
+ *	list head so nothing dangles.
+ *
+ * Results:
+ *	None (void).
+ *
+ * Side effects:
+ *	Frees every plugin entry (token array, name, node) and sets
+ *	the interpreter's plugin list to NULL.
  *
  *----------------------------------------------------------------------
  */
@@ -47317,6 +52116,17 @@ th8ParseReturnCode(Th8_Interp *interp, const char *z, size_t n, int *piCode)
  *	propagation mechanism so the caller's frame observes
  *	the override.
  *
+ * Why / How:
+ *	Walks the argv option/value pairs (`-code`, `-level`,
+ *	`-errorinfo`, `-errorcode`), capturing the -errorinfo /
+ *	-errorcode values without applying them yet: per
+ *	R-03654-57637 they are only committed when the final code is
+ *	TH8_ERROR, so a successful `[return]` that happens to pass
+ *	them does not clobber ::errorInfo / ::errorCode.  The trailing
+ *	non-option word becomes the interpreter result, and the
+ *	selected code is returned to unwind the requested number of
+ *	frames.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -47325,7 +52135,7 @@ th8ParseReturnCode(Th8_Interp *interp, const char *z, size_t n, int *piCode)
  *		the option/value suffix.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	The selected return code (default `TH8_RETURN`); the
  *	interpreter result is the trailing value (or empty).
  *	`TH8_ERROR` on bad option syntax (interpreter result:
@@ -47934,6 +52744,29 @@ oom:
  *	optional case folding.  For regexp mode, builds and evals a
  *	[regexp] command via Th8_ListAppend (proper list quoting).
  *
+ * Why / How:
+ *	Branches on `useGlob`: 2 = regexp (assembles and evals a
+ *	`regexp ?-nocase? pat str` list so the real regexp engine is
+ *	reused rather than re-implemented), 1 = glob (delegates to
+ *	Th8_GlobMatch, ASCII-lowercasing both operands first when
+ *	-nocase), and 0 = exact (length check then Th8_Memcmp, or a
+ *	byte-by-byte case-folded compare).  The byte-folding loops
+ *	poll Th8_Ready every 4096 bytes (TH8K-009) so an attacker
+ *	supplying huge -nocase inputs can still be cancelled; a trip
+ *	is reported through `*pReadyRc` while the int return stays the
+ *	match boolean.
+ *
+ * Results:
+ *	1 if the pattern matches, 0 otherwise (0 is also returned on
+ *	an OOM during -nocase folding or on a cancel/step-limit trip).
+ *	When `pReadyRc` is non-NULL it is set to TH8_OK, or to
+ *	TH8_ERROR if Th8_Ready tripped mid-compare.
+ *
+ * Side effects:
+ *	In regexp mode, evaluates a `regexp` command (which sets the
+ *	interpreter result).  Temporarily allocates and frees
+ *	lowercase copies of the operands in -nocase glob mode.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -47945,8 +52778,13 @@ th8SwitchMatch(
     const char *zStr,
     size_t nStr,
     int useGlob,
-    int noCase)
+    int noCase,
+    int *pReadyRc) /* OUT: TH8_OK, or TH8_ERROR if cancel/step-limit
+			 * tripped during a -nocase byte fold/compare
+			 * (TH8K-009).  The int return value stays the
+			 * match boolean. */
 {
+    if (pReadyRc) *pReadyRc = TH8_OK;
     if (useGlob == 2) {
 	/* Regexp mode: build [regexp ?-nocase? pattern string] */
 	char *zCmd = 0;
@@ -47992,12 +52830,31 @@ th8SwitchMatch(
 		return 0;
 	    }
 	    for (i = 0; i < nPat; i++) {
-		unsigned char c = (unsigned char)zPat[i];
+		unsigned char c;
+		/* TH8K-009: poll every 4096 bytes of the fold. */
+		if ((i & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			Th8_Free(interp, zLPat);
+			Th8_Free(interp, zLStr);
+			if (pReadyRc) *pReadyRc = TH8_ERROR;
+			return 0;
+		    }
+		}
+		c = (unsigned char)zPat[i];
 		zLPat[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
 	    }
 	    zLPat[nPat] = '\0';
 	    for (i = 0; i < nStr; i++) {
-		unsigned char c = (unsigned char)zStr[i];
+		unsigned char c;
+		if ((i & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			Th8_Free(interp, zLPat);
+			Th8_Free(interp, zLStr);
+			if (pReadyRc) *pReadyRc = TH8_ERROR;
+			return 0;
+		    }
+		}
+		c = (unsigned char)zStr[i];
 		zLStr[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
 	    }
 	    zLStr[nStr] = '\0';
@@ -48014,8 +52871,16 @@ th8SwitchMatch(
     if (noCase) {
 	size_t j;
 	for (j = 0; j < nPat; j++) {
-	    unsigned char a = (unsigned char)zPat[j];
-	    unsigned char b = (unsigned char)zStr[j];
+	    unsigned char a;
+	    unsigned char b;
+	    if ((j & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    if (pReadyRc) *pReadyRc = TH8_ERROR;
+		    return 0;
+		}
+	    }
+	    a = (unsigned char)zPat[j];
+	    b = (unsigned char)zStr[j];
 	    if (a >= 'A' && a <= 'Z') a += 32;
 	    if (b >= 'A' && b <= 'Z') b += 32;
 	    if (a != b) return 0;
@@ -48166,12 +53031,21 @@ switch_command(
 	 */
 
 	for (k = 0; k + 1 < nPairs; k += 2) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, azPairs);
+		return TH8_ERROR;
+	    }
 	    if (th8StrEq(interp, azPairs[k], anPairs[k], "default")) {
 		matched = 1;
 	    } else {
+		int readyRc;
 		matched = th8SwitchMatch(
 		    interp, azPairs[k], TH8_LEN(anPairs[k]), zString,
-		    TH8_LEN(nString), useGlob, noCase);
+		    TH8_LEN(nString), useGlob, noCase, &readyRc);
+		if (readyRc != TH8_OK) {
+		    Th8_Free(interp, azPairs);
+		    return TH8_ERROR;
+		}
 	    }
 	    if (matched) {
 		/* Fall-through: skip "-" bodies */
@@ -48204,9 +53078,13 @@ switch_command(
 	if (th8StrEq(interp, argv[i], argl[i], "default")) {
 	    matched = 1;
 	} else {
+	    int readyRc;
 	    matched = th8SwitchMatch(
 	        interp, argv[i], TH8_LEN(argl[i]), zString, TH8_LEN(nString),
-	        useGlob, noCase);
+	        useGlob, noCase, &readyRc);
+	    if (readyRc != TH8_OK) {
+		return TH8_ERROR;
+	    }
 	}
 
 	if (matched) {
@@ -48381,7 +53259,96 @@ subst_command(
 
 
 /*
- * try_post_finally -- NRE callback after the finally script completes.
+ *----------------------------------------------------------------------
+ *
+ * try_return_saved --
+ *
+ *	Restore the saved try-script result/rc into the interpreter and
+ *	tear down the TryState.  Shared by every [try] exit path that
+ *	returns the try script's own result: the exit-flag and
+ *	stack/suspension skip paths in try_post_try, and the
+ *	finally-succeeded path in try_post_finally.
+ *
+ * Why / How:
+ *	Copies pState->zTryResult back into the interpreter result via
+ *	Th8_SetResult.  That copy can fail under memory pressure, and a
+ *	`void`-style ignore would leave the interpreter with an empty or
+ *	stale result while still reporting the try's success code -- a
+ *	silent loss of the result (TH8K-020).  So the return is checked:
+ *	on failure it reports "out of memory" (via Th8_SetResultStatic,
+ *	which stores a static pointer and cannot itself allocate) and
+ *	returns TH8_ERROR.  pState and its owned result are freed on
+ *	every path.
+ *
+ * Results:
+ *	The saved try return code (pState->tryRc) on success; TH8_ERROR
+ *	if the saved result could not be restored (out of memory).
+ *
+ * Side effects:
+ *	Sets the interpreter result; frees pState->zTryResult and pState.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+try_return_saved(Th8_Interp *interp, TryState *pState)
+{
+    int rc = pState->tryRc;
+    int ok =
+        (Th8_SetResult(interp, pState->zTryResult, pState->nTryResult) ==
+         TH8_OK);
+
+    Th8_Free(interp, pState->zTryResult);
+    Th8_Free(interp, pState);
+    if (!ok) {
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    return rc;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * try_post_finally --
+ *
+ *	NRE callback invoked after the finally script has finished
+ *	evaluating.  It records the finally outcome, restores the
+ *	state that try_post_try altered, and chooses the final
+ *	result/return code for the whole [try].
+ *
+ * Why / How:
+ *	Stashes the finally result/rc in the interpreter's dedicated
+ *	finally fields (th8SetFinallyState) so introspection can see
+ *	them, then restores the allocation counter to the pre-finally
+ *	value PLUS whatever the finally block left live (the counter
+ *	was reset to 0 for the finally block, so its current value is
+ *	exactly the finally block's net residue).  This gives the
+ *	finally block a fresh budget DURING execution (peak <= 2x the
+ *	limit) while still charging its persistent allocations against
+ *	the interpreter's cap afterward -- otherwise a finally block
+ *	could retain unbounded memory that the counter never sees, a
+ *	silent bypass of Th8_SetAllocLimit (TH8K-023/-018).  It then
+ *	restores the saved cancel state.  Precedence follows Eagle
+ *	semantics:
+ *	if finally succeeded, the try script's saved result/rc win; if
+ *	finally failed, its own result/rc (already in the interp) win.
+ *	Finally it frees the saved try result and the TryState.
+ *
+ * Results:
+ *	The try script's saved return code when the finally block
+ *	succeeded; otherwise the finally block's own `rc`.  TH8_ERROR if
+ *	restoring the saved try result fails (out of memory), via
+ *	try_return_saved.
+ *
+ * Side effects:
+ *	Sets the interpreter result and finally-state fields; restores
+ *	the allocation counter (pre-finally value plus the finally
+ *	block's live residue) and cancel state; frees pState->zTryResult
+ *	and pState.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -48390,6 +53357,8 @@ try_post_finally(Th8_Interp *interp, void *pData[], int rc)
     TryState *pState = (TryState *)pData[0];
     const char *zFinallyResult;
     size_t nFinallyResult;
+    size_t nFinallyLive;
+    size_t nRestored;
 
     /*
      * Store the finally result/rc in the dedicated interp fields.
@@ -48398,11 +53367,23 @@ try_post_finally(Th8_Interp *interp, void *pData[], int rc)
     th8SetFinallyState(interp, zFinallyResult, nFinallyResult, rc);
 
     /*
-     * Restore the pre-finally allocation counter.  The finally
-     * block's allocations are allowed to persist, but the counter
-     * is reset so it doesn't permanently consume the budget.
+     * Restore the allocation counter.  try_post_try reset it to 0
+     * before the finally block, so its current value is exactly the
+     * bytes the finally block left LIVE.  Charge those against the
+     * pre-finally total so persistent finally allocations still count
+     * toward the cap (TH8K-023/-018): discarding them would let a
+     * finally block retain memory the counter never sees, silently
+     * bypassing Th8_SetAllocLimit.  On the (astronomical) overflow of
+     * saved + residue, saturate to poison the counter rather than wrap
+     * past the ceiling -- mirrors th8AccountAlloc.
      */
-    th8SetAllocBytes(interp, pState->nSavedAllocBytes);
+    nFinallyLive = Th8_GetAllocBytes(interp);
+    if (Th8_SafeAdd(
+            interp, pState->nSavedAllocBytes, nFinallyLive, &nRestored) !=
+        TH8_OK) {
+	nRestored = (size_t)-1;
+    }
+    th8SetAllocBytes(interp, nRestored);
 
     /*
      * Restore the cancel state.
@@ -48414,10 +53395,10 @@ try_post_finally(Th8_Interp *interp, void *pData[], int rc)
      */
     if (rc == TH8_OK) {
 	/*
-	 * Finally succeeded: return the try script's result/rc.
+	 * Finally succeeded: restore and return the try script's result/rc
+	 * (reporting OOM rather than silently losing it -- TH8K-020).
 	 */
-	Th8_SetResult(interp, pState->zTryResult, pState->nTryResult);
-	rc = pState->tryRc;
+	return try_return_saved(interp, pState);
     }
     /* else: finally failed -- its result/rc is already in the interp. */
 
@@ -48428,7 +53409,47 @@ try_post_finally(Th8_Interp *interp, void *pData[], int rc)
 
 
 /*
- * try_post_try -- NRE callback after the try script completes.
+ *----------------------------------------------------------------------
+ *
+ * try_post_try --
+ *
+ *	NRE callback invoked after the try script has finished
+ *	evaluating.  It captures the try outcome and, when a finally
+ *	clause is present and permitted, sets up and launches the
+ *	finally block.
+ *
+ * Why / How:
+ *	Saves the try script's rc into pState.  With no finally clause
+ *	the try result already sits in the interpreter, so it just
+ *	frees pState and returns the try rc directly -- no copy is made
+ *	(copying would leak on this path, and an OOM copy could clobber
+ *	a good result).  Otherwise a finally block follows and will
+ *	overwrite the interpreter result, so it first preserves a copy
+ *	of the try result (Th8_Strdup); on OOM it reports the
+ *	allocation failure rather than silently returning an empty or
+ *	stale result (TH8K-020).  It then enforces the security rules
+ *	before running finally: skip finally if the exit flag is set,
+ *	and skip it if a stack or suspension Th8_Ready check trips
+ *	(cancellation deliberately excluded -- finally must run to
+ *	clean up).  When cleared to proceed it saves/clears the cancel
+ *	state and grants the finally block a fresh allocation budget
+ *	(counter reset to 0, so total peak is at most 2x the limit),
+ *	then pushes try_post_finally and evaluates the finally script.
+ *
+ * Results:
+ *	The try script's return code when finally is skipped or
+ *	absent; otherwise the return code of the Th8_NREval that
+ *	launches the finally block (resolved later by
+ *	try_post_finally).  TH8_ERROR if the try result cannot be
+ *	copied for the finally block (out of memory).
+ *
+ * Side effects:
+ *	When a finally clause is present, allocates a copy of the try
+ *	result (or reports out of memory); may free pState; sets the
+ *	interpreter result; saves cancel state and resets the
+ *	allocation counter; registers the try_post_finally callback.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -48439,15 +53460,16 @@ try_post_try(Th8_Interp *interp, void *pData[], int rc)
     size_t nResult;
 
     /*
-     * Save the try script's result and return code.
+     * Save the try script's return code.
      */
     zResult = Th8_GetResult(interp, &nResult);
     pState->tryRc = rc;
-    pState->zTryResult = Th8_Strdup(interp, zResult, nResult);
-    pState->nTryResult = nResult;
 
     /*
-     * If there is no finally clause, we're done.
+     * If there is no finally clause, the try result already sits in
+     * the interpreter -- return it directly.  Do NOT copy it here: the
+     * copy would leak on this path, and an OOM copy could clobber a
+     * good result.
      */
     if (!pState->zFinally) {
 	Th8_Free(interp, pState);
@@ -48455,14 +53477,24 @@ try_post_try(Th8_Interp *interp, void *pData[], int rc)
     }
 
     /*
+     * A finally clause follows and will overwrite the interpreter
+     * result, so preserve a copy of the try result across it.  On OOM
+     * the result cannot be saved; report the allocation failure rather
+     * than silently returning an empty or stale result (TH8K-020).
+     */
+    pState->zTryResult = Th8_Strdup(interp, zResult, nResult);
+    if (!pState->zTryResult) {
+	Th8_Free(interp, pState);
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    pState->nTryResult = nResult;
+
+    /*
      * Check: do NOT evaluate finally if exit flag is set.
      */
     if (Th8_IsExited(interp)) {
-	Th8_SetResult(interp, pState->zTryResult, pState->nTryResult);
-	rc = pState->tryRc;
-	Th8_Free(interp, pState->zTryResult);
-	Th8_Free(interp, pState);
-	return rc;
+	return try_return_saved(interp, pState);
     }
 
     /*
@@ -48511,11 +53543,7 @@ try_post_try(Th8_Interp *interp, void *pData[], int rc)
 	    triggerFinallySkip = 1;
 	}
 	if (triggerFinallySkip) {
-	    Th8_SetResult(interp, pState->zTryResult, pState->nTryResult);
-	    rc = pState->tryRc;
-	    Th8_Free(interp, pState->zTryResult);
-	    Th8_Free(interp, pState);
-	    return rc;
+	    return try_return_saved(interp, pState);
 	}
     }
 
@@ -48542,7 +53570,36 @@ try_post_try(Th8_Interp *interp, void *pData[], int rc)
 
 
 /*
- * try_command -- entry point.
+ *----------------------------------------------------------------------
+ *
+ * try_command --
+ *
+ *	Implements the Eagle-style `[try script ?finally script?]`
+ *	command -- the entry point of the three-phase NRE chain
+ *	(try_command -> try_post_try -> try_post_finally).
+ *
+ * Why / How:
+ *	Validates the argument count (2 or 4) and, for the 4-arg
+ *	form, that argv[2] is exactly the literal "finally".
+ *	Allocates and initializes a TryState carrying the finally
+ *	script (or NULL) and the accumulators the later callbacks
+ *	fill in, then registers try_post_try and hands the try
+ *	script to Th8_NREval.  Doing the real work in NRE callbacks
+ *	keeps [try] non-recursive so deeply nested scripts do not
+ *	consume C stack.
+ *
+ * Results:
+ *	TH8_OK / whatever code the try (and finally) evaluation
+ *	ultimately yields via the NRE chain; TH8_ERROR on a wrong
+ *	argument count, a missing "finally" keyword, or a TryState
+ *	allocation failure (interpreter result: diagnostic).
+ *
+ * Side effects:
+ *	Allocates a TryState; registers the try_post_try NRE
+ *	callback; evaluates the try script (which may set the
+ *	interpreter result and have arbitrary script side effects).
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -48904,15 +53961,20 @@ typedef struct UpdateState {
  *	the boilerplate guard at every exit edge of
  *	`update_step`.
  *
+ * Why / How:
+ *	Centralizes the one-line `Th8_Free` so `update_step`'s many
+ *	terminal edges can free the accumulator with a single call; the
+ *	NULL guard makes it safe to call unconditionally.
+ *
  * Parameters:
  *	interp -- live interpreter (for `Th8_Free`).
  *	p      -- state pointer, or NULL.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
- *	Frees the state allocation.
+ *	Frees the state allocation.  No-op when `p` is NULL.
  *
  *----------------------------------------------------------------------
  */
@@ -48961,6 +54023,13 @@ static int update_step(Th8_Interp *interp, void *pData[], int rc);
  *	On every terminating edge the helper frees the
  *	`UpdateState` accumulator via `update_state_free`.
  *
+ * Why / How:
+ *	Draining one event per trampoline tick (rather than a C `while`
+ *	loop) keeps the NRE chain shape coherent, so a `[yield]` inside
+ *	an event callback saves the suspended chain at a clean boundary
+ *	and a later resume continues the drain.  It re-arms itself with
+ *	`Th8_NRAddCallback` until the limit is hit or the queue drains.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	pData  -- NRE data array; `pData[0]` is the
@@ -48968,7 +54037,7 @@ static int update_step(Th8_Interp *interp, void *pData[], int rc);
  *	rc     -- return code from the previous callback in
  *		the NRE chain.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on continuation (re-armed), terminal `TH8_OK`
  *	on completion (drain finished or limit hit), or the
  *	propagated error from `rc` / `Th8_Ready` /
@@ -49056,6 +54125,14 @@ update_step(Th8_Interp *interp, void *pData[], int rc)
  *	(coroutine-resume safety and `[yield]` boundary
  *	preservation).
  *
+ * Why / How:
+ *	Validates arguments and preconditions synchronously, then hands
+ *	the actual draining to `update_step` on the NRE chain so this
+ *	command's C stack frame unwinds before any event callback runs;
+ *	that indirection is what makes a `[yield]` inside a callback
+ *	safe.  The `UpdateState` accumulator carries the limit and
+ *	processed count across ticks and is owned by the NRE chain.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -49064,7 +54141,7 @@ update_step(Th8_Interp *interp, void *pData[], int rc)
  *		argv[2]=N (decimal positive integer).
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` once the NRE drain is enqueued.  `TH8_ERROR`
  *	on bad arguments, missing event queue, cancellation
  *	already pending, or allocation failure (interpreter
@@ -49209,15 +54286,22 @@ typedef struct VWaitState {
  *	`zCap`).  NULL-safe so callers do not need a guard
  *	at every exit edge of `vwait_step`.
  *
+ * Why / How:
+ *	`vwait_step` has many terminal edges (cancel, change, timeout,
+ *	error); centralizing the frees of the two owned strings plus the
+ *	struct here, behind a NULL guard, keeps each of those edges a
+ *	single call.
+ *
  * Parameters:
  *	interp -- live interpreter (for `Th8_Free`).
  *	p      -- state pointer, or NULL.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
- *	Frees `p->zVar`, `p->zCap`, and `p` itself.
+ *	Frees `p->zVar`, `p->zCap`, and `p` itself.  No-op when `p` is
+ *	NULL.
  *
  *----------------------------------------------------------------------
  */
@@ -49268,6 +54352,15 @@ static int vwait_step(Th8_Interp *interp, void *pData[], int rc);
  *
  *	Gated on `TH8_ENABLE_VARIABLES`.
  *
+ * Why / How:
+ *	Polls the watched variable one slice at a time instead of
+ *	blocking: each tick drains at most one event or sleeps a bounded
+ *	`TH8_VWAIT_SLICE_MS` before re-arming, so a pending cancel or a
+ *	timeout is noticed within one slice and a `[yield]` in an event
+ *	callback can suspend the whole NRE chain cleanly.  Cached
+ *	platform callbacks are used so a mid-wait platform swap cannot
+ *	strand the wait.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	pData  -- NRE data array; `pData[0]` is the
@@ -49275,7 +54368,7 @@ static int vwait_step(Th8_Interp *interp, void *pData[], int rc);
  *	rc     -- return code from the previous callback in
  *		the NRE chain.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on continuation (re-armed) or on
  *	successful variable-change (interpreter result
  *	cleared).
@@ -49445,6 +54538,14 @@ vwait_step(Th8_Interp *interp, void *pData[], int rc)
  *
  *	Gated on `TH8_ENABLE_VARIABLES`.
  *
+ * Why / How:
+ *	Does all setup that cannot run under a coroutine resume
+ *	(callback caching, name copy, initial-value snapshot, deadline
+ *	computation) up front, then delegates the slice-by-slice wait to
+ *	`vwait_step` on the NRE chain so this frame unwinds before any
+ *	event callback runs.  The captured monotonic deadline keeps the
+ *	timeout immune to wall-clock adjustments.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -49455,7 +54556,7 @@ vwait_step(Th8_Interp *interp, void *pData[], int rc)
  *		argv[3]=varName (-timeout form).
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` once the NRE wait is enqueued.  `TH8_ERROR`
  *	on bad arguments, missing event queue, missing
  *	platform callback, allocation failure, or
@@ -49626,13 +54727,21 @@ static Th8_CommandEntry th8EventsCommands[] = {
  *
  *	NULL `pnCommand` is always an error.
  *
+ * Why / How:
+ *	Implements the two-call reporter protocol shared by every TH8
+ *	plugin: the loader first calls with a NULL buffer to learn the
+ *	count, then again with a buffer of that size to receive the
+ *	entries.  This keeps buffer sizing on the caller and lets the
+ *	`vwait` slot compile out under `TH8_ENABLE_VARIABLES` without the
+ *	loader needing to know.
+ *
  * Parameters:
  *	pCommand  -- caller-supplied output buffer or NULL to
  *		query the count only.
  *	pnCommand -- in/out count; receives the table size on
  *		query, must be >= table size on copy.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` on missing
  *	`pnCommand` or insufficient `*pnCommand`.
  *
@@ -50115,6 +55224,13 @@ unload_command(
  *	Used to pick an arbitrary version from the ifneeded sub-hash
  *	when no specific version is requested.
  *
+ * Why / How:
+ *	Stores the current entry through the context pointer and
+ *	immediately returns TH8_BREAK, so the shared hash-iterate
+ *	machinery halts after visiting exactly one entry -- a
+ *	convenient "grab any element" primitive without exposing the
+ *	hash's internal bucket layout to the caller.
+ *
  * Results:
  *	TH8_BREAK (stop iteration after the first entry).
  *
@@ -50141,6 +55257,13 @@ th8LangFirstEntry(Th8_HashEntry *pEntry, void *pCtx)
  *
  *	Hash iteration callback that appends each entry's key to a
  *	list.  Used by [package names] and [package versions].
+ *
+ * Why / How:
+ *	Unpacks the interpreter, list pointer, and length pointer
+ *	from the three-slot context array, then appends the current
+ *	entry's key as a properly quoted list element via
+ *	Th8_ListAppend and returns TH8_OK to keep iterating -- so one
+ *	full sweep collects every key into the caller's growing list.
  *
  * Results:
  *	TH8_OK (continue iteration).
@@ -50315,6 +55438,13 @@ package_provide_command(
     }
     pEntry = Th8_HashFind(
         interp, Th8_GetPackageHash(interp), argv[2], TH8_LEN(argl[2]), 1);
+    if (!pEntry) {
+	/* create=1 hash insert can fail on OOM (Th8_HashFind returns NULL);
+	 * dereferencing pEntry->pData without this check crashed under a
+	 * transient allocation failure (Bug 85). */
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	return TH8_ERROR;
+    }
     pPkg = (Th8_PkgInfo *)pEntry->pData;
     if (!pPkg) {
 	pPkg = (Th8_PkgInfo *)TH8_ALLOC(interp, sizeof(Th8_PkgInfo));
@@ -50325,8 +55455,16 @@ package_provide_command(
 	pEntry->pData = (void *)pPkg;
     }
     if (argc == 4) {
+	/* Strdup FIRST, then swap: a transient OOM (Bug 85) must not free the
+	 * old version and then leave zVersion NULL -- and must fail the
+	 * command rather than silently record a versionless package. */
+	char *zVer = Th8_Strdup(interp, argv[3], argl[3]);
+	if (!zVer) {
+	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	    return TH8_ERROR;
+	}
 	Th8_Free(interp, pPkg->zVersion);
-	pPkg->zVersion = Th8_Strdup(interp, argv[3], argl[3]);
+	pPkg->zVersion = zVer;
 	pPkg->nVersion = TH8_LEN(argl[3]);
     }
     if (pPkg->zVersion) {
@@ -50681,6 +55819,13 @@ package_ifneeded_command(
     }
     pEntry = Th8_HashFind(
         interp, Th8_GetPackageHash(interp), argv[2], TH8_LEN(argl[2]), 1);
+    if (!pEntry) {
+	/* create=1 hash insert can fail on OOM (Th8_HashFind returns NULL);
+	 * dereferencing pEntry->pData without this check crashed under a
+	 * transient allocation failure (Bug 85). */
+	Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	return TH8_ERROR;
+    }
     pPkg = (Th8_PkgInfo *)pEntry->pData;
     if (!pPkg) {
 	pPkg = (Th8_PkgInfo *)TH8_ALLOC(interp, sizeof(Th8_PkgInfo));
@@ -50703,11 +55848,24 @@ package_ifneeded_command(
 	 */
 
 	Th8_HashEntry *pVer;
+	char *zScript;
 
 	pVer = Th8_HashFind(
 	    interp, pPkg->paIfNeeded, argv[3], TH8_LEN(argl[3]), 1);
+	if (!pVer) {
+	    /* create=1 hash insert can fail on OOM (Bug 85). */
+	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	    return TH8_ERROR;
+	}
+	/* Strdup FIRST, then swap, so a transient OOM neither frees the old
+	 * script into a dangling pData nor records a NULL ifneeded script. */
+	zScript = Th8_Strdup(interp, argv[4], argl[4]);
+	if (!zScript) {
+	    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+	    return TH8_ERROR;
+	}
 	Th8_Free(interp, pVer->pData);
-	pVer->pData = (void *)Th8_Strdup(interp, argv[4], argl[4]);
+	pVer->pData = (void *)zScript;
 	Th8_ClearResult(interp);
     } else {
 	/*
@@ -50910,8 +56068,8 @@ static int
 th8VersionParse(
     const char *z,
     size_t n,
-    int *aVer,   /* OUT: version components. */
-    int nMax)   /* Max components to parse. */
+    int *aVer, /* OUT: version components. */
+    int nMax) /* Max components to parse. */
 {
     int nVer = 0;
     size_t i = 0;
@@ -51136,15 +56294,15 @@ package_versions_command(
 /*
  *----------------------------------------------------------------------
  *
- * package_command --
+ * th8PackageSub --
  *
- *	Implements the Tcl [package] command.  Dispatcher for
- *	[package] sub-commands.
+ *	Catalogue of `package` sub-commands, installed into the `package`
+ *	ensemble command's per-interpreter sub-command hash at registration
+ *	(TH8K-025).
  *
  * Why / How:
- *	Uses Th8_CallSubCommand with a static sub-command table.
- *	Exports th8_package_aSub so that [info commands] can
- *	enumerate the available package sub-commands.
+ *	Published as th8_package_aSub so [info subcommands] can enumerate the
+ *	available package sub-commands.
  *
  * Results:
  *	Return code from the sub-command.
@@ -51169,45 +56327,6 @@ static const Th8_SubCommand th8PackageSub[] =
      {0, "vsatisfies", package_vsatisfies_command},
      {0, 0, 0}};
 
-/*
- *----------------------------------------------------------------------
- *
- * package_command --
- *
- *	Implements the script-visible `[package ...]` ensemble
- *	(`forget`, `ifneeded`, `names`, `present`, `provide`,
- *	`require`, `unknown`, `vcompare`, `versions`,
- *	`vsatisfies`).  Thin dispatcher into `th8PackageSub`
- *	via `Th8_CallSubCommand`; unknown / ambiguous
- *	subcommands fall through to its diagnostics.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand's return code, or `TH8_ERROR`
- *	with a diagnostic if the subcommand name is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-package_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8PackageSub);
-}
-
 
 /*
  *----------------------------------------------------------------------
@@ -51219,7 +56338,7 @@ package_command(
 
 static Th8_CommandEntry th8ExtensibilityCommands[] = {
     {1, 0, "load", load_command},
-    {1, 0, "package", package_command},
+    {1, 0, "package", 0}, /* pure ensemble (TH8K-025) */
     {1, 0, "unload", unload_command},
 };
 
@@ -51397,6 +56516,11 @@ file_dirname_command(
      */
 
     while (n > 1 && th8IsPathSep(z[n - 1])) {
+	if ((n & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	n--;
     }
 
@@ -51406,6 +56530,11 @@ file_dirname_command(
 
     i = n;
     while (i > 0 && !th8IsPathSep(z[i - 1])) {
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	i--;
     }
 
@@ -51428,6 +56557,11 @@ file_dirname_command(
 	 */
 
 	while (i > 1 && th8IsPathSep(z[i - 1])) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    return TH8_ERROR;
+		}
+	    }
 	    i--;
 	}
 	Th8_SetResult(interp, z, i);
@@ -51506,6 +56640,12 @@ file_join_command(
 
 	if (i < argc - 1) {
 	    while (n > 1 && th8IsPathSep(z[n - 1])) {
+		if ((n & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			Th8_Free(interp, zResult);
+			return TH8_ERROR;
+		    }
+		}
 		n--;
 	    }
 	}
@@ -51597,6 +56737,12 @@ file_split_command(
 	rc = Th8_ListAppend(interp, &zResult, &nResult, "/", 1);
 	if (rc != TH8_OK) goto done;
 	while (i < n && th8IsPathSep(z[i])) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    rc = TH8_ERROR;
+		    goto done;
+		}
+	    }
 	    i++;
 	}
     }
@@ -51606,9 +56752,21 @@ file_split_command(
      */
 
     while (i < n) {
-	size_t start = i;
+	size_t start;
+
+	if (Th8_Ready(interp) != TH8_OK) {
+	    rc = TH8_ERROR;
+	    goto done;
+	}
+	start = i;
 
 	while (i < n && !th8IsPathSep(z[i])) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    rc = TH8_ERROR;
+		    goto done;
+		}
+	    }
 	    i++;
 	}
 
@@ -51619,6 +56777,12 @@ file_split_command(
 	}
 
 	while (i < n && th8IsPathSep(z[i])) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    rc = TH8_ERROR;
+		    goto done;
+		}
+	    }
 	    i++;
 	}
     }
@@ -51741,6 +56905,11 @@ file_tail_command(
      */
 
     while (n > 1 && th8IsPathSep(z[n - 1])) {
+	if ((n & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	n--;
     }
 
@@ -51750,6 +56919,11 @@ file_tail_command(
 
     i = n;
     while (i > 0 && !th8IsPathSep(z[i - 1])) {
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	i--;
     }
 
@@ -52490,6 +57664,11 @@ file_extension_command(
 
     lastSep = 0;
     for (i = 0; i < n; i++) {
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	if (th8IsPathSep(z[i])) {
 	    lastSep = i + 1;
 	}
@@ -52501,6 +57680,11 @@ file_extension_command(
 
     lastDot = n;  /* sentinel: no dot found */
     for (i = lastSep; i < n; i++) {
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	if (z[i] == '.') {
 	    lastDot = i;
 	}
@@ -52577,6 +57761,12 @@ file_nativename_command(
 	 */
 
 	for (i = 0; i < n; i++) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, zCopy);
+		    return TH8_ERROR;
+		}
+	    }
 	    if (zCopy[i] == '/') {
 		zCopy[i] = '\\';
 	    }
@@ -52587,6 +57777,12 @@ file_nativename_command(
 	 */
 
 	for (i = 0; i < n; i++) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, zCopy);
+		    return TH8_ERROR;
+		}
+	    }
 	    if (zCopy[i] == '\\') {
 		zCopy[i] = '/';
 	    }
@@ -52746,6 +57942,11 @@ file_rootname_command(
 
     lastSep = 0;
     for (i = 0; i < n; i++) {
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	if (th8IsPathSep(z[i])) {
 	    lastSep = i + 1;
 	}
@@ -52757,6 +57958,11 @@ file_rootname_command(
 
     lastDot = n;  /* sentinel: no dot found */
     for (i = lastSep; i < n; i++) {
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
 	if (z[i] == '.') {
 	    lastDot = i;
 	}
@@ -52953,6 +58159,11 @@ file_separator_command(
 	size_t i;
 
 	for (i = 0; i < n; i++) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    return TH8_ERROR;
+		}
+	    }
 	    if (z[i] == '/') {
 		Th8_SetResultStatic(interp, "/", 1);
 		return TH8_OK;
@@ -52972,14 +58183,13 @@ file_separator_command(
 /*
  *----------------------------------------------------------------------
  *
- * file_command --
+ * th8FileSub --
  *
- *	Implements the Tcl [file] command.  Dispatcher for [file]
- *	sub-commands.
+ *	Catalogue of `file` sub-commands, installed into the `file` ensemble
+ *	command's per-interpreter sub-command hash at registration (TH8K-025).
  *
  * Why / How:
- *	Uses Th8_CallSubCommand with a static sub-command table
- *	covering path manipulation (dirname, join, split, tail,
+ *	Covers path manipulation (dirname, join, split, tail,
  *	extension, rootname, normalize, nativename, pathtype),
  *	existence checks (exists, type), identity (same, under),
  *	validation (validname), channels (channels, tempname),
@@ -53015,51 +58225,6 @@ static const Th8_SubCommand th8FileSub[] =
      {0, "under", file_under_command},
      {0, "validname", file_validname_command},
      {0, 0, 0}};
-
-/*
- *----------------------------------------------------------------------
- *
- * file_command --
- *
- *	Implements the script-visible `[file ...]` ensemble
- *	(`atime`, `attributes`, `copy`, `delete`, `dirname`,
- *	`executable`, `exists`, `extension`, `isdirectory`,
- *	`isfile`, `join`, `link`, `lstat`, `mkdir`, `mtime`,
- *	`nativename`, `normalize`, `owned`, `pathtype`,
- *	`readable`, `readlink`, `rename`, `rootname`, `size`,
- *	`split`, `stat`, `tail`, `tempfile`, `tempdir`,
- *	`type`, `under`, `validname`, ...).  Thin dispatcher
- *	into `th8FileSub` via `Th8_CallSubCommand`.
- *
- *	Diagnostics for unknown / ambiguous subcommands are
- *	emitted by `Th8_CallSubCommand`.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand's return code, or `TH8_ERROR`
- *	with a diagnostic if the subcommand name is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-file_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8FileSub);
-}
 
 
 /*
@@ -53277,7 +58442,7 @@ source_command(
 
 static Th8_CommandEntry th8FilesystemsCommands[] = {
     {1, 0, "cd", cd_command},
-    {1, 0, "file", file_command},
+    {1, 0, "file", 0}, /* pure ensemble (TH8K-025) */
     {1, 0, "pwd", pwd_command},
     {1, 0, "source", source_command},
 };
@@ -53413,6 +58578,10 @@ format_command(
     nFmt = TH8_LEN(argl[1]);
 
     for (i = 0; i < nFmt; i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    return TH8_ERROR;
+	}
 	if (zFmt[i] != '%') {
 	    TH8_STR_APPEND(interp, &zOut, &nOut, &zFmt[i], 1);
 	    continue;
@@ -54261,45 +59430,280 @@ oom:
 /*
  *----------------------------------------------------------------------
  *
+ * th8ScanFormatUnsigned --
+ *
+ *	Format an unsigned 64-bit value as a decimal string.
+ *
+ * Why / How:
+ *	Renders the unsigned interpretation of a scanned value for the
+ *	64-bit-unsigned scan conversions (%lu and 64-bit %u variants),
+ *	which Th8_SetResultWideInt (signed) cannot express.  Digits are
+ *	generated least-significant first, then reversed into the
+ *	caller's buffer, which must hold at least 20 digits.
+ *
+ * Results:
+ *	The number of digits written (never zero: 0 renders as "0").
+ *
+ * Side effects:
+ *	Writes into zBuf.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8ScanFormatUnsigned(char *zBuf, th8_uint64_t v)
+{
+    char tmp[24];
+    int n = 0;
+    int i;
+
+    if (v == 0) {
+	zBuf[0] = '0';
+	return 1;
+    }
+    while (v > 0) {
+	tmp[n++] = (char)('0' + (int)(v % 10));
+	v /= 10;
+    }
+    for (i = 0; i < n; i++) {
+	zBuf[i] = tmp[n - 1 - i];
+    }
+    return n;
+}
+
+
+/* scan integer size modifiers (h/l/L run) -> stored integer type. */
+#  define SCAN_MOD_NONE 0 /* (default)  -> 32-bit int */
+#  define SCAN_MOD_HH   1 /* hh         -> 8-bit int  */
+#  define SCAN_MOD_H    2 /* h          -> 16-bit int */
+#  define SCAN_MOD_L    3 /* l or L     -> 64-bit int */
+#  define SCAN_MOD_LL   4 /* ll         -> BigInt     */
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8ScanDigitOk --
+ *
+ *	Test whether a character is a valid digit in the given radix.
+ *
+ * Why / How:
+ *	Branches on the four bases `scan` supports so digit validation
+ *	during a `%x`/`%o`/`%b`/`%d` conversion stops at the first
+ *	out-of-radix character; hex defers to `th8IsHexDig` so both
+ *	letter cases are accepted.  Any base other than 2, 8, or 16 is
+ *	treated as decimal.
+ *
+ * Results:
+ *	Non-zero if c is a digit of base (2, 8, 10, or 16); 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8ScanDigitOk(char c, int base)
+{
+    if (base == 16) return th8IsHexDig(c);
+    if (base == 2) return (c == '0' || c == '1');
+    if (base == 8) return (c >= '0' && c <= '7');
+    return (c >= '0' && c <= '9');
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8ScanCountSpecs --
+ *
+ *	Count the non-suppressed conversion specifiers in a scan format.
+ *
+ * Why / How:
+ *	In list mode `scan` returns one element per non-suppressed
+ *	conversion specifier, padding trailing unmatched specifiers with
+ *	empty strings.  A `%` beginning `%%` is a literal; a `%`
+ *	immediately followed by `*` is suppressed and produces no list
+ *	element.  Every other `%` is a value-producing specifier.
+ *
+ * Results:
+ *	The number of value-producing (non-suppressed) specifiers.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8ScanCountSpecs(const char *zFmt, size_t nFmt)
+{
+    size_t i;
+    int n = 0;
+
+    for (i = 0; i + 1 < nFmt; i++) {
+	if (zFmt[i] != '%') continue;
+	if (zFmt[i + 1] == '%') {
+	    i++; /* literal %% */
+	    continue;
+	}
+	if (zFmt[i + 1] != '*') n++;
+    }
+    return n;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8ScanStoreInt --
+ *
+ *	Convert a scanned integer digit run to the type selected by the
+ *	conversion's size modifier and set it as the interpreter result.
+ *
+ * Why / How:
+ *	TH8's scan uses the ACTUAL C type associated with each specifier:
+ *	the digits are accumulated modulo 2^64, negated if signed, then
+ *	truncated to the modifier's width (hh=8, h=16, default=32, l/L=64
+ *	bits), sign-extended for signed conversions or zero-extended for
+ *	unsigned ones.  The `ll` modifier stores an arbitrary-precision
+ *	BigInt instead (th8ScanBignum); an unsigned BigInt scan of a
+ *	negative value is an error, matching the impossibility of an
+ *	unbounded unsigned magnitude.  Digits are assumed pre-validated
+ *	for `base` by the caller.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set; TH8_ERROR on an
+ *	unsigned-BigInt scan of a negative value or an over-long BigInt.
+ *
+ * Side effects:
+ *	Sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8ScanStoreInt(
+    Th8_Interp *interp,
+    const char *zDig,
+    size_t nDig,
+    int base,
+    int bNeg,
+    int bUnsigned,
+    int sizeMod)
+{
+    th8_uint64_t acc = 0;
+    th8_uint64_t mask;
+    th8_uint64_t low;
+    size_t k;
+    int width;
+
+    if (sizeMod == SCAN_MOD_LL) {
+#  if defined(TH8_ENABLE_BIGINT)
+	char buf[600];
+	size_t p = 0;
+	const char *zPfx = (base == 16) ? "0x"
+	                 : (base == 8)  ? "0o"
+	                 : (base == 2)  ? "0b"
+	                                : "";
+	size_t nPfx = Th8_Strlen(interp, zPfx);
+
+	if (bUnsigned && bNeg) {
+	    Th8_SetResultStatic(
+	        interp, "scan: unsigned bignum scans are invalid", TH8_NOLEN);
+	    return TH8_ERROR;
+	}
+	if (nDig + nPfx + 2 >= sizeof(buf)) {
+	    Th8_SetResultStatic(
+	        interp, "scan: integer too long for conversion", TH8_NOLEN);
+	    return TH8_ERROR;
+	}
+	if (bNeg) buf[p++] = '-';
+	Th8_Memcpy(interp, &buf[p], zPfx, nPfx);
+	p += nPfx;
+	Th8_Memcpy(interp, &buf[p], zDig, nDig);
+	p += nDig;
+	return th8ScanBignum(interp, buf, p);
+#  else
+	width = 64; /* No BigInt support: fall back to 64-bit. */
+#  endif
+    } else {
+	width = (sizeMod == SCAN_MOD_HH) ? 8
+	      : (sizeMod == SCAN_MOD_H)  ? 16
+	      : (sizeMod == SCAN_MOD_L)  ? 64
+	                                 : 32;
+    }
+
+    for (k = 0; k < nDig; k++) {
+	char c = zDig[k];
+	int d;
+
+	if (c >= '0' && c <= '9') {
+	    d = c - '0';
+	} else if (c >= 'a' && c <= 'f') {
+	    d = c - 'a' + 10;
+	} else {
+	    d = c - 'A' + 10;
+	}
+	acc = acc * (th8_uint64_t)base + (th8_uint64_t)d; /* modular */
+    }
+    if (bNeg) acc = (th8_uint64_t)0 - acc; /* two's-complement negate */
+
+    mask = (width == 64) ? ~(th8_uint64_t)0
+                         : (((th8_uint64_t)1 << width) - 1);
+    low = acc & mask;
+    if (!bUnsigned && width < 64 && ((low >> (width - 1)) & 1)) {
+	low |= ~mask; /* sign-extend */
+    }
+
+    if (bUnsigned && width == 64) {
+	char ubuf[24];
+	int nu = th8ScanFormatUnsigned(ubuf, low);
+
+	Th8_SetResult(interp, ubuf, (size_t)nu);
+    } else {
+	Th8_SetResultWideInt(interp, (th8_int64_t)low);
+    }
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * scan_command --
  *
- *	Parse a string according to a format (inverse of format).
+ *	Parse an input string under the control of a format string,
+ *	extracting values (the inverse of [format]).
  *
  *	scan STRING FORMAT ?VARNAME ...?
  *
- *	Simplified implementation supporting %d/%i, %o, %x, %s, %c,
- *	%f, and %n.  Width specifiers are parsed but not enforced.
- *
- *	Two modes of operation:
- *	  - Variable mode (argc > 3): each converted value is stored
- *	    in the corresponding VARNAME; the result is the count
- *	    of successful conversions.
- *	  - List mode (argc == 3): converted values are collected
- *	    into a list which becomes the result.
- *
- *	The parsing loop walks the format string (iFmt) and input
- *	string (iStr) in lockstep:
- *	  - Non-'%' format characters must match literally.
- *	  - %% matches a literal '%'.
- *	  - Each specifier consumes characters from the input,
- *	    converts them, and stores/collects the result.
- *	  - Parsing stops on the first mismatch or conversion failure.
- *
- *	NOTE: This is a simplified implementation.  Width limits on
- *	specifiers, character classes ([...]), and the * suppression
- *	flag are not yet supported.
- *
  * Why / How:
- *	Implements the Tcl [scan] command (the inverse of [format]).
- *	Operates in two modes: variable mode stores each converted
- *	value in a named variable and returns the count of successful
- *	conversions; list mode collects all converted values into a
- *	Tcl list.  The format and input strings are walked in lockstep
- *	with literal characters requiring an exact match and specifiers
- *	consuming and converting input characters.
+ *	A scanf engine tracking the Tcl 8.6 specifier set with TH8's own
+ *	type rules.  Each specifier is %[*][width][size]CONV:
+ *	  d u i o x X b   -- integers.  The size modifier selects the
+ *	                     stored C type: hh=8, h=16, (none)=32, l/L=64
+ *	                     bits, ll=BigInt; signed conversions (d, i)
+ *	                     sign-extend, the rest zero-extend.
+ *	  e E f g G       -- floating point: (none)=double, h=float; any
+ *	                     other size modifier is an error.
+ *	  c               -- one character as its code point
+ *	  s               -- run of non-whitespace characters
+ *	  [set] [^set]    -- run of characters in / not in a set
+ *	  n               -- count of characters consumed so far
+ *	  %%              -- a literal '%'
+ *	`*` suppresses assignment; a width bounds the field.  A blank/tab
+ *	in the format matches any run of input whitespace; every
+ *	conversion except c, [ and n skips leading whitespace.  In
+ *	variable mode the result is the count of assignments (or -1 if
+ *	end-of-input is reached before any conversion); in list mode (no
+ *	VARNAMEs) it is a list with one element per non-suppressed
+ *	specifier, trailing unmatched specifiers padded with empties.
  *
  * Results:
- *	TH8_OK on success; TH8_ERROR on overflow or if variables are
+ *	TH8_OK on success; TH8_ERROR on a bad size modifier, an
+ *	unsigned-BigInt scan of a negative value, or if variables are
  *	requested but TH8_ENABLE_VARIABLES is not compiled in.
  *
  * Side effects:
@@ -54323,12 +59727,18 @@ scan_command(
     size_t iStr = 0;
     size_t iFmt = 0;
 #  if defined(TH8_ENABLE_VARIABLES)
-    int iVar = 3; /* Next variable argument */
+    int iVar = 3; /* Next variable argument. */
 #  endif
-    int nConv = 0; /* Conversions performed */
-    char *zList = 0; /* For no-variable mode */
+    int nAssign = 0; /* Assignments / list elements produced. */
+    int nConvTotal = 0; /* Conversions including suppressed ones. */
+    int bEof = 0; /* EOF reached before any conversion -> -1 / empty. */
+    int nSpecs; /* Non-suppressed specifiers (list-mode padding). */
+    int bConvAttempted = 0; /* A conversion specifier was reached. */
+    char *zList = 0; /* For inline (no-variable) mode. */
     size_t nList = 0;
     int bVarMode;
+
+    (void)ctx;
 
     if (argc < 3) {
 	return Th8_WrongNumArgs(interp, "scan string format ?varname ...?");
@@ -54338,6 +59748,7 @@ scan_command(
     zFmt = argv[2];
     nFmt = TH8_LEN(argl[2]);
     bVarMode = (argc > 3);
+    nSpecs = th8ScanCountSpecs(zFmt, nFmt);
 
 #  if !defined(TH8_ENABLE_VARIABLES)
     if (bVarMode) {
@@ -54347,170 +59758,246 @@ scan_command(
     }
 #  endif
 
-    /* Loop invariant: every iStr advance inside the body is
-     * guarded by `iStr < nStr` (literal-match branch L849, and
-     * each conversion handler's internal bound check), so iStr
-     * never exceeds nStr.  The `iStr <= nStr` upper-bound here
-     * is a belt-and-braces defensive check, never F at entry. */
-    while (iFmt < nFmt && ALWAYS(iStr <= nStr)) {
-	if (zFmt[iFmt] != '%') {
-	    /*
-	     * Literal character must match.
-	     */
+    while (iFmt < nFmt) {
+	char cf;
+	int bSuppress;
+	int width;
+	int bHaveWidth;
+	int sizeMod;
+	char conv;
+	size_t maxEnd;
+	int converted;
 
-	    if (iStr >= nStr || zStr[iStr] != zFmt[iFmt]) {
-		break;
-	    }
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zList);
+	    return TH8_ERROR;
+	}
+	cf = zFmt[iFmt];
+
+	/* A blank or tab matches any run (including zero) of input ws. */
+	if (th8IsSpace(cf)) {
+	    iFmt++;
+	    while (iStr < nStr && th8IsSpace(zStr[iStr]))
+		iStr++;
+	    continue;
+	}
+
+	/* Any other non-'%' character must match the input literally. */
+	if (cf != '%') {
+	    if (iStr >= nStr || zStr[iStr] != cf) break;
 	    iStr++;
 	    iFmt++;
 	    continue;
 	}
-	iFmt++; /* skip '%' */
+
+	iFmt++; /* Skip '%'. */
 	if (iFmt >= nFmt) break;
 	if (zFmt[iFmt] == '%') {
-	    /* Literal %% */
 	    if (iStr >= nStr || zStr[iStr] != '%') break;
 	    iStr++;
 	    iFmt++;
 	    continue;
 	}
 
-	/*
-	 * Skip optional width (not used in simplified impl).
-	 */
+	/* [*] assignment-suppression flag. */
+	bSuppress = 0;
+	if (zFmt[iFmt] == '*') {
+	    bSuppress = 1;
+	    iFmt++;
+	    if (iFmt >= nFmt) break;
+	}
 
+	/* [width] maximum field width. */
+	width = 0;
+	bHaveWidth = 0;
 	while (iFmt < nFmt && zFmt[iFmt] >= '0' && zFmt[iFmt] <= '9') {
+	    bHaveWidth = 1;
+	    width = width * 10 + (zFmt[iFmt] - '0');
 	    iFmt++;
 	}
 	if (iFmt >= nFmt) break;
 
-	switch (zFmt[iFmt]) {
+	/* [size] modifier (hh, h, l, ll, L). */
+	sizeMod = SCAN_MOD_NONE;
+	if (zFmt[iFmt] == 'h') {
+	    iFmt++;
+	    if (iFmt < nFmt && zFmt[iFmt] == 'h') {
+		iFmt++;
+		sizeMod = SCAN_MOD_HH;
+	    } else {
+		sizeMod = SCAN_MOD_H;
+	    }
+	} else if (zFmt[iFmt] == 'l') {
+	    iFmt++;
+	    if (iFmt < nFmt && zFmt[iFmt] == 'l') {
+		iFmt++;
+		sizeMod = SCAN_MOD_LL;
+	    } else {
+		sizeMod = SCAN_MOD_L;
+	    }
+	} else if (zFmt[iFmt] == 'L') {
+	    iFmt++;
+	    sizeMod = SCAN_MOD_L;
+	}
+	if (iFmt >= nFmt) break;
+
+	conv = zFmt[iFmt];
+
+	/* Every conversion except %c, %[, and %n skips leading whitespace. */
+	if (conv != 'c' && conv != '[' && conv != 'n') {
+	    while (iStr < nStr && th8IsSpace(zStr[iStr]))
+		iStr++;
+	}
+
+	/* EOF before a value-producing conversion, nothing converted -> -1. */
+	if (conv != 'n' && iStr >= nStr) {
+	    if (nConvTotal == 0) bEof = 1;
+	    break;
+	}
+
+	/* The field width bounds the input region this conversion reads. */
+	maxEnd = nStr;
+	if (bHaveWidth && width > 0 && iStr + (size_t)width < maxEnd) {
+	    maxEnd = iStr + (size_t)width;
+	}
+
+	converted = 0;
+	bConvAttempted = 1;
+
+	switch (conv) {
 	case 'd':
-	case 'i': {
+	case 'i':
+	case 'u': {
 	    /*
-	     * Decimal integer.
+	     * Decimal (d/u) or base-detected (i) integer.
 	     */
 
-	    size_t start = iStr;
-	    th8_int64_t val;
+	    size_t save = iStr;
+	    size_t dstart;
+	    int base = 10;
+	    int bNeg = 0;
+	    int bUnsigned = (conv == 'u');
 
-	    if (iStr < nStr && (zStr[iStr] == '-' || zStr[iStr] == '+')) {
+	    if (iStr < maxEnd && (zStr[iStr] == '-' || zStr[iStr] == '+')) {
+		bNeg = (zStr[iStr] == '-');
 		iStr++;
 	    }
-	    while (iStr < nStr && zStr[iStr] >= '0' && zStr[iStr] <= '9') {
-		iStr++;
-	    }
-	    if (iStr == start) goto scan_done;
-	    if (Th8_ToWideInt(0, &zStr[start], iStr - start, &val) !=
-	        TH8_OK) {
-		goto scan_done;
-	    }
-	    Th8_SetResultWideInt(interp, val);
-	    break;
-	}
-	case 'o': {
-	    size_t start = iStr;
-	    th8_int64_t val = 0;
-
-	    while (iStr < nStr && zStr[iStr] >= '0' && zStr[iStr] <= '7') {
-		if (val > (TH8_INT64_MAX >> 3)) {
-		    Th8_SetResultStatic(
-		        interp, "integer value too large", TH8_NOLEN);
-		    return TH8_ERROR;
+	    if (conv == 'i') {
+		if (iStr + 1 < maxEnd && zStr[iStr] == '0' &&
+		    (zStr[iStr + 1] == 'x' || zStr[iStr + 1] == 'X')) {
+		    base = 16;
+		    iStr += 2;
+		} else if (iStr < maxEnd && zStr[iStr] == '0') {
+		    base = 8;
 		}
-		val = (val << 3) | (zStr[iStr] - '0');
-		iStr++;
 	    }
-	    if (iStr == start) goto scan_done;
-	    Th8_SetResultWideInt(interp, val);
+	    dstart = iStr;
+	    while (iStr < maxEnd && th8ScanDigitOk(zStr[iStr], base))
+		iStr++;
+	    if (iStr == dstart) {
+		iStr = save;
+		break;
+	    }
+	    if (th8ScanStoreInt(
+	            interp, &zStr[dstart], iStr - dstart, base, bNeg,
+	            bUnsigned, sizeMod) != TH8_OK) {
+		Th8_Free(interp, zList);
+		return TH8_ERROR;
+	    }
+	    converted = 1;
 	    break;
 	}
-	case 'x': {
-	    size_t start;
-	    th8_int64_t val = 0;
-
+	case 'o':
+	case 'x':
+	case 'X':
+	case 'b': {
 	    /*
-	     * Skip optional 0x or 0X prefix.
+	     * Octal / hexadecimal / binary (unsigned), with optional 0x /
+	     * 0b prefix for x/X and b.
 	     */
 
-	    if (iStr + 1 < nStr && zStr[iStr] == '0' &&
+	    size_t save = iStr;
+	    size_t dstart;
+	    int base = (conv == 'o') ? 8 : (conv == 'b') ? 2 : 16;
+
+	    if (base == 16 && iStr + 1 < maxEnd && zStr[iStr] == '0' &&
 	        (zStr[iStr + 1] == 'x' || zStr[iStr + 1] == 'X')) {
 		iStr += 2;
+	    } else if (
+	        base == 2 && iStr + 1 < maxEnd && zStr[iStr] == '0' &&
+	        (zStr[iStr + 1] == 'b' || zStr[iStr + 1] == 'B')) {
+		iStr += 2;
 	    }
-	    start = iStr;
-	    while (iStr < nStr && th8IsHexDig(zStr[iStr])) {
-		int d;
-
-		if (ALWAYS(zStr[iStr] >= '0') && zStr[iStr] <= '9') {
-		    d = zStr[iStr] - '0';
-		} else if (zStr[iStr] >= 'a') {
-		    d = zStr[iStr] - 'a' + 10;
-		} else {
-		    d = zStr[iStr] - 'A' + 10;
-		}
-		if (val > (TH8_INT64_MAX >> 4)) {
-		    Th8_SetResultStatic(
-		        interp, "integer value too large", TH8_NOLEN);
-		    return TH8_ERROR;
-		}
-		val = (val << 4) | d;
+	    dstart = iStr;
+	    while (iStr < maxEnd && th8ScanDigitOk(zStr[iStr], base))
 		iStr++;
+	    if (iStr == dstart) {
+		iStr = save;
+		break;
 	    }
-	    if (iStr == start) goto scan_done;
-	    Th8_SetResultWideInt(interp, val);
+	    if (th8ScanStoreInt(
+	            interp, &zStr[dstart], iStr - dstart, base, 0, 1,
+	            sizeMod) != TH8_OK) {
+		Th8_Free(interp, zList);
+		return TH8_ERROR;
+	    }
+	    converted = 1;
 	    break;
 	}
 	case 'c': {
 	    /*
-	     * Single character -> code point value.
+	     * A single character (no ws skip, no width): its code point.
 	     */
 
 	    int nByte;
-	    int cp;
+	    int cp = Th8_Utf8Decode(&zStr[iStr], nStr - iStr, &nByte);
 
-	    if (iStr >= nStr) goto scan_done;
-	    cp = Th8_Utf8Decode(&zStr[iStr], nStr - iStr, &nByte);
 	    iStr += (size_t)nByte;
 	    Th8_SetResultInt(interp, cp);
+	    converted = 1;
 	    break;
 	}
 	case 's': {
 	    /*
-	     * Non-whitespace string.
+	     * A run of non-whitespace characters (bounded by the width).
 	     */
 
 	    size_t start = iStr;
 
-	    while (iStr < nStr && !th8IsSpace(zStr[iStr])) {
+	    while (iStr < maxEnd && !th8IsSpace(zStr[iStr]))
 		iStr++;
-	    }
+	    if (iStr == start) break;
 	    Th8_SetResult(interp, &zStr[start], iStr - start);
+	    converted = 1;
 	    break;
 	}
-	case 'f': {
+	case 'e':
+	case 'E':
+	case 'f':
+	case 'g':
+	case 'G': {
 	    /*
-	     * Floating-point number.
+	     * Floating point.  The stored type follows the size modifier:
+	     * (none) -> double, h -> float; any other modifier is an error.
 	     */
 
 	    size_t start = iStr;
 	    double rVal;
 	    int bSawExp = 0;
 
-	    if (iStr < nStr && (zStr[iStr] == '-' || zStr[iStr] == '+')) {
+	    if (sizeMod != SCAN_MOD_NONE && sizeMod != SCAN_MOD_H) {
+		Th8_SetResultStatic(
+		    interp,
+		    "scan: unsupported size modifier for floating-point "
+		    "conversion",
+		    TH8_NOLEN);
+		Th8_Free(interp, zList);
+		return TH8_ERROR;
+	    }
+	    if (iStr < maxEnd && (zStr[iStr] == '-' || zStr[iStr] == '+')) {
 		iStr++;
 	    }
-	    /* Bug 8 fix: the previous one-pass char-class
-	     * accepted only digits, '.', 'e', 'E' -- it did
-	     * NOT accept a '+'/'-' sign immediately after
-	     * 'e'/'E', so e.g. "1e-3" stopped at "1e" and
-	     * Th8_ToDouble rejected the truncated token,
-	     * making the scan silently return 0 conversions.
-	     * Restructured as a small state machine that:
-	     *   - consumes digits and '.' freely
-	     *   - accepts at most one 'e' / 'E'
-	     *   - accepts at most one sign byte immediately
-	     *     after the e/E that started the exponent. */
-	    while (iStr < nStr) {
+	    while (iStr < maxEnd) {
 		char c = zStr[iStr];
 
 		if ((c >= '0' && c <= '9') || c == '.') {
@@ -54520,7 +60007,7 @@ scan_command(
 		if ((c == 'e' || c == 'E') && !bSawExp) {
 		    bSawExp = 1;
 		    iStr++;
-		    if (iStr < nStr &&
+		    if (iStr < maxEnd &&
 		        (zStr[iStr] == '+' || zStr[iStr] == '-')) {
 			iStr++;
 		    }
@@ -54528,32 +60015,100 @@ scan_command(
 		}
 		break;
 	    }
-	    if (iStr == start) goto scan_done;
+	    if (iStr == start) break;
 	    if (Th8_ToDouble(0, &zStr[start], iStr - start, &rVal) !=
 	        TH8_OK) {
-		goto scan_done;
+		iStr = start;
+		break;
+	    }
+	    if (sizeMod == SCAN_MOD_H) {
+		rVal = (double)(float)rVal; /* narrow to single precision */
 	    }
 	    Th8_SetResultDouble(interp, rVal);
+	    converted = 1;
 	    break;
 	}
 	case 'n': {
 	    /*
-	     * Number of characters consumed so far.
+	     * Store the number of characters consumed so far (no input).
 	     */
 
 	    Th8_SetResultInt(interp, Th8_Utf8Len(zStr, iStr));
+	    converted = 1;
+	    break;
+	}
+	case '[': {
+	    /*
+	     * Character-set scan (honoring a leading '^' negation, a ']'
+	     * first member, and 'a-b' ranges).
+	     */
+
+	    unsigned char inSet[256];
+	    int bNeg = 0;
+	    size_t start;
+	    size_t bodyStart;
+	    size_t k;
+
+	    for (k = 0; k < 256; k++)
+		inSet[k] = 0;
+
+	    iFmt++; /* Past '['. */
+	    if (iFmt < nFmt && zFmt[iFmt] == '^') {
+		bNeg = 1;
+		iFmt++;
+	    }
+	    bodyStart = iFmt;
+	    if (iFmt < nFmt && zFmt[iFmt] == ']') {
+		inSet[(unsigned char)']'] = 1;
+		iFmt++;
+	    }
+	    while (iFmt < nFmt && zFmt[iFmt] != ']') {
+		if (zFmt[iFmt] == '-' && iFmt > bodyStart &&
+		    iFmt + 1 < nFmt && zFmt[iFmt + 1] != ']') {
+		    unsigned char lo = (unsigned char)zFmt[iFmt - 1];
+		    unsigned char hi = (unsigned char)zFmt[iFmt + 1];
+		    int c;
+
+		    if (lo <= hi) {
+			for (c = lo; c <= hi; c++)
+			    inSet[c] = 1;
+		    } else {
+			inSet[hi] = 1;
+			inSet[(unsigned char)'-'] = 1;
+		    }
+		    iFmt += 2;
+		    continue;
+		}
+		inSet[(unsigned char)zFmt[iFmt]] = 1;
+		iFmt++;
+	    }
+	    if (iFmt >= nFmt) {
+		goto scan_done; /* Unterminated set. */
+	    }
+
+	    start = iStr;
+	    while (iStr < maxEnd) {
+		unsigned char uc = (unsigned char)zStr[iStr];
+
+		if (bNeg ? inSet[uc] : !inSet[uc]) break;
+		iStr++;
+	    }
+	    if (iStr == start) break;
+	    Th8_SetResult(interp, &zStr[start], iStr - start);
+	    converted = 1;
 	    break;
 	}
 	default:
-	    goto scan_done;
+	    goto scan_done; /* Unknown conversion character. */
 	}
-	iFmt++;
 
-	/*
-	 * Store or collect the converted value.
-	 */
+	if (!converted) {
+	    break; /* Matching failure: stop scanning. */
+	}
 
-	{
+	iFmt++; /* Consume the conversion character (or the set's ']'). */
+
+	if (!bSuppress) {
 	    size_t nRes;
 	    const char *zRes = Th8_GetResult(interp, &nRes);
 
@@ -54568,14 +60123,27 @@ scan_command(
 	    } else {
 		Th8_ListAppend(interp, &zList, &nList, zRes, nRes);
 	    }
+	    nAssign++;
 	}
-	nConv++;
+	nConvTotal++;
     }
 
 scan_done:
     if (bVarMode) {
-	Th8_SetResultInt(interp, nConv);
+	Th8_SetResultInt(interp, bEof ? -1 : nAssign);
     } else {
+	/*
+	 * List mode: pad to one element per non-suppressed specifier with
+	 * empty strings, unless end-of-input was hit before any conversion
+	 * (then the result is the empty list).
+	 */
+
+	if (bConvAttempted && !bEof) {
+	    while (nAssign < nSpecs) {
+		Th8_ListAppend(interp, &zList, &nList, "", 0);
+		nAssign++;
+	    }
+	}
 	Th8_SetResult(interp, zList, nList);
 	Th8_Free(interp, zList);
     }
@@ -54992,6 +60560,14 @@ oom:
  *	`th8ResolveNsPattern`, which also splits the
  *	namespace prefix from the tail glob.
  *
+ * Why / How:
+ *	Splits into two paths so namespace scoping matches Tcl: a
+ *	qualified pattern iterates only the named namespace's command
+ *	hash (prefixing results with the namespace path), while a bare
+ *	pattern gathers the current + global namespaces and glob-filters
+ *	the flat list.  Delegating the split to `th8ResolveNsPattern`
+ *	keeps the two callers of that convention consistent.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -55000,7 +60576,7 @@ oom:
  *		argv[2]=optional pattern.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with the list as the interpreter result;
  *	`TH8_ERROR` on argument-count or allocation failure
  *	(interpreter result: diagnostic).
@@ -55895,12 +61471,19 @@ info_plugins_command(
  *	     wraps `readlink("/proc/self/exe")` on Linux,
  *	     `_NSGetExecutablePath` on macOS,
  *	     `GetModuleFileNameW` on Win32, etc.).
- *	  3. Fall back to the empty string when neither
+ *	  3. Fail with `"no executable name?"` when neither
  *	     source is available.
  *
  *	Priority 1 lets embedders force a specific identity
  *	(useful for self-tests and tools that wrap the
  *	interpreter); priority 2 covers the common case.
+ *
+ * Why / How:
+ *	The variable-override tier exists so a host can pin the
+ *	executable identity (for self-tests or wrapper tools) without a
+ *	platform call, and it takes precedence precisely so it can shadow
+ *	whatever `xGetExePath` would report.  The platform callback is
+ *	consulted only when no override is set.
  *
  * Parameters:
  *	interp -- live interpreter.
@@ -55909,9 +61492,10 @@ info_plugins_command(
  *	argv   -- argv[0]=`"info"`; argv[1]=`"nameofexecutable"`.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with the path as the interpreter result;
- *	`TH8_ERROR` only on wrong argument count.
+ *	`TH8_ERROR` on wrong argument count or when no override and no
+ *	platform path are available (result: `"no executable name?"`).
  *
  * Side effects:
  *	Sets the interpreter result; may allocate and free a
@@ -56069,8 +61653,18 @@ info_patchlevel_command(
  *	Return a list of breakpoint descriptions.  Each breakpoint
  *	produces three elements: ID, scriptName, lineNumber.
  *
+ * Why / How:
+ *	Delegates to `Th8_ListAppendBreakpoints`, which walks the
+ *	interpreter's breakpoint table and appends each entry as a
+ *	three-element triple, so the debugger's breakpoint state is
+ *	exposed to scripts as a flat, easily-iterated Tcl list.
+ *
  * Results:
  *	TH8_OK.  Result is a flat list of {id name line} triples.
+ *
+ * Side effects:
+ *	Sets the interpreter result; allocates and frees a temporary
+ *	list-building buffer.
  *
  *----------------------------------------------------------------------
  */
@@ -56112,8 +61706,18 @@ info_breakpoints_command(
  *	in the current namespace, optionally filtered by a glob
  *	pattern.
  *
+ * Why / How:
+ *	Delegates to `Th8_ListAppendExpansions`, forwarding the optional
+ *	glob pattern (argv[2]) so the append helper does the namespace
+ *	scoping and filtering; this command only validates arity and
+ *	publishes the result.
+ *
  * Results:
  *	TH8_OK.  Result is a list of tag names.
+ *
+ * Side effects:
+ *	Sets the interpreter result; allocates and frees a temporary
+ *	list-building buffer.
  *
  *----------------------------------------------------------------------
  */
@@ -56388,6 +61992,63 @@ info_context_command(
 
 
 /*
+ * Context for th8InfoSubCallback: builds the (optionally glob-filtered)
+ * sub-command name list in registration order.
+ */
+
+typedef struct {
+    Th8_Interp *interp;
+    const char *zPat; /* Glob pattern, or NULL for "all". */
+    size_t nPat;
+    char **pzList; /* Output list. */
+    size_t *pnList;
+    int rc; /* Set to TH8_ERROR if an append failed. */
+} th8InfoSubCtx;
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8InfoSubCallback --
+ *
+ *	Th8_HashIterateOrdered callback: append one sub-command name (the hash
+ *	key) to the [info subcommands] result, glob-filtered, in registration
+ *	order.
+ *
+ * Why / How:
+ *	The sub-command hash is keyed by name, so the entry key IS the name;
+ *	the Th8_SubCmd payload is not needed here.  Matches Tcl's ensemble
+ *	introspection: only names passing the optional glob are listed.
+ *
+ * Results:
+ *	TH8_OK to continue; TH8_ERROR to stop early on an allocation failure.
+ *
+ * Side effects:
+ *	Appends to the caller's list; may set the context's rc.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8InfoSubCallback(Th8_HashEntry *pEntry, void *pVoid)
+{
+    th8InfoSubCtx *p = (th8InfoSubCtx *)pVoid;
+
+    if (!pEntry->pData) return TH8_OK; /* skip an empty slot defensively */
+    if (p->zPat && !Th8_GlobMatch(
+                       p->interp, p->zPat, TH8_LEN(p->nPat), pEntry->zKey,
+                       pEntry->nKey)) {
+	return TH8_OK;
+    }
+    if (Th8_ListAppend(
+            p->interp, p->pzList, p->pnList, pEntry->zKey, pEntry->nKey) !=
+        TH8_OK) {
+	p->rc = TH8_ERROR;
+	return TH8_ERROR;
+    }
+    return TH8_OK;
+}
+
+/*
  *----------------------------------------------------------------------
  *
  * info_subcommands_command --
@@ -56395,16 +62056,18 @@ info_context_command(
  *	info subcommands COMMAND ?PATTERN?
  *
  * Why / How:
- *	Implements [info subcommands].  Matches the COMMAND name to
- *	its known subcommand table (info, file, string, namespace,
- *	package, array) and returns a list of subcommand names,
- *	optionally filtered by a glob pattern.  The subcommand
- *	tables are stored in global pointers (th8_info_aSub, etc.)
- *	that are populated when the ensemble dispatchers run.
+ *	Implements [info subcommands].  Resolves COMMAND and enumerates its
+ *	per-interpreter sub-command hash (th8CommandSubCommands) in registration
+ *	order, optionally filtered by a glob PATTERN.  Because this is the SAME
+ *	hash the evaluator dispatches from, the listing always matches behavior:
+ *	a dynamically added, replaced, or subsetted-out sub-command is reflected
+ *	here identically -- there is no static catalogue to drift.  Works for
+ *	every ensemble (including embedder-created ones), so no per-ensemble
+ *	special-casing is needed.
  *
  * Results:
- *	TH8_OK with a list of subcommand names, or TH8_ERROR if
- *	COMMAND is not a recognized ensemble.
+ *	TH8_OK with a list of subcommand names, or TH8_ERROR if COMMAND is
+ *	unknown or is not an ensemble.
  *
  * Side effects:
  *	None.
@@ -56420,81 +62083,36 @@ info_subcommands_command(
     const char **argv,  /* Argument values. */
     size_t *argl)  /* Argument lengths. */
 {
-    const Th8_SubCommand *pSub = 0;
+    Th8_Hash *pSubs;
+    th8InfoSubCtx c;
     char *zList = 0;
     size_t nList = 0;
-    const char *zPat = 0;
-    size_t nPat = 0;
-    int i;
 
     (void)ctx;
 
     if (argc != 3 && argc != 4) {
 	return Th8_WrongNumArgs(interp, "info subcommands command ?pattern?");
     }
-    if (argc == 4) {
-	zPat = argv[3];
-	nPat = argl[3];
-    }
 
-    /*
-     * Match the command name to its subcommand table.
-     */
-
-    if (th8StrEq(interp, argv[2], argl[2], "info")) {
-	pSub = th8_info_aSub;
-    }
-#  if defined(TH8_PLUGIN_FILE_SYSTEMS)
-    else if (th8StrEq(interp, argv[2], argl[2], "file")) {
-	pSub = th8_file_aSub;
-    }
-#  endif
-#  if defined(TH8_PLUGIN_STRINGS)
-    else if (th8StrEq(interp, argv[2], argl[2], "string")) {
-	pSub = th8_string_aSub;
-    }
-#  endif
-#  if defined(TH8_PLUGIN_MANAGEMENT)
-    else if (th8StrEq(interp, argv[2], argl[2], "namespace")) {
-	pSub = th8_namespace_aSub;
-    }
-#  endif
-#  if defined(TH8_PLUGIN_EXTENSIBILITY)
-    else if (th8StrEq(interp, argv[2], argl[2], "package")) {
-	pSub = th8_package_aSub;
-    }
-#  endif
-#  if defined(TH8_PLUGIN_VARIABLES)
-    else if (th8StrEq(interp, argv[2], argl[2], "array")) {
-	pSub = th8_array_aSub;
-    }
-#  endif
-#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
-    else if (th8StrEq(interp, argv[2], argl[2], "flags")) {
-	/* Bug 35: th8_flags_aSub is owned by the harpy plugin
-	 * which is gated on TH8_ENABLE_CRYPTOGRAPHY; without
-	 * cryptography the [info subcommands flags] form is
-	 * not supported. */
-	pSub = th8_flags_aSub;
-    }
-#  endif
-
-    if (!pSub) {
+    pSubs = th8CommandSubCommands(interp, argv[2], TH8_LEN(argl[2]));
+    if (!pSubs) {
 	Th8_ErrorMessage(
 	    interp, "not an ensemble command: \"", argv[2], argl[2]);
 	return TH8_ERROR;
     }
 
-    for (i = 0; pSub[i].zName; i++) {
-	if (zPat) {
-	    if (!Th8_GlobMatch(
-	            interp, zPat, TH8_LEN(nPat), pSub[i].zName,
-	            Th8_Strlen(interp, pSub[i].zName))) {
-		continue;
-	    }
-	}
-	Th8_ListAppend(interp, &zList, &nList, pSub[i].zName, TH8_NOLEN);
+    c.interp = interp;
+    c.zPat = (argc == 4) ? argv[3] : 0;
+    c.nPat = (argc == 4) ? argl[3] : 0;
+    c.pzList = &zList;
+    c.pnList = &nList;
+    c.rc = TH8_OK;
+    (void)Th8_HashIterateOrdered(interp, pSubs, th8InfoSubCallback, &c);
+    if (c.rc != TH8_OK) {
+	Th8_Free(interp, zList);
+	return TH8_ERROR;
     }
+
     if (zList) {
 	Th8_SetResult(interp, zList, nList);
 	Th8_Free(interp, zList);
@@ -56508,16 +62126,15 @@ info_subcommands_command(
 /*
  *----------------------------------------------------------------------
  *
- * info_command --
+ * th8InfoSub --
  *
- *	Dispatcher for info sub-commands.
+ *	Catalogue of `info` sub-commands, installed into the `info` ensemble
+ *	command's per-interpreter sub-command hash at registration (TH8K-025).
  *
  * Why / How:
- *	Implements the Tcl [info] command ensemble.  Builds a static
- *	subcommand table (conditionally compiled based on enabled
- *	features) and delegates to Th8_CallSubCommand.  Also stores
- *	the table pointer in the th8_info_aSub global for
- *	[info subcommands] support.
+ *	Conditionally compiled based on enabled features.  Published as
+ *	th8_info_aSub so [info subcommands] can enumerate the available info
+ *	sub-commands.
  *
  * Results:
  *	Return code from the sub-command.
@@ -56571,53 +62188,6 @@ static const Th8_SubCommand th8InfoSub[] = {
 #  endif
     {0, 0, 0}};
 
-/*
- *----------------------------------------------------------------------
- *
- * info_command --
- *
- *	Implements the script-visible `[info ...]` ensemble.
- *	Pure thin wrapper that hands the dispatch off to
- *	`Th8_CallSubCommand` against `th8InfoSub`, the
- *	feature-gated table covering `args`, `body`,
- *	`breakpoints`, `cmdcount`, `commands`, `complete`,
- *	`context`, `default`, `exists`, `expansions`,
- *	`functions`, `globals`, `level`, `library`, `loaded`,
- *	`nameofexecutable`, `patchlevel`, `plugins`, and
- *	(when their respective features are enabled) several
- *	others.
- *
- *	Diagnostics for unknown / ambiguous subcommands are
- *	emitted by `Th8_CallSubCommand`.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand handler's return code, or
- *	`TH8_ERROR` with a diagnostic if the subcommand name
- *	is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-info_command(
-    Th8_Interp *interp, /* Interpreter. */
-    void *ctx,   /* Not used. */
-    int argc,   /* Number of arguments. */
-    const char **argv,  /* Argument values. */
-    size_t *argl)  /* Argument lengths. */
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8InfoSub);
-}
-
 
 /*
  *----------------------------------------------------------------------
@@ -56667,7 +62237,7 @@ pid_command(
  */
 
 static Th8_CommandEntry th8IntrospectionCommands[] = {
-    {1, 0, "info", info_command},
+    {1, 0, "info", 0}, /* pure ensemble (TH8K-025) */
     {1, 0, "pid", pid_command},
 };
 
@@ -57472,6 +63042,9 @@ read_command(
 	if (pChan) {
 	    while (th8ChannelRead(interp, pChan, &zLine, &nLine) == TH8_OK &&
 	           ALWAYS(zLine)) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    goto oom;
+		}
 		TH8_STR_APPEND(interp, &zAll, &nAll, zLine, nLine);
 		TH8_STR_APPEND(interp, &zAll, &nAll, "\n", 1);
 		Th8_Free(interp, zLine);
@@ -57735,6 +63308,7 @@ join_command(
     if (rc != TH8_OK) return rc;
 
     for (i = 0; i < nCount; i++) {
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
 	if (i > 0) {
 	    TH8_STR_APPEND(interp, &zOut, &nOut, zSep, nSep);
 	}
@@ -57993,6 +63567,11 @@ lindex_command(
 	    int j;
 
 	    for (j = 0; j < nIdx; j++) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, azIdx);
+		    Th8_Free(interp, zCopy);
+		    return TH8_ERROR;
+		}
 		rc = Th8_SplitList(
 		    interp, zList, nList, &azElem, &anElem, &nCount,
 		    TH8_LIST_NONE);
@@ -58310,8 +63889,121 @@ lrange_command(
     if (iLast >= nCount) iLast = nCount - 1;
 
     for (i = iFirst; i <= iLast && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
     }
+    Th8_SetResult(interp, zOut, nOut);
+    Th8_Free(interp, zOut);
+    Th8_Free(interp, azElem);
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * linsert_command --
+ *
+ *	Insert elements into a list before a given index.
+ *
+ *	linsert LIST INDEX ?ELEMENT ...?
+ *
+ * Why / How:
+ *	Implements the Tcl [linsert] command.  Splits the list, then
+ *	builds a new list from three parts: the elements before INDEX,
+ *	the new ELEMENT arguments, and the elements at and after INDEX.
+ *	INDEX uses one-past-the-end semantics -- `end` inserts AFTER the
+ *	last element (append), unlike lindex/lrange where `end` is the
+ *	last element -- so th8ParseIndex is given nCount+1, resolving
+ *	`end` -> nCount and `end-N` -> nCount-N; the result is clamped to
+ *	[0, nCount].
+ *
+ * Results:
+ *	TH8_OK.  Result is the new list with the elements inserted.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+linsert_command(
+    Th8_Interp *interp,
+    void *ctx,
+    int argc,
+    const char **argv,
+    size_t *argl)
+{
+    char **azElem = 0;
+    size_t *anElem = 0;
+    int nCount;
+    int iIndex;
+    char *zOut = 0;
+    size_t nOut = 0;
+    int i;
+    int rc;
+
+    (void)ctx;
+
+    if (argc < 3) {
+	return Th8_WrongNumArgs(interp, "linsert list index ?element ...?");
+    }
+    rc = Th8_SplitList(
+        interp, argv[1], argl[1], &azElem, &anElem, &nCount, TH8_LIST_NONE);
+    if (rc != TH8_OK) return rc;
+
+    /*
+     * `end` must resolve to the append position (nCount), so parse against
+     * nCount+1; numeric indices are unaffected, then clamped below.
+     */
+
+    if (th8ParseIndex(interp, argv[2], argl[2], nCount + 1, &iIndex) !=
+        TH8_OK) {
+	Th8_Free(interp, azElem);
+	return TH8_ERROR;
+    }
+    if (iIndex < 0) iIndex = 0;
+    if (iIndex > nCount) iIndex = nCount;
+
+    /*
+     * Elements before the insertion point.
+     */
+
+    for (i = 0; i < iIndex && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
+	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
+    }
+
+    /*
+     * Inserted elements (from argv[3] onward).
+     */
+
+    for (i = 3; i < argc; i++) {
+	Th8_ListAppend(interp, &zOut, &nOut, argv[i], argl[i]);
+    }
+
+    /*
+     * Elements at and after the insertion point.
+     */
+
+    for (i = iIndex; i < nCount && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
+	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
+    }
+
     Th8_SetResult(interp, zOut, nOut);
     Th8_Free(interp, zOut);
     Th8_Free(interp, azElem);
@@ -58394,6 +64086,11 @@ lreplace_command(
      */
 
     for (i = 0; i < iFirst && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
     }
 
@@ -58410,6 +64107,11 @@ lreplace_command(
      */
 
     for (i = iLast + 1; i < nCount && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
     }
 
@@ -58635,7 +64337,8 @@ lsearch_command(
 		    }
 		}
 
-		if (bDecreasing) cmp = -cmp;
+		if (bDecreasing)
+		    cmp = (cmp < 0) - (cmp > 0); /* sign flip; INT_MIN-safe */
 
 		if (cmp == 0) {
 		    found = mid;
@@ -58744,14 +64447,478 @@ lsearch_command(
 }
 
 
+/* TH8_SORT_*, Th8_SortCtx -- declared at top of file. */
+
 /*
- * Sort mode constants and context structure.  The context struct
- * is defined for potential future use with a qsort_r-like interface;
- * the current implementation uses inline comparison within the
- * insertion sort loop instead.
+ *----------------------------------------------------------------------
+ *
+ * th8DictCompare --
+ *
+ *	Dictionary-mode comparison of two strings: case-insensitive,
+ *	with embedded runs of decimal digits compared by numeric
+ *	magnitude rather than lexically.  Used by th8LsortCompare for
+ *	[lsort -dictionary].
+ *
+ * Why / How:
+ *	Digit runs are compared WITHOUT accumulating into a
+ *	fixed-width integer (the previous `num = num*10 + digit`
+ *	overflowed the signed `int` for ordinary long digit strings,
+ *	silently producing wrong orderings, TH8K-017).  Instead each
+ *	run's significant length is found (leading zeros skipped); the
+ *	run with more significant digits is the larger number, and
+ *	equal-length runs are compared lexically.  Non-digit bytes are
+ *	folded to lower case and compared by value.  The scan polls
+ *	`Th8_Ready` periodically so a single comparison of two very
+ *	long strings remains cancellable (TH8K-017, TH8K-009).
+ *
+ * Results:
+ *	The comparison sign (<0, 0, >0).  On a cancellation/readiness
+ *	failure it stops early, writes TH8_ERROR through *pRc, and
+ *	returns 0; otherwise *pRc is TH8_OK.
+ *
+ * Side effects:
+ *	None (readiness check may set the interpreter result).
+ *
+ *----------------------------------------------------------------------
  */
 
-/* TH8_SORT_*, Th8_SortCtx -- declared at top of file. */
+static int
+th8DictCompare(
+    Th8_Interp *interp,
+    const char *zA,
+    size_t nA,
+    const char *zB,
+    size_t nB,
+    int *pRc)
+{
+    size_t ia = 0, ib = 0;
+    int cmp = 0;
+
+    *pRc = TH8_OK;
+    while (ia < nA && ib < nB) {
+	unsigned char ca = (unsigned char)zA[ia];
+	unsigned char cb = (unsigned char)zB[ib];
+	int aIsDigit = (ca >= '0' && ca <= '9');
+	int bIsDigit = (cb >= '0' && cb <= '9');
+
+	/* Bound cancellation latency across a long comparison. */
+	if ((ia & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		*pRc = TH8_ERROR;
+		return 0;
+	    }
+	}
+
+	if (aIsDigit && bIsDigit) {
+	    size_t ea = ia, eb = ib, fa, fb, la, lb;
+
+	    /* Find the end of each decimal run (pollable). */
+	    while (ea < nA && zA[ea] >= '0' && zA[ea] <= '9') {
+		if ((ea & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			*pRc = TH8_ERROR;
+			return 0;
+		    }
+		}
+		ea++;
+	    }
+	    while (eb < nB && zB[eb] >= '0' && zB[eb] <= '9') {
+		if ((eb & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			*pRc = TH8_ERROR;
+			return 0;
+		    }
+		}
+		eb++;
+	    }
+
+	    /* Skip leading zeros to get each run's significant length. */
+	    fa = ia;
+	    while (fa < ea && zA[fa] == '0')
+		fa++;
+	    fb = ib;
+	    while (fb < eb && zB[fb] == '0')
+		fb++;
+	    la = ea - fa;
+	    lb = eb - fb;
+
+	    if (la != lb) {
+		cmp = (la < lb) ? -1 : 1;
+	    } else {
+		while (fa < ea && zA[fa] == zB[fb]) {
+		    fa++;
+		    fb++;
+		}
+		if (fa < ea) {
+		    cmp = ((unsigned char)zA[fa] < (unsigned char)zB[fb]) ? -1
+		                                                          : 1;
+		}
+	    }
+	    ia = ea;
+	    ib = eb;
+	} else {
+	    if (ca >= 'A' && ca <= 'Z') ca += ('a' - 'A');
+	    if (cb >= 'A' && cb <= 'Z') cb += ('a' - 'A');
+	    cmp = (ca > cb) - (ca < cb);
+	    ia++;
+	    ib++;
+	}
+	if (cmp != 0) return cmp;
+    }
+
+    /* Common prefix equal: the shorter string sorts first. */
+    return (nA < nB) ? -1 : (nA > nB);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8LsortField --
+ *
+ *	Resolve the comparison field for one list element: the element
+ *	itself, or (when -index N was given) its Nth sub-element.
+ *
+ * Why / How:
+ *	When pCtx->iIndex >= 0 the element is parsed as a sub-list via
+ *	Th8_SplitList and the Nth item selected (an out-of-range index
+ *	yields the empty string, matching the prior behaviour).  The
+ *	Th8_SplitList return code is honoured -- a malformed sub-list
+ *	is a hard error, no longer silently ignored (TH8K-017).  On
+ *	success *pazFree receives the sub-list block (or NULL) that the
+ *	caller MUST free after it is done reading *pzField, whose bytes
+ *	point into that block.
+ *
+ * Results:
+ *	TH8_OK with the field, its length, and the free-block out
+ *	parameters set, or TH8_ERROR (with the interpreter result set)
+ *	if the sub-list could not be split.
+ *
+ * Side effects:
+ *	Allocates the sub-list block on the -index path (freed by the
+ *	caller via *pazFree).
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8LsortField(
+    const Th8_SortCtx *pCtx,
+    const char *zElem,
+    size_t nElem,
+    const char **pzField,
+    size_t *pnField,
+    char ***pazFree)
+{
+    Th8_Interp *interp = pCtx->interp;
+    char **azSub = 0;
+    size_t *anSub = 0;
+    int nSub = 0;
+
+    *pazFree = 0;
+    if (pCtx->iIndex < 0) {
+	*pzField = zElem;
+	*pnField = TH8_LEN(nElem);
+	return TH8_OK;
+    }
+    if (Th8_SplitList(
+            interp, zElem, TH8_LEN(nElem), &azSub, &anSub, &nSub,
+            TH8_LIST_NONE) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    *pazFree = azSub;
+    /* ALWAYS: an in-range index (iIndex < nSub) implies nSub >= 1, so
+     * Th8_SplitList returned a non-NULL block -- the guard is defensive
+     * and never false when reached, so wrap it to keep the always-true
+     * arm out of the MC/DC denominator. */
+    if (pCtx->iIndex < nSub && ALWAYS(azSub)) {
+	*pzField = azSub[pCtx->iIndex];
+	*pnField = TH8_LEN(anSub[pCtx->iIndex]);
+    } else {
+	*pzField = "";
+	*pnField = 0;
+    }
+    return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8LsortCompare --
+ *
+ *	Compare two whole list elements per an [lsort] sort context,
+ *	writing the (direction-adjusted) comparison sign to *pCmp.
+ *
+ * Why / How:
+ *	Resolves each element's comparison field via th8LsortField
+ *	(honouring -index), then compares by the selected mode
+ *	(-ascii, -integer, -real, -dictionary, or -command).  All
+ *	sub-list blocks allocated for -index are freed on EVERY exit
+ *	path, including the conversion- and evaluation-error paths that
+ *	previously leaked them (TH8K-017).  The -decreasing sign flip
+ *	uses `(cmp<0)-(cmp>0)`, which is safe even when a -command
+ *	comparator returns INT_MIN (plain negation would overflow,
+ *	TH8K-017).
+ *
+ * Results:
+ *	TH8_OK with *pCmp set, or TH8_ERROR (interpreter result set) on
+ *	a bad integer/real element, a failed -command evaluation, a
+ *	non-integer comparator result, a malformed -index sub-list, or
+ *	a cancellation during a -dictionary scan.
+ *
+ * Side effects:
+ *	In -command mode evaluates the comparator script (which may
+ *	have arbitrary side effects).
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8LsortCompare(
+    const Th8_SortCtx *pCtx,
+    const char *zElemA,
+    size_t nElemA,
+    const char *zElemB,
+    size_t nElemB,
+    int *pCmp)
+{
+    Th8_Interp *interp = pCtx->interp;
+    const char *zA, *zB;
+    size_t nA, nB;
+    char **azFreeA = 0, **azFreeB = 0;
+    int cmp = 0;
+    int rc = TH8_OK;
+
+    if (th8LsortField(pCtx, zElemA, nElemA, &zA, &nA, &azFreeA) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (th8LsortField(pCtx, zElemB, nElemB, &zB, &nB, &azFreeB) != TH8_OK) {
+	Th8_Free(interp, azFreeA);
+	return TH8_ERROR;
+    }
+
+    if (pCtx->eMode == TH8_SORT_INTEGER) {
+	int va, vb;
+
+	if (Th8_ToInt(interp, zA, nA, &va) != TH8_OK ||
+	    Th8_ToInt(interp, zB, nB, &vb) != TH8_OK) {
+	    rc = TH8_ERROR;
+	} else {
+	    cmp = (va > vb) - (va < vb);
+	}
+    } else if (pCtx->eMode == TH8_SORT_REAL) {
+	double ra, rb;
+
+	if (Th8_ToDouble(interp, zA, nA, &ra) != TH8_OK ||
+	    Th8_ToDouble(interp, zB, nB, &rb) != TH8_OK) {
+	    rc = TH8_ERROR;
+	} else {
+	    cmp = (ra > rb) - (ra < rb);
+	}
+    } else if (pCtx->eMode == TH8_SORT_COMMAND) {
+	char *zEval = 0;
+	size_t nEval = 0;
+	int iResult = 0;
+
+	/*
+	 * Build "script a b" and evaluate; the result is the sign.  Each
+	 * append is checked in its own single-condition branch (an
+	 * else-if ladder) rather than one compound `||`, so the
+	 * OOM-only failure arms stay out of the MC/DC denominator.
+	 */
+	if (Th8_StringAppend(
+	        interp, &zEval, &nEval, pCtx->zCommand, pCtx->nCommand) !=
+	    TH8_OK) {
+	    rc = TH8_ERROR;
+	} else if (
+	    Th8_StringAppend(interp, &zEval, &nEval, " ", 1) != TH8_OK) {
+	    rc = TH8_ERROR;
+	} else if (Th8_ListAppend(interp, &zEval, &nEval, zA, nA) != TH8_OK) {
+	    rc = TH8_ERROR;
+	} else if (
+	    Th8_StringAppend(interp, &zEval, &nEval, " ", 1) != TH8_OK) {
+	    rc = TH8_ERROR;
+	} else if (Th8_ListAppend(interp, &zEval, &nEval, zB, nB) != TH8_OK) {
+	    rc = TH8_ERROR;
+	} else {
+	    rc = Th8_Eval(interp, 0, zEval, nEval, NULL, 0);
+	    if (rc == TH8_OK) {
+		size_t nRes;
+		const char *zRes = Th8_GetResult(interp, &nRes);
+
+		if (Th8_ToInt(interp, zRes, nRes, &iResult) != TH8_OK) {
+		    rc = TH8_ERROR;
+		} else {
+		    cmp = iResult;
+		}
+	    }
+	}
+	Th8_Free(interp, zEval);
+    } else if (pCtx->eMode == TH8_SORT_DICTIONARY) {
+	int dictRc = TH8_OK;
+
+	cmp = th8DictCompare(interp, zA, nA, zB, nB, &dictRc);
+	if (dictRc != TH8_OK) rc = TH8_ERROR;
+    } else {
+	size_t nMin = nA < nB ? nA : nB;
+
+	cmp = Th8_Memcmp(interp, zA, zB, nMin);
+	if (cmp == 0) {
+	    cmp = (nA < nB) ? -1 : (nA > nB);
+	}
+    }
+
+    Th8_Free(interp, azFreeA);
+    Th8_Free(interp, azFreeB);
+
+    if (rc == TH8_OK && pCtx->bDecreasing) {
+	cmp = (cmp < 0) - (cmp > 0); /* INT_MIN-safe sign flip */
+    }
+    *pCmp = cmp;
+    return rc;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8LsortMergeSort --
+ *
+ *	Sort parallel element/length arrays in place using a stable
+ *	bottom-up merge sort driven by th8LsortCompare.
+ *
+ * Why / How:
+ *	Replaces the previous O(n^2) insertion sort (unreasonable for
+ *	the one-million-element list ceiling, TH8K-017) with an
+ *	O(n log n) stable merge.  Stability -- required by [lsort]
+ *	(equal-key elements keep input order) -- is preserved by taking
+ *	the left run on ties (`cmp <= 0`).  A readiness check runs
+ *	before each comparison so a large sort stays cancellable, and
+ *	any comparison error (bad element, failed -command, cancelled
+ *	scan) aborts the whole sort.
+ *
+ * Results:
+ *	TH8_OK on success (arrays sorted in place), or TH8_ERROR if the
+ *	scratch arrays cannot be allocated, a comparison fails, or a
+ *	readiness check fires (interpreter result set in the latter
+ *	cases).
+ *
+ * Side effects:
+ *	Allocates and frees two scratch arrays of nCount entries.  May
+ *	evaluate -command comparator scripts.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8LsortMergeSort(const Th8_SortCtx *pCtx, char **az, size_t *an, int nCount)
+{
+    Th8_Interp *interp = pCtx->interp;
+    char **azTmp;
+    size_t *anTmp;
+    int width;
+    int rc = TH8_OK;
+
+    if (nCount < 2) return TH8_OK;
+
+    azTmp = (char **)TH8_ALLOC_MUL(interp, (size_t)nCount, sizeof(char *));
+    if (!azTmp) return TH8_ERROR;
+    anTmp = (size_t *)TH8_ALLOC_MUL(interp, (size_t)nCount, sizeof(size_t));
+    if (!anTmp) {
+	Th8_Free(interp, azTmp);
+	return TH8_ERROR;
+    }
+
+    for (width = 1; width < nCount; width *= 2) {
+	int iLeft;
+
+	for (iLeft = 0; iLeft < nCount; iLeft += 2 * width) {
+	    int iMid = iLeft + width;
+	    int iEnd = iLeft + 2 * width;
+	    int i, j, k;
+
+	    if (iMid > nCount) iMid = nCount;
+	    if (iEnd > nCount) iEnd = nCount;
+	    i = iLeft;
+	    j = iMid;
+	    k = iLeft;
+
+	    while (i < iMid && j < iEnd) {
+		int cmp = 0;
+
+		if (Th8_Ready(interp) != TH8_OK) {
+		    rc = TH8_ERROR;
+		    goto done;
+		}
+		if (th8LsortCompare(pCtx, az[i], an[i], az[j], an[j], &cmp) !=
+		    TH8_OK) {
+		    rc = TH8_ERROR;
+		    goto done;
+		}
+		if (cmp <= 0) { /* stable: take left on tie */
+		    azTmp[k] = az[i];
+		    anTmp[k] = an[i];
+		    i++;
+		} else {
+		    azTmp[k] = az[j];
+		    anTmp[k] = an[j];
+		    j++;
+		}
+		k++;
+	    }
+	    while (i < iMid) {
+		/* Poll the leftover-copy tail too (TH8K-009): the merge loop
+		 * above polls per comparison, but a run that is already ordered
+		 * drains here without any comparison.  Nested single-condition
+		 * ifs keep this out of a compound MC/DC decision; 0xFFF matches
+		 * the documented 4096-iteration maximum interval. */
+		if ((k & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			rc = TH8_ERROR;
+			goto done;
+		    }
+		}
+		azTmp[k] = az[i];
+		anTmp[k] = an[i];
+		i++;
+		k++;
+	    }
+	    while (j < iEnd) {
+		if ((k & 0xFFF) == 0) {
+		    if (Th8_Ready(interp) != TH8_OK) {
+			rc = TH8_ERROR;
+			goto done;
+		    }
+		}
+		azTmp[k] = az[j];
+		anTmp[k] = an[j];
+		j++;
+		k++;
+	    }
+	}
+
+	for (iLeft = 0; iLeft < nCount; iLeft++) {
+	    /* The copy-back is a full O(nCount) pass every width doubling --
+	     * ~1M unpolled iterations at the list ceiling without this poll
+	     * (TH8K-009). */
+	    if ((iLeft & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    rc = TH8_ERROR;
+		    goto done;
+		}
+	    }
+	    az[iLeft] = azTmp[iLeft];
+	    an[iLeft] = anTmp[iLeft];
+	}
+    }
+
+done:
+    Th8_Free(interp, azTmp);
+    Th8_Free(interp, anTmp);
+    return rc;
+}
+
 
 /*
  *----------------------------------------------------------------------
@@ -58767,16 +64934,19 @@ lsearch_command(
  *	-unique.
  *
  * Why / How:
- *	Implements the Tcl [lsort] command.  Uses a stable insertion
- *	sort (O(n^2) but correct and portable without qsort_r).
- *	Supports five comparison modes and optional sub-element
- *	indexing via -index.  -command mode evaluates a comparison
- *	script for each pair.  Calls Th8_Ready per comparison for
- *	cancellation.  -unique removes adjacent duplicates after
- *	sorting.
+ *	Implements the Tcl [lsort] command.  Parses the options into a
+ *	Th8_SortCtx, then sorts with a stable O(n log n) merge sort
+ *	(th8LsortMergeSort) whose comparator (th8LsortCompare) handles
+ *	all five comparison modes, optional -index sub-element
+ *	extraction, and the -command script evaluation.  A readiness
+ *	check runs before each comparison for cancellation.  -unique
+ *	removes adjacent duplicates after sorting.
  *
  * Results:
- *	TH8_OK.  Result is the sorted list.
+ *	TH8_OK with the sorted list as the result, or TH8_ERROR if the
+ *	list or a sub-element cannot be parsed, an element cannot be
+ *	converted for the chosen mode, a -command evaluation fails, or
+ *	the sort/result build is cancelled or runs out of memory.
  *
  * Side effects:
  *	May evaluate comparison scripts in -command mode.
@@ -58801,15 +64971,12 @@ lsort_command(
     int iArg = 1;
     char *zOut = 0;
     size_t nOut = 0;
-    int i, j;
+    int i;
     int rc;
     const char *zCommand = 0;
     size_t nCommand = 0;
     int iIndex = -1;
-    /* Function-scope so the oom label can free the -command eval
-     * accumulator, which is built inside the sort's inner loop. */
-    char *zEval = 0;
-    size_t nEval = 0;
+    Th8_SortCtx sortCtx;
 
     if (argc < 2) {
 	return Th8_WrongNumArgs(interp, "lsort ?options? list");
@@ -58867,186 +65034,25 @@ lsort_command(
     if (rc != TH8_OK) return rc;
 
     /*
-     * Insertion sort.  O(n^2) but simple, correct, stable,
-     * and doesn't require qsort (which needs a context
-     * pointer we can't portably provide in C89).
-     * For the sizes typical in an embedded interpreter,
-     * this is adequate.
+     * Stable O(n log n) merge sort (TH8K-017, replacing the former
+     * O(n^2) insertion sort).  The context carries the mode,
+     * direction, -index selector, and optional -command script; all
+     * comparison, sub-element extraction, and error/leak handling
+     * live in th8LsortCompare.
      */
 
+    sortCtx.interp = interp;
+    sortCtx.eMode = eMode;
+    sortCtx.bDecreasing = bDecreasing;
+    sortCtx.zCommand = zCommand;
+    sortCtx.nCommand = nCommand;
+    sortCtx.iIndex = iIndex;
+
     if (azElem && nCount > 1) {
-	for (i = 1; i < nCount; i++) {
-	    char *zKey = azElem[i];
-	    size_t nKey = anElem[i];
-
-	    j = i - 1;
-	    while (j >= 0) {
-		int cmp = 0;
-		const char *zA, *zB;
-		size_t nA, nB;
-		char **azSubA = 0, **azSubB = 0;
-		size_t *anSubA = 0, *anSubB = 0;
-
-		if (Th8_Ready(interp) != TH8_OK) {
-		    Th8_Free(interp, azElem);
-		    return TH8_ERROR;
-		}
-
-		zA = azElem[j];
-		nA = TH8_LEN(anElem[j]);
-		zB = zKey;
-		nB = TH8_LEN(nKey);
-
-		/*
-		 * If -index is given, extract the Nth sub-element
-		 * from each list element for comparison.
-		 */
-
-		if (iIndex >= 0) {
-		    int nSubA = 0, nSubB = 0;
-
-		    Th8_SplitList(
-		        interp, zA, nA, &azSubA, &anSubA, &nSubA,
-		        TH8_LIST_NONE);
-		    Th8_SplitList(
-		        interp, zB, nB, &azSubB, &anSubB, &nSubB,
-		        TH8_LIST_NONE);
-		    if (iIndex < nSubA && ALWAYS(azSubA)) {
-			zA = azSubA[iIndex];
-			nA = TH8_LEN(anSubA[iIndex]);
-		    } else {
-			zA = "";
-			nA = 0;
-		    }
-		    if (iIndex < nSubB && ALWAYS(azSubB)) {
-			zB = azSubB[iIndex];
-			nB = TH8_LEN(anSubB[iIndex]);
-		    } else {
-			zB = "";
-			nB = 0;
-		    }
-		}
-
-		/*
-		 * Compare zA/zB using the selected mode.
-		 */
-
-		if (eMode == TH8_SORT_INTEGER) {
-		    int va, vb;
-
-		    if (Th8_ToInt(interp, zA, nA, &va) != TH8_OK ||
-		        Th8_ToInt(interp, zB, nB, &vb) != TH8_OK) {
-			Th8_Free(interp, azElem);
-			return TH8_ERROR;
-		    }
-		    cmp = (va > vb) - (va < vb);
-		} else if (eMode == TH8_SORT_REAL) {
-		    double ra, rb;
-
-		    if (Th8_ToDouble(interp, zA, nA, &ra) != TH8_OK ||
-		        Th8_ToDouble(interp, zB, nB, &rb) != TH8_OK) {
-			Th8_Free(interp, azElem);
-			return TH8_ERROR;
-		    }
-		    cmp = (ra > rb) - (ra < rb);
-		} else if (eMode == TH8_SORT_COMMAND) {
-		    /*
-		     * -command: build "script a b", evaluate,
-		     * result is the comparison integer.
-		     */
-
-		    int iResult;
-
-		    zEval = 0;
-		    nEval = 0;
-		    TH8_STR_APPEND(
-		        interp, &zEval, &nEval, zCommand, nCommand);
-		    TH8_STR_APPEND(interp, &zEval, &nEval, " ", 1);
-		    Th8_ListAppend(interp, &zEval, &nEval, zA, nA);
-		    TH8_STR_APPEND(interp, &zEval, &nEval, " ", 1);
-		    Th8_ListAppend(interp, &zEval, &nEval, zB, nB);
-		    rc = Th8_Eval(interp, 0, zEval, nEval, NULL, 0);
-		    Th8_Free(interp, zEval);
-		    zEval = 0;
-		    if (rc != TH8_OK) {
-			Th8_Free(interp, azElem);
-			return rc;
-		    }
-		    {
-			size_t nRes;
-			const char *zRes = Th8_GetResult(interp, &nRes);
-
-			if (Th8_ToInt(interp, zRes, nRes, &iResult) !=
-			    TH8_OK) {
-			    Th8_Free(interp, azElem);
-			    return TH8_ERROR;
-			}
-		    }
-		    cmp = iResult;
-		} else if (eMode == TH8_SORT_DICTIONARY) {
-		    /*
-		     * Dictionary comparison: case-insensitive,
-		     * with embedded integers compared numerically.
-		     */
-
-		    size_t ia = 0, ib = 0;
-
-		    cmp = 0;
-		    while (ia < nA && ib < nB && cmp == 0) {
-			unsigned char ca = (unsigned char)zA[ia];
-			unsigned char cb = (unsigned char)zB[ib];
-			int aIsDigit = (ca >= '0' && ca <= '9');
-			int bIsDigit = (cb >= '0' && cb <= '9');
-
-			if (aIsDigit && bIsDigit) {
-			    /* Compare numeric runs. */
-			    int numA = 0, numB = 0;
-
-			    while (ia < nA && zA[ia] >= '0' &&
-			           zA[ia] <= '9') {
-				numA = numA * 10 + (zA[ia] - '0');
-				ia++;
-			    }
-			    while (ib < nB && zB[ib] >= '0' &&
-			           zB[ib] <= '9') {
-				numB = numB * 10 + (zB[ib] - '0');
-				ib++;
-			    }
-			    cmp = (numA > numB) - (numA < numB);
-			} else {
-			    /* Case-insensitive character compare. */
-			    if (ca >= 'A' && ca <= 'Z') ca += ('a' - 'A');
-			    if (cb >= 'A' && cb <= 'Z') cb += ('a' - 'A');
-			    cmp = (ca > cb) - (ca < cb);
-			    ia++;
-			    ib++;
-			}
-		    }
-		    if (cmp == 0) {
-			cmp = (nA < nB) ? -1 : (nA > nB);
-		    }
-		} else {
-		    /* ASCII / default: byte comparison */
-		    size_t nMin = nA < nB ? nA : nB;
-
-		    cmp = Th8_Memcmp(interp, zA, zB, nMin);
-		    if (cmp == 0) {
-			cmp = (nA < nB) ? -1 : (nA > nB);
-		    }
-		}
-
-		Th8_Free(interp, azSubA);
-		Th8_Free(interp, azSubB);
-
-		if (bDecreasing) cmp = -cmp;
-		if (cmp <= 0) break;
-
-		azElem[j + 1] = azElem[j];
-		anElem[j + 1] = anElem[j];
-		j--;
-	    }
-	    azElem[j + 1] = zKey;
-	    anElem[j + 1] = nKey;
+	rc = th8LsortMergeSort(&sortCtx, azElem, anElem, nCount);
+	if (rc != TH8_OK) {
+	    Th8_Free(interp, azElem);
+	    return rc;
 	}
     }
 
@@ -59055,6 +65061,7 @@ lsort_command(
      */
 
     for (i = 0; i < nCount && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
 	if (bUnique && i > 0) {
 	    size_t nA = TH8_LEN(anElem[i - 1]);
 	    size_t nB = TH8_LEN(anElem[i]);
@@ -59064,7 +65071,10 @@ lsort_command(
 		continue; /* skip duplicate */
 	    }
 	}
-	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
+	if (Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]) !=
+	    TH8_OK) {
+	    goto oom;
+	}
     }
     Th8_SetResult(interp, zOut, nOut);
     Th8_Free(interp, zOut);
@@ -59072,9 +65082,8 @@ lsort_command(
     return TH8_OK;
 
 oom:
-    /* A TH8_STR_APPEND growth failed (building the result or a
-     * -command eval buffer); "out of memory" already set. */
-    Th8_Free(interp, zEval);
+    /* A result-list growth (Th8_ListAppend) failed; "out of memory"
+     * already set. */
     Th8_Free(interp, zOut);
     Th8_Free(interp, azElem);
     return TH8_ERROR;
@@ -59096,10 +65105,13 @@ oom:
  *	Calls Th8_Ready per element for cancellation.
  *
  * Results:
- *	TH8_OK.  Result is a properly-formed list.
+ *	TH8_OK with a properly-formed list result on success; TH8_ERROR
+ *	on a wrong argument count, on a Th8_Ready cancel/resource-limit
+ *	trip, or on an out-of-memory while building the result list (in
+ *	which case no partial list is published).
  *
  * Side effects:
- *	None.
+ *	Sets the interpreter result (the split list, or an error message).
  *
  *----------------------------------------------------------------------
  */
@@ -59120,6 +65132,7 @@ split_command(
     size_t nList = 0;
     size_t i;
     size_t start;
+    int rc = TH8_OK;
 
     if (argc != 2 && argc != 3) {
 	return Th8_WrongNumArgs(interp, "split string ?splitchars?");
@@ -59144,9 +65157,19 @@ split_command(
 	while (i < nStr) {
 	    int nByte;
 
-	    if (Th8_Ready(interp) != TH8_OK) goto split_done;
+	    if (Th8_Ready(interp) != TH8_OK) {
+		rc =
+		    TH8_ERROR; /* propagate cancel/limit, not partial output */
+		goto split_done;
+	    }
 	    Th8_Utf8Decode(&zStr[i], nStr - i, &nByte);
-	    Th8_ListAppend(interp, &zList, &nList, &zStr[i], (size_t)nByte);
+	    if (Th8_ListAppend(
+	            interp, &zList, &nList, &zStr[i], (size_t)nByte) !=
+	        TH8_OK) {
+		Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+		rc = TH8_ERROR;
+		goto split_done;
+	    }
 	    i += (size_t)nByte;
 	}
     } else {
@@ -59159,7 +65182,10 @@ split_command(
 	    size_t j;
 	    int isSplit = 0;
 
-	    if (Th8_Ready(interp) != TH8_OK) goto split_done;
+	    if (Th8_Ready(interp) != TH8_OK) {
+		rc = TH8_ERROR;
+		goto split_done;
+	    }
 	    for (j = 0; j < nChars; j++) {
 		if (zStr[i] == zChars[j]) {
 		    isSplit = 1;
@@ -59167,21 +65193,39 @@ split_command(
 		}
 	    }
 	    if (isSplit) {
-		Th8_ListAppend(
-		    interp, &zList, &nList, &zStr[start], i - start);
+		if (Th8_ListAppend(
+		        interp, &zList, &nList, &zStr[start], i - start) !=
+		    TH8_OK) {
+		    Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+		    rc = TH8_ERROR;
+		    goto split_done;
+		}
 		start = i + 1;
 	    }
 	}
 	if (nStr > 0) {
-	    Th8_ListAppend(
-	        interp, &zList, &nList, &zStr[start], nStr - start);
+	    if (Th8_ListAppend(
+	            interp, &zList, &nList, &zStr[start], nStr - start) !=
+	        TH8_OK) {
+		Th8_SetResultStatic(interp, "out of memory", TH8_NOLEN);
+		rc = TH8_ERROR;
+		goto split_done;
+	    }
 	}
     }
 
 split_done:
-    Th8_SetResult(interp, zList, nList);
+    /*
+     * On success publish the list; on error (cancel/limit via Th8_Ready, or an
+     * OOM from Th8_ListAppend) the interpreter result already holds the correct
+     * error message -- do NOT overwrite it with the partial list, and return
+     * TH8_ERROR rather than reporting truncated output as success (TH8K-009).
+     */
+    if (rc == TH8_OK) {
+	Th8_SetResult(interp, zList, nList);
+    }
     Th8_Free(interp, zList);
-    return TH8_OK;
+    return rc;
 }
 
 
@@ -59260,6 +65304,11 @@ lassign_command(
      */
 
     for (i = argc - 2; i < nCount && ALWAYS(azElem); i++) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zRest);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	Th8_ListAppend(interp, &zRest, &nRest, azElem[i], anElem[i]);
     }
 
@@ -59335,6 +65384,11 @@ lremove_command(
     for (i = 0; i < nCount && ALWAYS(azElem); i++) {
 	int skip = 0;
 
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	for (j = 2; j < argc; j++) {
 	    int idx;
 
@@ -59406,6 +65460,11 @@ lreverse_command(
     if (rc != TH8_OK) return rc;
 
     for (i = nCount - 1; i >= 0 && ALWAYS(azElem); i--) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
     }
 
@@ -59465,8 +65524,27 @@ lreverse_command(
  */
 
 /*
- * th8DictFind -- look up a key in a split key-value list.
- * Returns the index of the value (key_index + 1), or -1 if not found.
+ *----------------------------------------------------------------------
+ *
+ * th8DictFind --
+ *
+ *	Look up a key in a split key-value element list (the array
+ *	form of a dict, keys at even indices and values at odd).
+ *
+ * Why / How:
+ *	Scans key positions (i += 2) and compares length first, then
+ *	bytes via `Th8_Memcmp`, so it works on binary keys and avoids a
+ *	full compare when lengths differ.  Returning the VALUE index
+ *	(key_index + 1) lets callers read or replace the value directly.
+ *
+ * Results:
+ *	The index of the matching key's value (key_index + 1), or -1 if
+ *	the key is not present.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -59491,19 +65569,37 @@ th8DictFind(
 
 
 /*
- * th8DictRebuildWith -- rebuild a dict from element arrays.
+ *----------------------------------------------------------------------
  *
- *	If bRemove is true and iKeyIdx >= 0, skip the key-value
- *	pair at (iKeyIdx-1, iKeyIdx).
+ * th8DictRebuildWith --
  *
- *	If !bRemove and iKeyIdx >= 0, replace the value at
- *	iKeyIdx with zNewVal/nNewVal.
+ *	Rebuild a dict string from its split element arrays, optionally
+ *	removing or replacing one key's value:
+ *	  * bRemove && iKeyIdx >= 0 -- skip the key-value pair at
+ *	    (iKeyIdx-1, iKeyIdx).
+ *	  * !bRemove && iKeyIdx >= 0 -- replace the value at iKeyIdx
+ *	    with zNewVal/nNewVal.
+ *	  * iKeyIdx == -1 && !bRemove -- copy through unchanged (the
+ *	    caller handles new-key insertion separately).
  *
- *	If iKeyIdx == -1 and !bRemove, this is a no-op: caller
- *	handles new-key insertion separately.
+ * Why / How:
+ *	Copies preserve dicts as ordinary lists: it re-emits every pair
+ *	with `Th8_ListAppend` (which handles element quoting) in the
+ *	original order, substituting or dropping the targeted pair as it
+ *	goes.  Rebuilding a fresh string rather than mutating in place
+ *	keeps the input immutable for the caller.  Polls `Th8_Ready` each
+ *	pair so a large dict rewrite stays cancelable.
  *
- *	On success, *pzOut and *pnOut hold the rebuilt dict string
- *	(caller must Th8_Free).
+ * Results:
+ *	TH8_OK with the rebuilt dict in *pzOut and *pnOut (caller must
+ *	`Th8_Free` *pzOut); TH8_ERROR if a cancel/limit is pending
+ *	(any partial buffer is freed).
+ *
+ * Side effects:
+ *	Allocates the output dict string (ownership passes to the
+ *	caller).  Frees its partial buffer on the cancel path.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -59524,6 +65620,10 @@ th8DictRebuildWith(
     int i;
 
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    return TH8_ERROR;
+	}
 	if (bRemove && iKeyIdx >= 0 && i + 1 == iKeyIdx) {
 	    /* Skip this key-value pair. */
 	    continue;
@@ -59544,14 +65644,33 @@ th8DictRebuildWith(
 
 
 /*
- * th8DictSplit -- split a dict string, using the cache.
+ *----------------------------------------------------------------------
  *
- *	Uses Th8_FindInCache with TH8_CACHE_DICT (cache type 10)
- *	to cache the split result.  If cache hit, reuse.  Otherwise
- *	split and cache.  Returns TH8_ERROR if odd element count.
+ * th8DictSplit --
  *
- *	The caller receives freshly-allocated element arrays that
- *	must be freed with Th8_Free(interp, *pazElem).
+ *	Split a dict string into parallel key/value element arrays,
+ *	using the interpreter's internal-representation cache.  The
+ *	caller receives freshly-allocated arrays that must be freed
+ *	with `Th8_Free(interp, *pazElem)`.
+ *
+ * Why / How:
+ *	Consults `Th8_FindInCache` with `TH8_CACHE_DICT` so repeated dict
+ *	operations on the same string avoid re-parsing: a cache hit
+ *	copies the cached elements into one contiguous allocation for the
+ *	caller; a miss splits with `Th8_SplitList`, validates an even
+ *	element count, and populates the cache.  A NULL cache slot (OOM)
+ *	simply falls through to a fresh parse (Bug 28 family).
+ *
+ * Results:
+ *	TH8_OK with *pazElem, *panElem, and *pnCount populated (caller
+ *	frees *pazElem); TH8_ERROR on an odd element count ("missing value
+ *	to go with key") or allocation failure ("out of memory").
+ *
+ * Side effects:
+ *	Allocates the caller's element arrays; may populate a dict cache
+ *	entry.  Sets the interpreter result on error.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -59683,15 +65802,38 @@ th8DictSplit(
 
 
 /*
- * th8DictTraverse -- walk a nested key path.
+ *----------------------------------------------------------------------
  *
- *	For each key in azKeys[0..nKeys-1] except the last, looks
- *	up the value and descends into it (splitting as a nested
- *	dict).  On success, *pazElem / *panElem / *pnCount are the
- *	innermost dict and *piKey is the value index of the last
- *	key (-1 if not found).  Caller must Th8_Free *pazElem.
+ * th8DictTraverse --
  *
- *	Returns TH8_ERROR on bad dict structure.
+ *	Walk a nested key path into a dict.  For each key in
+ *	azKeys[0..nKeys-1] except the last, looks up the value and
+ *	descends into it as a nested dict.  On success *pazElem /
+ *	*panElem / *pnCount describe the innermost dict and *piKey is
+ *	the value index of the last key (-1 if not found).  Caller must
+ *	`Th8_Free` *pazElem.
+ *
+ * Why / How:
+ *	Implements the multi-key form of `dict get`/`dict set`: each
+ *	intermediate key must resolve to a value that is itself a valid
+ *	dict, which is re-split with `th8DictSplit` before descending;
+ *	the previous level's element array is freed as soon as its inner
+ *	value has been copied out, so only one level is held at a time.
+ *	The last key is not descended -- its index is returned for the
+ *	caller to read or rewrite.
+ *
+ * Results:
+ *	TH8_OK with the innermost dict and last-key index reported via
+ *	the out-parameters (*piKey == -1 if the final key is absent);
+ *	TH8_ERROR if an intermediate key is missing or names a
+ *	malformed dict (interpreter result: diagnostic).
+ *
+ * Side effects:
+ *	Allocates the returned innermost element arrays (caller frees
+ *	*pazElem) and frees the intermediate arrays it descends through.
+ *	Sets the interpreter result on error.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -59961,6 +66103,11 @@ dict_filter_command(
 	        interp, "dict filter dictionary key pattern");
 	}
 	for (i = 0; i < nDict; i += 2) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, zOut);
+		Th8_Free(interp, azDict);
+		return TH8_ERROR;
+	    }
 	    if (Th8_GlobMatch(
 	            interp, argv[4], TH8_LEN(argl[4]), azDict[i],
 	            anDict[i])) {
@@ -59976,6 +66123,11 @@ dict_filter_command(
 	        interp, "dict filter dictionary value pattern");
 	}
 	for (i = 0; i < nDict; i += 2) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, zOut);
+		Th8_Free(interp, azDict);
+		return TH8_ERROR;
+	    }
 	    if (Th8_GlobMatch(
 	            interp, argv[4], TH8_LEN(argl[4]), azDict[i + 1],
 	            anDict[i + 1])) {
@@ -60259,6 +66411,11 @@ dict_keys_command(
     }
 
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	if (!zPat ||
 	    Th8_GlobMatch(interp, zPat, nPat, azElem[i], anElem[i])) {
 	    Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
@@ -60338,7 +66495,21 @@ dict_merge_command(
 	    zOut = 0;
 	    nOut = 0;
 	    for (i = 0; i < nD; i++) {
-		Th8_ListAppend(interp, &zOut, &nOut, azD[i], anD[i]);
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, azD);
+		    Th8_Free(interp, zOut);
+		    return TH8_ERROR;
+		}
+		/* A failed append must abort: ignoring it would leave zOut
+		 * TRUNCATED (possibly an odd element count), and the merge
+		 * pass below reads it as key/value PAIRS -- an odd list makes
+		 * azCur[i+1] an out-of-bounds read (crash) (TH8K-030). */
+		if (Th8_ListAppend(interp, &zOut, &nOut, azD[i], anD[i]) !=
+		    TH8_OK) {
+		    Th8_Free(interp, azD);
+		    Th8_Free(interp, zOut);
+		    return TH8_ERROR;
+		}
 	    }
 	} else {
 	    /*
@@ -60362,24 +66533,54 @@ dict_merge_command(
 
 	    /* Copy existing, replacing matched keys. */
 	    for (i = 0; i < nCur; i += 2) {
-		int iV =
-		    th8DictFind(interp, azD, anD, nD, azCur[i], anCur[i]);
-		Th8_ListAppend(interp, &zNew, &nNew, azCur[i], anCur[i]);
-		if (iV >= 0) {
-		    Th8_ListAppend(interp, &zNew, &nNew, azD[iV], anD[iV]);
-		} else {
-		    Th8_ListAppend(
-		        interp, &zNew, &nNew, azCur[i + 1], anCur[i + 1]);
+		int iV;
+
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, zNew);
+		    Th8_Free(interp, azCur);
+		    Th8_Free(interp, azD);
+		    Th8_Free(interp, zOut);
+		    return TH8_ERROR;
+		}
+		iV = th8DictFind(interp, azD, anD, nD, azCur[i], anCur[i]);
+		if (Th8_ListAppend(
+		        interp, &zNew, &nNew, azCur[i], anCur[i]) != TH8_OK ||
+		    (iV >= 0 ? Th8_ListAppend(
+		                   interp, &zNew, &nNew, azD[iV], anD[iV]) !=
+		                   TH8_OK
+		             : Th8_ListAppend(
+		                   interp, &zNew, &nNew, azCur[i + 1],
+		                   anCur[i + 1]) != TH8_OK)) {
+		    Th8_Free(interp, zNew);
+		    Th8_Free(interp, azCur);
+		    Th8_Free(interp, azD);
+		    Th8_Free(interp, zOut);
+		    return TH8_ERROR;
 		}
 	    }
 
 	    /* Append new keys. */
 	    for (i = 0; i < nD; i += 2) {
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, zNew);
+		    Th8_Free(interp, azCur);
+		    Th8_Free(interp, azD);
+		    Th8_Free(interp, zOut);
+		    return TH8_ERROR;
+		}
 		if (th8DictFind(interp, azCur, anCur, nCur, azD[i], anD[i]) <
 		    0) {
-		    Th8_ListAppend(interp, &zNew, &nNew, azD[i], anD[i]);
-		    Th8_ListAppend(
-		        interp, &zNew, &nNew, azD[i + 1], anD[i + 1]);
+		    if (Th8_ListAppend(
+		            interp, &zNew, &nNew, azD[i], anD[i]) != TH8_OK ||
+		        Th8_ListAppend(
+		            interp, &zNew, &nNew, azD[i + 1], anD[i + 1]) !=
+		            TH8_OK) {
+			Th8_Free(interp, zNew);
+			Th8_Free(interp, azCur);
+			Th8_Free(interp, azD);
+			Th8_Free(interp, zOut);
+			return TH8_ERROR;
+		    }
 		}
 	    }
 
@@ -60444,6 +66645,11 @@ dict_remove_command(
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
 	int skip = 0;
 
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	for (j = 3; j < argc; j++) {
 	    if (anElem[i] == TH8_LEN(argl[j]) &&
 	        Th8_Memcmp(interp, azElem[i], argv[j], anElem[i]) == 0) {
@@ -60524,6 +66730,11 @@ dict_replace_command(
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
 	int replaced = 0;
 
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	for (j = 3; j + 1 < argc; j += 2) {
 	    if (anElem[i] == TH8_LEN(argl[j]) &&
 	        Th8_Memcmp(interp, azElem[i], argv[j], anElem[i]) == 0) {
@@ -60661,6 +66872,11 @@ dict_values_command(
     }
 
     for (i = 1; i < nCount && ALWAYS(azElem); i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	if (!zPat ||
 	    Th8_GlobMatch(interp, zPat, nPat, azElem[i], anElem[i])) {
 	    Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
@@ -60687,8 +66903,35 @@ dict_values_command(
 #  if defined(TH8_ENABLE_VARIABLES)
 
 /*
- * th8DictVarGet -- helper: read a dict variable, split it, validate
- * even length.  Caller must Th8_Free azElem on success.
+ *----------------------------------------------------------------------
+ *
+ * th8DictVarGet --
+ *
+ *	Read a dict-valued variable, split it into key/value element
+ *	arrays, and validate an even element count.  A missing variable
+ *	is treated as an empty dict.  Caller must `Th8_Free` *pazElem on
+ *	success.
+ *
+ * Why / How:
+ *	Splits on the RAW byte length (TH8_LIST_NONE) so the element
+ *	lengths stay byte-exact for `th8DictFind`/memcpy comparisons: a
+ *	tainted dict variable would otherwise produce tainted element
+ *	lengths that never match a raw search key.  The variable's taint
+ *	is deliberately dropped here and re-applied at write-back by
+ *	`th8DictVarPut`.  Treating a nonexistent variable as the empty
+ *	dict lets the mutating `dict` subcommands create it on first use.
+ *
+ * Results:
+ *	TH8_OK with the element arrays reported (empty when the variable
+ *	does not exist); TH8_ERROR on a split failure or an odd element
+ *	count ("missing value to go with key").
+ *
+ * Side effects:
+ *	Allocates the caller's element arrays.  Overwrites the
+ *	interpreter result (with the variable value, or an error
+ *	message).
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -60735,8 +66978,29 @@ th8DictVarGet(
 }
 
 /*
- * th8DictVarPut -- helper: write dict back to variable,
- * set result to new dict value.
+ *----------------------------------------------------------------------
+ *
+ * th8DictVarPut --
+ *
+ *	Write a rebuilt dict string back to its variable and set the
+ *	interpreter result to the new dict value.
+ *
+ * Why / How:
+ *	Because `th8DictVarGet` splits on raw lengths (dropping taint), an
+ *	in-place mutation loses the source dict's taint; this re-reads the
+ *	variable's pre-mutation value and OR-folds its taint bits, plus
+ *	any taint already carried in `nDict` from new key/value arguments,
+ *	so the written value's taint is the union.  The pre-mutation read
+ *	is safe because it happens before the `Th8_SetVar` overwrite.
+ *
+ * Results:
+ *	TH8_OK.  The variable is updated and the interpreter result holds
+ *	the new (correctly-tainted) dict value.
+ *
+ * Side effects:
+ *	Sets the variable named `zVar` and the interpreter result.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -60824,6 +67088,7 @@ dict_append_command(
         interp, azElem, anElem, nCount, argv[3], TH8_LEN(argl[3]));
 
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
 	if (i + 1 == iKey) {
 	    /* Append strings to existing value. */
@@ -61025,6 +67290,11 @@ dict_incr_command(
         interp, azElem, anElem, nCount, argv[3], TH8_LEN(argl[3]));
 
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    Th8_Free(interp, azElem);
+	    return TH8_ERROR;
+	}
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
 	if (i + 1 == iKey) {
 	    int val = 0;
@@ -61117,6 +67387,7 @@ dict_lappend_command(
         interp, azElem, anElem, nCount, argv[3], TH8_LEN(argl[3]));
 
     for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
 	Th8_ListAppend(interp, &zOut, &nOut, azElem[i], anElem[i]);
 	if (i + 1 == iKey) {
 	    /* List-append values to existing value. */
@@ -61864,6 +68135,11 @@ dict_update_command(
 	    for (i = 0; i < nCount && ALWAYS(azElem); i += 2) {
 		int skip = 0;
 
+		if (Th8_Ready(interp) != TH8_OK) {
+		    Th8_Free(interp, zOut);
+		    Th8_Free(interp, azElem);
+		    return TH8_ERROR;
+		}
 		for (p = 0; p < nPairs; p++) {
 		    int argKey = 3 + p * 2;
 		    if (anElem[i] == TH8_LEN(argl[argKey]) &&
@@ -62108,6 +68384,11 @@ dict_with_command(
     }
 
     for (i = 0; i < nCount; i += 2) {
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, azElem);
+	    Th8_Free(interp, azSavedKeys);
+	    return TH8_ERROR;
+	}
 	Th8_SetVar(
 	    interp, azElem[i], anElem[i], azElem[i + 1],
 	    anElem[i + 1] | nSrcTag);
@@ -62132,6 +68413,11 @@ dict_with_command(
 	int k;
 
 	for (k = 0; k < nSavedKeys; k++) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, zOut);
+		Th8_Free(interp, azSavedKeys);
+		return TH8_ERROR;
+	    }
 	    if (Th8_GetVar(interp, azSavedKeys[k], anSavedKeys[k]) ==
 	        TH8_OK) {
 		size_t nVal;
@@ -62316,69 +68602,62 @@ oom:
 /*
  *----------------------------------------------------------------------
  *
- * dict_command -- ensemble dispatcher.
+ * th8DictSub -- `dict` sub-command catalogue.
  *
  * Why / How:
- *	Implements the Tcl [dict] command ensemble.  Builds a static
- *	subcommand table (conditionally including variable-gated
- *	subcommands) and delegates to Th8_CallSubCommand.
+ *	Catalogue of [dict] sub-commands (conditionally including the
+ *	variable-gated ones).  Installed into the `dict` ensemble command's
+ *	per-interpreter sub-command hash at registration (TH8K-025); the core
+ *	dispatches them -- there is no `dict` delegator.
  *
  * Results:
- *	Return code from the sub-command.
+ *	N/A (data).
  *
  * Side effects:
- *	Determined by the sub-command.
+ *	None.
  *
  *----------------------------------------------------------------------
  */
 
-static int
-dict_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    static const Th8_SubCommand aSub[] = {
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "append", dict_append_command},
-#  endif
-        {0, "create", dict_create_command},
-        {0, "exists", dict_exists_command},
-        {0, "filter", dict_filter_command},
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "for", dict_for_command},
-#  endif
-        {0, "get", dict_get_command},
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "incr", dict_incr_command},
-#  endif
-        {0, "info", dict_info_command},
-        {0, "keys", dict_keys_command},
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "lappend", dict_lappend_command},
-        {0, "map", dict_map_command},
-#  endif
-        {0, "merge", dict_merge_command},
-        {0, "remove", dict_remove_command},
-        {0, "replace", dict_replace_command},
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "set", dict_set_command},
-#  endif
-        {0, "size", dict_size_command},
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "unset", dict_unset_command},
-        {0, "update", dict_update_command},
-#  endif
-        {0, "values", dict_values_command},
-#  if defined(TH8_ENABLE_VARIABLES)
-        {0, "with", dict_with_command},
-#  endif
-        {0, 0, 0}};
+/* Published for th8_lang.c ensemble population (TH8K-025). */
+const Th8_SubCommand *th8_dict_aSub;
 
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, aSub);
-}
+static const Th8_SubCommand th8DictSub[] = {
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "append", dict_append_command},
+#  endif
+    {0, "create", dict_create_command},
+    {0, "exists", dict_exists_command},
+    {0, "filter", dict_filter_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "for", dict_for_command},
+#  endif
+    {0, "get", dict_get_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "incr", dict_incr_command},
+#  endif
+    {0, "info", dict_info_command},
+    {0, "keys", dict_keys_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "lappend", dict_lappend_command},
+    {0, "map", dict_map_command},
+#  endif
+    {0, "merge", dict_merge_command},
+    {0, "remove", dict_remove_command},
+    {0, "replace", dict_replace_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "set", dict_set_command},
+#  endif
+    {0, "size", dict_size_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "unset", dict_unset_command},
+    {0, "update", dict_update_command},
+#  endif
+    {0, "values", dict_values_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "with", dict_with_command},
+#  endif
+    {0, 0, 0}};
 
 
 /*
@@ -62390,13 +68669,14 @@ dict_command(
  */
 
 static Th8_CommandEntry th8ListsCommands[] = {
-    {1, 0, "dict", dict_command},
+    {1, 0, "dict", 0}, /* pure ensemble (TH8K-025) */
     {1, 0, "join", join_command},
 #  if defined(TH8_ENABLE_VARIABLES)
     {1, 0, "lappend", lappend_command},
     {1, 0, "lassign", lassign_command},
 #  endif
     {1, 0, "lindex", lindex_command},
+    {1, 0, "linsert", linsert_command},
     {1, 0, "list", list_command},
     {1, 0, "llength", llength_command},
     {1, 0, "lrange", lrange_command},
@@ -62451,6 +68731,8 @@ th8ListsGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
 	    pCommand[i] = th8ListsCommands[i];
 	}
     }
+    th8_dict_aSub =
+        th8DictSub; /* publish for ensemble population (TH8K-025) */
     return TH8_OK;
 }
 #endif /* TH8_PLUGIN_LISTS */
@@ -63179,6 +69461,7 @@ foreach_step(Th8_Interp *interp, void *pData[], int rc)
 	int jj;
 
 	for (jj = 0; jj < pp->nVar; jj++) {
+	    if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
 	    if (ALWAYS(pp->azVar) && ALWAYS(pp->azValue) &&
 	        pp->iIndex + jj < pp->nValue) {
 		Th8_SetVar(
@@ -63447,10 +69730,13 @@ rename_command(
  *
  *	interp cancel ?-unwind? ?--? ?path? ?result?
  *
- *	Per TIP #285, if two non-switch arguments remain, the first
- *	is the interpreter path and the second is the result message.
- *	If one remains, it is the result message.  TH8 has no child
- *	interpreters, so path must be "" (empty string) or absent.
+ *	Per TIP #285 the first non-switch argument is ALWAYS the
+ *	interpreter path; the second (if present) is the result
+ *	message.  TH8 has no child interpreters, so the path must be
+ *	"" (empty string) or absent.  A result message for the current
+ *	interpreter is therefore passed as `interp cancel "" MESSAGE`:
+ *	a lone non-empty argument is an interpreter path (and rejected
+ *	as "could not find interpreter"), NOT a message.
  *
  * Why / How:
  *	Parses the -unwind flag and the optional path/result arguments
@@ -63532,38 +69818,32 @@ interp_cancel_command(
 /*
  *----------------------------------------------------------------------
  *
- * interp_command --
+ * th8InterpSub --
  *
- *	Implements the Tcl [interp] command.  Dispatcher for
- *	[interp] sub-commands.
+ *	Catalogue of `interp` sub-commands, installed into the `interp`
+ *	ensemble command's per-interpreter sub-command hash at registration
+ *	(TH8K-025).
  *
  * Why / How:
- *	Uses Th8_CallSubCommand with a static sub-command table.
- *	Currently only "cancel" is supported; additional sub-commands
- *	(e.g. "create", "eval") may be added in future phases.
+ *	Published as th8_interp_aSub so [info subcommands] can enumerate the
+ *	available interp sub-commands.  Currently only "cancel" is supported;
+ *	additional sub-commands (e.g. "create", "eval") may be added in future
+ *	phases.
  *
  * Results:
- *	Return code from the sub-command.
+ *	None (data table).
  *
  * Side effects:
- *	Determined by the sub-command.
+ *	None.
  *
  *----------------------------------------------------------------------
  */
 
-static int
-interp_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    static const Th8_SubCommand aSub[] =
-        {{0, "cancel", interp_cancel_command}, {0, 0, 0}};
+/* Published for th8_lang.c ensemble population (TH8K-025). */
+const Th8_SubCommand *th8_interp_aSub;
 
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, aSub);
-}
+static const Th8_SubCommand th8InterpSub[] =
+    {{0, "cancel", interp_cancel_command}, {0, 0, 0}};
 
 
 /*
@@ -64061,6 +70341,26 @@ namespace_import_command(
  *	to [namespace which -command name] -- it resolves the
  *	command and returns its qualified name.
  *
+ * Why / How:
+ *	Builds a fully qualified name -- using the argument as-is
+ *	when it already starts with "::", otherwise prefixing the
+ *	current namespace -- then confirms the command exists by
+ *	evaluating `info commands <qualified>` and checking for a
+ *	non-empty result.  Because TH8 keeps no import bookkeeping,
+ *	the "origin" is just the resolved qualified name rather than
+ *	a walk back through an import chain.
+ *
+ * Results:
+ *	TH8_OK with the fully qualified command name as the
+ *	interpreter result; TH8_ERROR with an `invalid command
+ *	name "..."` message if no such command exists, on a wrong
+ *	argument count, or on an allocation failure.
+ *
+ * Side effects:
+ *	Evaluates an `info commands` command (which sets the
+ *	interpreter result); allocates and frees the qualified-name
+ *	buffer; sets the interpreter result.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -64143,6 +70443,27 @@ oom:
  *	With -command (default): resolves the command name.
  *	With -variable: resolves the variable name.
  *	Returns empty string if not found.
+ *
+ * Why / How:
+ *	Parses the leading `-command` / `-variable` flags (last one
+ *	wins) to pick the resolution mode, then qualifies the name
+ *	(used verbatim when already "::"-prefixed, otherwise prefixed
+ *	with the current namespace).  In variable mode it checks
+ *	Th8_ExistsVar (or, when built without TH8_ENABLE_VARIABLES,
+ *	always reports not-found per Bug 35); in command mode it
+ *	tests existence via `info commands`.  A hit sets the result
+ *	to the qualified name; a miss clears it, matching Tcl's
+ *	empty-string-on-not-found contract.
+ *
+ * Results:
+ *	TH8_OK with the fully qualified name on a hit, or an empty
+ *	interpreter result on a miss; TH8_ERROR on a wrong argument
+ *	count/missing name or on an allocation failure.
+ *
+ * Side effects:
+ *	In command mode, evaluates an `info commands` command (which
+ *	sets the interpreter result); allocates and frees the
+ *	qualified-name buffer; sets or clears the interpreter result.
  *
  *----------------------------------------------------------------------
  */
@@ -64247,15 +70568,15 @@ oom:
 /*
  *----------------------------------------------------------------------
  *
- * namespace_command --
+ * th8NamespaceSub --
  *
- *	Implements the Tcl [namespace] command.  Dispatcher for
- *	[namespace] sub-commands.
+ *	Catalogue of `namespace` sub-commands, installed into the `namespace`
+ *	ensemble command's per-interpreter sub-command hash at registration
+ *	(TH8K-025).
  *
  * Why / How:
- *	Uses Th8_CallSubCommand with a static sub-command table.
- *	Exports th8_namespace_aSub so that [info commands] can
- *	enumerate the available namespace sub-commands.
+ *	Published as th8_namespace_aSub so [info subcommands] can enumerate the
+ *	available namespace sub-commands.
  *
  * Results:
  *	Return code from the sub-command.
@@ -64280,48 +70601,6 @@ static const Th8_SubCommand th8NamespaceSub[] =
      {0, "which", namespace_which_command},
      {0, 0, 0}};
 
-/*
- *----------------------------------------------------------------------
- *
- * namespace_command --
- *
- *	Implements the script-visible `[namespace ...]`
- *	ensemble (`children`, `code`, `current`, `delete`,
- *	`eval`, `exists`, `export`, `forget`, `import`,
- *	`inscope`, `origin`, `parent`, `qualifiers`, `tail`,
- *	`which`, ...).  Thin dispatcher into `th8NamespaceSub`
- *	via `Th8_CallSubCommand`.
- *
- *	Diagnostics for unknown / ambiguous subcommands are
- *	emitted by `Th8_CallSubCommand`.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand's return code, or `TH8_ERROR`
- *	with a diagnostic if the subcommand name is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-namespace_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8NamespaceSub);
-}
-
 
 /*
  *----------------------------------------------------------------------
@@ -64332,8 +70611,8 @@ namespace_command(
  */
 
 static Th8_CommandEntry th8ManagementCommands[] = {
-    {1, 0, "interp", interp_command},
-    {1, 0, "namespace", namespace_command},
+    {1, 0, "interp", 0}, /* pure ensemble (TH8K-025) */
+    {1, 0, "namespace", 0}, /* pure ensemble (TH8K-025) */
     {1, 0, "rename", rename_command},
 };
 
@@ -64366,6 +70645,7 @@ th8ManagementGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
                   sizeof(th8ManagementCommands[0]));
 
     th8_namespace_aSub = th8NamespaceSub;
+    th8_interp_aSub = th8InterpSub; /* TH8K-025 */
 
     if (!pnCommand) return TH8_ERROR;
     if (!pCommand) {
@@ -66198,6 +72478,12 @@ string_compare_command(
 	    unsigned char a = (unsigned char)argv[iArg][j];
 	    unsigned char b = (unsigned char)argv[iArg + 1][j];
 
+	    /* -nocase compares the argument VALUES byte by byte, so poll every
+	     * 4096 bytes to stay interruptible on huge string values
+	     * (TH8K-009). */
+	    if ((j & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (a >= 'A' && a <= 'Z') a += ('a' - 'A');
 	    if (b >= 'A' && b <= 'Z') b += ('a' - 'A');
 	    if (a != b) {
@@ -66311,6 +72597,11 @@ string_equal_command(
 	    unsigned char a = (unsigned char)argv[iArg][j];
 	    unsigned char b = (unsigned char)argv[iArg + 1][j];
 
+	    /* -nocase byte compare over the argument VALUES; poll every 4096
+	     * bytes for interruptibility on huge values (TH8K-009). */
+	    if ((j & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (a >= 'A' && a <= 'Z') a += ('a' - 'A');
 	    if (b >= 'A' && b <= 'Z') b += ('a' - 'A');
 	    if (a != b) {
@@ -66690,17 +72981,21 @@ string_repeat_command(
     nLen = TH8_LEN(argl[2]);
 
     /*
-     * Security: bound the output size against both the hard
-     * maximum AND the per-interpreter result size limit.
-     * The check is overflow-safe: dividing the limit by nLen
-     * cannot overflow, and rejects any iCount that would push
-     * iCount * nLen past the limit.
+     * Security: bound the output size against the per-interpreter
+     * result size limit AND the dedicated [string repeat] hard cap
+     * (TH8_MX_STRING_REPEAT, TH8K-009), whichever is smaller.  The hard
+     * cap bounds the uninterruptible doubling fill below to ~1 MiB so a
+     * single [string repeat] cannot make the interpreter unresponsive,
+     * even when the result limit is the full 100 MiB default.  The check
+     * is overflow-safe: dividing the limit by nLen cannot overflow, and
+     * it rejects any iCount that would push iCount * nLen past the limit.
      */
 
     {
 	size_t nLimit = Th8_GetResultLimit(interp);
 
 	if (nLimit == 0) nLimit = TH8_MX_STRLEN;
+	if (nLimit > TH8_MX_STRING_REPEAT) nLimit = TH8_MX_STRING_REPEAT;
 	if (nLen > 0 && (size_t)iCount > nLimit / nLen) {
 	    Th8_SetResultStatic(interp, "string too long", TH8_NOLEN);
 	    return TH8_ERROR;
@@ -66841,6 +73136,9 @@ string_trim_command(
 	    size_t j;
 	    int found = 0;
 
+	    if ((iLeft & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    for (j = 0; j < nChars; j++) {
 		if (zStr[iLeft] == zChars[j]) {
 		    found = 1;
@@ -66856,6 +73154,9 @@ string_trim_command(
 	    size_t j;
 	    int found = 0;
 
+	    if ((iRight & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    for (j = 0; j < nChars; j++) {
 		if (zStr[iRight - 1] == zChars[j]) {
 		    found = 1;
@@ -66908,7 +73209,7 @@ string_is_command(
     size_t nStr;
     int iResult = 1;
     int bStrict = 0;
-    int iClass;  /* argv index of the class name */
+    int iClass; /* argv index of the class name */
     int iString; /* argv index of the string value */
 
     /*
@@ -66959,6 +73260,11 @@ string_is_command(
 	size_t i;
 
 	for (i = 0; i < nStr; i++) {
+	    /* [string is CLASS] scans the value byte by byte; poll every 4096
+	     * bytes for interruptibility on huge values (TH8K-009). */
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (!th8IsAlnum((unsigned char)argv[iString][i])) {
 		iResult = 0;
 		break;
@@ -66968,6 +73274,11 @@ string_is_command(
 	size_t i;
 
 	for (i = 0; i < nStr; i++) {
+	    /* [string is CLASS] scans the value byte by byte; poll every 4096
+	     * bytes for interruptibility on huge values (TH8K-009). */
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (!th8IsAlpha((unsigned char)argv[iString][i])) {
 		iResult = 0;
 		break;
@@ -66977,6 +73288,11 @@ string_is_command(
 	size_t i;
 
 	for (i = 0; i < nStr; i++) {
+	    /* [string is CLASS] scans the value byte by byte; poll every 4096
+	     * bytes for interruptibility on huge values (TH8K-009). */
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (!th8IsDigit((unsigned char)argv[iString][i])) {
 		iResult = 0;
 		break;
@@ -66986,6 +73302,11 @@ string_is_command(
 	size_t i;
 
 	for (i = 0; i < nStr; i++) {
+	    /* [string is CLASS] scans the value byte by byte; poll every 4096
+	     * bytes for interruptibility on huge values (TH8K-009). */
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (!th8IsSpace((unsigned char)argv[iString][i])) {
 		iResult = 0;
 		break;
@@ -67002,6 +73323,9 @@ string_is_command(
 	size_t i;
 
 	for (i = 0; i < nStr; i++) {
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if ((unsigned char)argv[iString][i] > 127) {
 		iResult = 0;
 		break;
@@ -67032,6 +73356,9 @@ string_is_command(
 	for (i = 0; i < nStr; i++) {
 	    char c = argv[iString][i];
 
+	    if ((i & 0xFFF) == 0) {
+		if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	    }
 	    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
 	          (c >= 'A' && c <= 'F'))) {
 		iResult = 0;
@@ -67244,7 +73571,7 @@ string_map_command(
     size_t i;
     int rc;
     int bNoCase = 0;
-    int iArg = 2;  /* Index of MAPPING argument. */
+    int iArg = 2; /* Index of MAPPING argument. */
 
     (void)ctx;
 
@@ -67540,8 +73867,15 @@ string_totitle_command(
     Th8_Memcpy(interp, zOut, zStr, nStr);
 
     for (i = 0; i < nStr; i++) {
-	unsigned char c = (unsigned char)zOut[i];
-	int iChar = Th8_Utf8Len(zStr, i);
+	unsigned char c;
+	int iChar;
+
+	if (Th8_Ready(interp) != TH8_OK) {
+	    Th8_Free(interp, zOut);
+	    return TH8_ERROR;
+	}
+	c = (unsigned char)zOut[i];
+	iChar = Th8_Utf8Len(zStr, i);
 
 	if (iChar == iFirst) {
 	    /* Title case: uppercase the first char in range. */
@@ -67609,7 +73943,10 @@ string_wordend_command(
     if (iIdx >= nChars) iIdx = nChars - 1;
 
     for (i = iIdx; i < nChars; i++) {
-	const char *p = Th8_Utf8Index(argv[2], argl[2], i);
+	const char *p;
+
+	if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	p = Th8_Utf8Index(argv[2], argl[2], i);
 
 	if (ALWAYS(p) && !th8IsAlnum((unsigned char)*p) &&
 	    ALWAYS(*p != '_')) {
@@ -67621,7 +73958,34 @@ string_wordend_command(
 
 
 /*
- * string_wordstart_command -- see string_wordend_command above.
+ *----------------------------------------------------------------------
+ *
+ * string_wordstart_command --
+ *
+ *	string wordstart STRING INDEX
+ *
+ *	Return the index of the first character of the word containing
+ *	the character at INDEX.  A "word" is a contiguous run of word
+ *	characters (alphanumeric or underscore).  This is the
+ *	backward-scanning mirror of `string_wordend_command`.
+ *
+ * Why / How:
+ *	Clamps INDEX into range (via th8ParseIndex, honoring "end"
+ *	syntax), then scans toward the start of the string, testing the
+ *	character before the cursor and stopping at the first non-word
+ *	character; the loop index left standing is the word's first
+ *	character.  Polls `Th8_Ready` each step so a scan over a long
+ *	string stays cancelable.
+ *
+ * Results:
+ *	TH8_OK with the boundary character index as the result;
+ *	TH8_ERROR on wrong argument count, a bad index, or a pending
+ *	cancel.
+ *
+ * Side effects:
+ *	Sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -67647,7 +74011,10 @@ string_wordstart_command(
     if (iIdx >= nChars) iIdx = nChars - 1;
 
     for (i = iIdx; i > 0; i--) {
-	const char *p = Th8_Utf8Index(argv[2], argl[2], i - 1);
+	const char *p;
+
+	if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	p = Th8_Utf8Index(argv[2], argl[2], i - 1);
 
 	if (ALWAYS(p) && !th8IsAlnum((unsigned char)*p) &&
 	    ALWAYS(*p != '_')) {
@@ -67744,8 +74111,12 @@ string_reverse_command(
     nChars = Th8_Utf8Len(argv[2], argl[2]);
 
     for (i = nChars - 1; i >= 0; i--) {
-	const char *p = Th8_Utf8Index(argv[2], argl[2], i);
-	const char *pNext = Th8_Utf8Index(argv[2], argl[2], i + 1);
+	const char *p;
+	const char *pNext;
+
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
+	p = Th8_Utf8Index(argv[2], argl[2], i);
+	pNext = Th8_Utf8Index(argv[2], argl[2], i + 1);
 
 	if (!pNext) pNext = argv[2] + argl[2];
 	if (p) {
@@ -67858,6 +74229,14 @@ string_case_command(
     for (i = (size_t)(zFirst - argv[2]); i < (size_t)(zLast - argv[2]); i++) {
 	unsigned char c = (unsigned char)zOut[i];
 
+	/* [string toupper/tolower/totitle] rewrites the value; poll every 4096
+	 * bytes and free the output buffer on cancellation (TH8K-009). */
+	if ((i & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, zOut);
+		return TH8_ERROR;
+	    }
+	}
 	if (bToLower) {
 	    if (c >= 'A' && c <= 'Z') {
 		zOut[i] = (char)(c + ('a' - 'A'));
@@ -67879,10 +74258,12 @@ string_case_command(
 /*
  *----------------------------------------------------------------------
  *
- * string_command --
+ * th8StringSub --
  *
- *	Dispatcher for string sub-commands.  Uses the standard
- *	Th8_SubCommand table pattern with Th8_CallSubCommand.
+ *	Catalogue of `string` sub-commands.  At registration these are
+ *	installed into the `string` ensemble command's per-interpreter
+ *	sub-command hash (Th8_CreateSubCommand); the core dispatches them
+ *	from that hash -- there is no `string` delegator function.
  *
  *	Sub-commands: compare, first, index, is, last, length, map,
  *	match, range, repeat, tolower, toupper, trim, trimleft,
@@ -67895,17 +74276,16 @@ string_case_command(
  *	at runtime.
  *
  * Why / How:
- *	Implements the Tcl [string] command ensemble.  Builds a
- *	static subcommand table and delegates to Th8_CallSubCommand,
- *	which handles subcommand lookup, abbreviation matching, and
- *	error reporting.  Also stores the table pointer in the
- *	th8_string_aSub global for [info subcommands] support.
+ *	Published as th8_string_aSub so [info subcommands] can enumerate the
+ *	available string sub-commands.  The core resolves argv[1] against the
+ *	ensemble's per-interpreter sub-command hash and reports unknown
+ *	sub-commands.
  *
  * Results:
- *	Return code from the sub-command.
+ *	None (data table).
  *
  * Side effects:
- *	Determined by the sub-command.
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -67934,49 +74314,6 @@ static const Th8_SubCommand th8StringSub[] =
      {0, "bytelength", string_bytelength_command},
      {0, "reverse", string_reverse_command},
      {0, 0, 0}};
-
-/*
- *----------------------------------------------------------------------
- *
- * string_command --
- *
- *	Implements the script-visible `[string ...]` ensemble
- *	(`bytelength`, `compare`, `equal`, `first`, `index`,
- *	`is`, `last`, `length`, `map`, `match`, `range`,
- *	`repeat`, `replace`, `reverse`, `tolower`, `totitle`,
- *	`toupper`, `trim`, `trimleft`, `trimright`,
- *	`wordstart`, `wordend`, ...).  Thin dispatcher into
- *	`th8StringSub` via `Th8_CallSubCommand`.
- *
- *	Diagnostics for unknown / ambiguous subcommands are
- *	emitted by `Th8_CallSubCommand`.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand's return code, or `TH8_ERROR`
- *	with a diagnostic if the subcommand name is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-string_command(
-    Th8_Interp *interp, /* Interpreter. */
-    void *ctx,   /* Not used. */
-    int argc,   /* Number of arguments. */
-    const char **argv,  /* Argument values. */
-    size_t *argl)  /* Argument lengths. */
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8StringSub);
-}
 
 
 /*
@@ -68141,7 +74478,9 @@ oom:
 static Th8_CommandEntry th8StringsCommands[] = {
     {1, 0, "base64", base64_command},
     {1, 0, "concat", concat_command},
-    {1, 0, "string", string_command},
+    {1, 0, "string", 0}, /* pure ensemble: sub-commands populated at
+			    * registration; the core dispatches from the
+			    * per-interp sub-command hash (no delegator). */
 };
 
 /*
@@ -68347,9 +74686,10 @@ clock_seconds_command(
 /*
  *----------------------------------------------------------------------
  *
- * clock_command --
+ * th8ClockSub --
  *
- *	Dispatcher for clock sub-commands.
+ *	Catalogue of `clock` sub-commands, installed into the `clock` ensemble
+ *	command's per-interpreter sub-command hash at registration (TH8K-025).
  *
  *	The "seconds" subcommand is built-in.  The "ntp" and "https"
  *	subcommands are provided by the Harpy plugin via internal
@@ -68358,42 +74698,31 @@ clock_seconds_command(
  *	subsystem at the source level.
  *
  * Why / How:
- *	Implements the Tcl [clock] command as an ensemble dispatcher.
- *	Uses Th8_CallSubCommand with a static subcommand table so
- *	that adding new subcommands requires only a table entry.
- *	The "ntp" and "https" subcommands are conditionally compiled
- *	under TH8_ENABLE_CRYPTOGRAPHY and reference non-static
- *	functions from the Harpy plugin, keeping the compile-time
+ *	Published as th8_clock_aSub so [info subcommands] can enumerate the
+ *	available clock sub-commands.  The "ntp" and "https" sub-commands are
+ *	conditionally compiled under TH8_ENABLE_CRYPTOGRAPHY and reference
+ *	non-static functions from the Harpy plugin, keeping the compile-time
  *	dependency optional.
  *
  * Results:
- *	Returns the result of the dispatched subcommand, or
- *	TH8_ERROR if the subcommand is not recognized.
+ *	None (data table).
  *
  * Side effects:
- *	Depends on the subcommand invoked.
+ *	None.
  *
  *----------------------------------------------------------------------
  */
 
-static int
-clock_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    static const Th8_SubCommand aSub[] =
-        {{0, "seconds", clock_seconds_command},
-#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
-         {0, "https", th8HarpyClockHttpsCommand},
-         {0, "ntp", th8HarpyClockNtpCommand},
-#  endif
-         {0, 0, 0}};
+/* Published for th8_lang.c ensemble population (TH8K-025). */
+const Th8_SubCommand *th8_clock_aSub;
 
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, aSub);
-}
+static const Th8_SubCommand th8ClockSub[] =
+    {{0, "seconds", clock_seconds_command},
+#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
+     {0, "https", th8HarpyClockHttpsCommand},
+     {0, "ntp", th8HarpyClockNtpCommand},
+#  endif
+     {0, 0, 0}};
 
 
 /*
@@ -68495,7 +74824,7 @@ oom:
 
 static Th8_CommandEntry th8TimekeepingCommands[] = {
     {1, 0, "after", after_command},
-    {1, 0, "clock", clock_command},
+    {1, 0, "clock", 0}, /* pure ensemble (TH8K-025) */
     {1, 0, "time", time_command},
 };
 
@@ -68542,6 +74871,8 @@ th8TimekeepingGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
 	    pCommand[i] = th8TimekeepingCommands[i];
 	}
     }
+    th8_clock_aSub =
+        th8ClockSub; /* publish for ensemble population (TH8K-025) */
     return TH8_OK;
 }
 #endif /* TH8_PLUGIN_TIMEKEEPING */
@@ -68610,6 +74941,13 @@ const Th8_SubCommand *th8_array_aSub;
  *	current value (either the pre-existing value or the newly
  *	assigned default).
  *
+ * Why / How:
+ *	Calls Th8_GetVar first; that call, on success, already leaves the
+ *	existing value in the interpreter result.  Only when the variable
+ *	does not exist does it set the variable to the supplied default and
+ *	push that default into the result, so callers never have to
+ *	special-case the first use of a variable.
+ *
  * Results:
  *	TH8_OK unconditionally.  The interpreter result is set to
  *	the variable's value.
@@ -68653,8 +74991,15 @@ th8GetOrCreateVar(
  *	Used by incr_command to update the variable after computing
  *	the new integer value.
  *
+ * Why / How:
+ *	Reads back the current interpreter result string (and its length)
+ *	with Th8_GetResult and hands it straight to Th8_SetVar, avoiding a
+ *	second integer-to-string conversion by reusing the formatting the
+ *	previous Th8_SetResult* call already performed.
+ *
  * Results:
- *	TH8_OK.
+ *	TH8_OK if the variable was stored; otherwise the TH8_ERROR status
+ *	returned by Th8_SetVar.
  *
  * Side effects:
  *	Variable is set to the current interpreter result string.
@@ -68759,7 +75104,13 @@ set_command(
 	if (th8CheckSystemVar(interp, argv[1], argl[1]) != TH8_OK) {
 	    return TH8_ERROR;
 	}
-	Th8_SetVar(interp, argv[1], argl[1], argv[2], argl[2]);
+	/* A failed store (e.g. out of memory) must be reported, not ignored:
+	 * otherwise [set] would report success and then read back a stale or
+	 * empty value (TH8K-030). */
+	if (Th8_SetVar(interp, argv[1], argl[1], argv[2], argl[2]) !=
+	    TH8_OK) {
+	    return TH8_ERROR;
+	}
     }
     return Th8_GetVar(interp, argv[1], argl[1]);
 }
@@ -68795,10 +75146,10 @@ set_command(
 static int
 append_command(
     Th8_Interp *interp, /* Interpreter. */
-    void *ctx,   /* Not used. */
-    int argc,   /* Number of arguments. */
-    const char **argv,  /* Argument values. */
-    size_t *argl)  /* Argument lengths. */
+    void *ctx, /* Not used. */
+    int argc, /* Number of arguments. */
+    const char **argv, /* Argument values. */
+    size_t *argl) /* Argument lengths. */
 {
     int i;
     char *zNew = 0;
@@ -69019,8 +75370,14 @@ incr_command(
 	}
     }
     iVal += iIncr;
-    Th8_SetResultInt(interp, iVal);
-    th8SetVarFromResult(interp, argv[1], argl[1]);
+    if (Th8_SetResultInt(interp, iVal) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    /* A failed store (out of memory) must be reported, not ignored, or [incr]
+     * reports success while the variable keeps its old value (TH8K-030). */
+    if (th8SetVarFromResult(interp, argv[1], argl[1]) != TH8_OK) {
+	return TH8_ERROR;
+    }
     return TH8_OK;
 }
 
@@ -69549,6 +75906,12 @@ variable_command(
 		const char *p = zName + nName;
 
 		while (p > zName + 2) {
+		    if (((size_t)(p - zName) & 0xFFF) == 0) {
+			if (Th8_Ready(interp) != TH8_OK) {
+			    Th8_Free(interp, zQual);
+			    return TH8_ERROR;
+			}
+		    }
 		    p--;
 		    if (p[-1] == ':' && p[0] == ':') {
 			zLocal = p + 1;
@@ -69734,8 +76097,10 @@ array_get_command(
     for (i = 0; i < nCount; i++) {
 	size_t nVal;
 	const char *zVal;
-	size_t nFull = 0;
+	size_t nFull;
 
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
+	nFull = 0;
 	zFull = 0;
 	if (argc == 4 &&
 	    !Th8_GlobMatch(
@@ -69858,8 +76223,10 @@ array_set_command(
     }
 
     for (i = 0; i < nCount; i += 2) {
-	size_t nFull = 0;
+	size_t nFull;
 
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
+	nFull = 0;
 	zFull = 0;
 	TH8_STR_APPEND(interp, &zFull, &nFull, argv[2], argl[2]);
 	TH8_STR_APPEND(interp, &zFull, &nFull, "(", 1);
@@ -70004,6 +76371,7 @@ array_unset_command(
 	 * the C1 (i < nCount) sub-check before reaching C2.  Wrap
 	 * azName ALWAYS at the C2 position. */
 	for (i = 0; i < nCount && ALWAYS(azName); i++) {
+	    if (Th8_Ready(interp) != TH8_OK) goto oom;
 	    if (Th8_GlobMatch(
 	            interp, argv[3], TH8_LEN(argl[3]), azName[i],
 	            TH8_LEN(anName[i]))) {
@@ -70034,15 +76402,14 @@ oom:
 /*
  *----------------------------------------------------------------------
  *
- * array_command --
+ * th8ArraySub --
  *
- *	Implements the Tcl [array] command.  Dispatcher for array
- *	sub-commands.
+ *	Catalogue of `array` sub-commands, installed into the `array` ensemble
+ *	command's per-interpreter sub-command hash at registration (TH8K-025).
  *
  * Why / How:
- *	Uses Th8_CallSubCommand with a static sub-command table.
- *	Exports th8_array_aSub so that [info commands] can enumerate
- *	the available array sub-commands.
+ *	Published as th8_array_aSub so [info subcommands] can enumerate the
+ *	available array sub-commands.
  *
  * Results:
  *	Return code from the sub-command.
@@ -70141,8 +76508,10 @@ array_statistics_command(
      */
     for (i = 0; i < nCount && ALWAYS(azElem); i++) {
 	size_t nVal;
-	size_t nFull = 0;
+	size_t nFull;
 
+	if (Th8_Ready(interp) != TH8_OK) goto oom;
+	nFull = 0;
 	zFull = 0;
 	nNameBytesTotal += anElem[i];
 	if (anElem[i] > nNameLenMax) nNameLenMax = anElem[i];
@@ -70230,6 +76599,15 @@ oom:
  *	bucket or when the table is exhausted.  Backs the
  *	`[array nextelement]` walk.
  *
+ * Why / How:
+ *	The element hash is an array of bucket chains, many of which
+ *	are empty; a naive `pHash->aBucket[i]` at the cursor's saved
+ *	index can land on a NULL head.  This loop keeps incrementing
+ *	`*piBucket` and reloading the bucket head until it finds a
+ *	non-NULL entry or runs off the end of the table
+ *	(TH8_HASH_SIZE), so callers of `[array nextelement]` always
+ *	resume at a real element without duplicating the skip logic.
+ *
  * Parameters:
  *	pHash    -- the array's element hash being iterated.
  *	piBucket -- in/out current bucket index; the caller has
@@ -70238,7 +76616,7 @@ oom:
  *		bucket is empty.  Set to a valid entry, or to NULL
  *		when iteration is exhausted, on return.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -70279,6 +76657,19 @@ th8ArraySearchSkipEmpty(
  *	flake where the allocator reused a freed hash address
  *	after `array unset` + `array set` of the same name.
  *
+ * Why / How:
+ *	Finds the search record in the per-interp search hash by SID,
+ *	then applies defense-in-depth checks in order -- owning
+ *	interp, registered array name, array liveness, generation,
+ *	and epoch -- returning NULL on the first mismatch.  The
+ *	per-interp monotonic generation counter (rather than a bare
+ *	pointer compare on the array hash) is what makes a stale or
+ *	guessed SID unable to drive a re-bound array, fixing the
+ *	Bug 9 / arrsearch-4.3 allocator-reuse flake.  On a liveness
+ *	or generation/epoch failure it also tears the stale record
+ *	down (the `invalidate` path) so the caller reports a clean
+ *	"couldn't find search".
+ *
  * Parameters:
  *	interp -- live interpreter (owns the search hash).
  *	zSid   -- search id (the hash key).
@@ -70286,7 +76677,7 @@ th8ArraySearchSkipEmpty(
  *	zArray -- array name the search must be bound to.
  *	nArray -- array-name length.
  *
- * Returns:
+ * Results:
  *	The matching th8ArraySearch on success; NULL on any
  *	mismatch or if the search was found but invalidated.
  *
@@ -70373,12 +76764,23 @@ invalidate:
  *	in `pEntry` and `pEntry->pData` (Bug 26): a tombstoned or
  *	absent entry is a no-op.
  *
+ * Why / How:
+ *	Casts the iterate context to the owning interpreter, treats
+ *	`pEntry->pData` as the th8ArraySearch, frees its owned
+ *	`zArray` copy and the record itself, then clears `pData` so a
+ *	later pass over the same entry sees a tombstone.  Sharing one
+ *	freer between teardown iteration and `[array donesearch]`
+ *	keeps the ownership rules in a single place; the two leading
+ *	NULL guards are kept as sequential `if`s (Bug 26 / Finding
+ *	005 sec. 5b) so they survive TH8_OMIT without forming a dead
+ *	MC/DC C-pair.
+ *
  * Parameters:
  *	pEntry -- hash entry whose pData is the th8ArraySearch,
  *		or NULL.
  *	pCtx   -- the owning Th8_Interp (hash-iterate context).
  *
- * Returns:
+ * Results:
  *	TH8_OK unconditionally.
  *
  * Side effects:
@@ -70428,6 +76830,15 @@ th8ArraySearchFreeEntry(Th8_HashEntry *pEntry, void *pCtx)
  *	combination, but the defensive arms stay in place
  *	for future callers and embedder paths.
  *
+ * Why / How:
+ *	Fetches the per-interp search hash and, when both it and the
+ *	SID are present, removes the cursor's entry so subsequent
+ *	`[array nextelement]` lookups fail cleanly; then, when the
+ *	cursor struct is present, frees its owned `zArray` copy and
+ *	the struct itself.  Each operand is guarded by its own `if`
+ *	(Finding 005 sec. 5b) so a missing hash, SID, or cursor skips
+ *	only its own block rather than aborting the whole release.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	zSid   -- search id (the hash key), or NULL to skip
@@ -70435,7 +76846,7 @@ th8ArraySearchFreeEntry(Th8_HashEntry *pEntry, void *pCtx)
  *	nSid   -- search-id length.
  *	p      -- cursor struct, or NULL.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -70495,6 +76906,20 @@ th8ArraySearchRelease(
  *	with the canonical `"arrayName" isn't an array` Tcl
  *	error.
  *
+ * Why / How:
+ *	Validates argc and array existence, then allocates and
+ *	initializes a th8ArraySearch positioned at the first
+ *	non-empty bucket and stamped with the array's current epoch
+ *	and generation so a later mutation invalidates the cursor.
+ *	The `"s-<counter>-<arrayName>"` SID formatted by th8Snprintf
+ *	is both unique (monotonic counter) and human-readable; the
+ *	defensive negative-return fallback to `"s-<counter>-array"`
+ *	(Bug 26) keeps the search registerable even if a platform
+ *	snprintf misbehaves, avoiding a bad size_t cast.  The record
+ *	is registered in the per-interp search hash and its SID is
+ *	returned so later `[array nextelement]`/`anymore`/
+ *	`donesearch` calls can retrieve it.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -70503,7 +76928,7 @@ th8ArraySearchRelease(
  *		argv[2]=arrayName.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with the generated search-id as the
  *	interpreter result.  `TH8_ERROR` on wrong argument
  *	count, non-array variable, missing search hash, or
@@ -70636,6 +77061,16 @@ oom:
  *	stale epoch) raises the canonical
  *	`couldn't find search "..."` error.
  *
+ * Why / How:
+ *	Resolves the cursor with th8ArraySearchFind (which also
+ *	validates epoch/generation), sets the result to the current
+ *	entry's key, then advances `p->pCursor` to `pCursor->pNext`.
+ *	Because the epoch was just verified, the bucket chain is
+ *	structurally unchanged so `pNext` is still valid; when it
+ *	reaches the end of a chain, th8ArraySearchSkipEmpty walks on
+ *	to the next non-empty bucket, leaving the cursor ready for
+ *	the following call.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -70644,7 +77079,7 @@ oom:
  *		argv[2]=arrayName; argv[3]=searchId.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with the next key (or empty result at end).
  *	`TH8_ERROR` on wrong argument count, missing cursor,
  *	or stale-epoch cursor (interpreter result:
@@ -70729,6 +77164,13 @@ oom:
  *	`couldn't find search "..."` error, matching the
  *	other `array *search` subcommands.
  *
+ * Why / How:
+ *	Resolves the cursor with th8ArraySearchFind and reports the
+ *	boolean `p->pCursor != 0` as the result -- a non-NULL cursor
+ *	means an element is still pending.  It deliberately does not
+ *	advance the cursor, so a script can test `anymore` and then
+ *	fetch with `nextelement` without skipping an element.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -70737,7 +77179,7 @@ oom:
  *		argv[2]=arrayName; argv[3]=searchId.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with `1` / `0` as the interpreter result.
  *	`TH8_ERROR` on wrong argument count or missing
  *	cursor (interpreter result: diagnostic).
@@ -70799,6 +77241,15 @@ oom:
  *	already released" granularity, not at the script
  *	level.
  *
+ * Why / How:
+ *	Resolves the cursor with th8ArraySearchFind first, so a bad
+ *	or stale search id produces the canonical error before any
+ *	freeing happens; on success it hands the id and cursor to
+ *	th8ArraySearchRelease (unlinking the hash entry and freeing
+ *	the record) and clears the result, giving scripts explicit,
+ *	deterministic cleanup rather than waiting for interpreter
+ *	teardown.
+ *
  * Parameters:
  *	interp -- live interpreter.
  *	ctx    -- unused command context.
@@ -70807,7 +77258,7 @@ oom:
  *		argv[2]=arrayName; argv[3]=searchId.
  *	argl   -- argument byte-lengths.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with the interpreter result cleared.
  *	`TH8_ERROR` on wrong argument count or missing
  *	cursor (interpreter result: diagnostic).
@@ -70869,49 +77320,6 @@ static const Th8_SubCommand th8ArraySub[] =
      {0, "unset", array_unset_command},
      {0, 0, 0}};
 
-/*
- *----------------------------------------------------------------------
- *
- * array_command --
- *
- *	Implements the script-visible `[array ...]` ensemble.
- *	Pure thin wrapper that hands the dispatch off to
- *	`Th8_CallSubCommand` with the `th8ArraySub` table
- *	covering `anymore`, `donesearch`, `exists`, `get`,
- *	`names`, `nextelement`, `set`, `size`, `startsearch`,
- *	`statistics`, and `unset`.
- *
- *	Diagnostics for unknown or ambiguous subcommands are
- *	emitted by `Th8_CallSubCommand` itself.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand handler's return code, or
- *	`TH8_ERROR` with a diagnostic if the subcommand name
- *	is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-array_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8ArraySub);
-}
-
 
 /*
  *----------------------------------------------------------------------
@@ -70922,10 +77330,14 @@ array_command(
  */
 
 static Th8_CommandEntry th8VariablesCommands[] = {
-    {1, 0, "append", append_command},     {1, 0, "array", array_command},
-    {1, 0, "global", global_command},     {1, 0, "incr", incr_command},
-    {1, 0, "set", set_command},           {1, 0, "unset", unset_command},
-    {1, 0, "uplevel", uplevel_command},   {1, 0, "upvar", upvar_command},
+    {1, 0, "append", append_command},
+    {1, 0, "array", 0}, /* pure ensemble (TH8K-025) */
+    {1, 0, "global", global_command},
+    {1, 0, "incr", incr_command},
+    {1, 0, "set", set_command},
+    {1, 0, "unset", unset_command},
+    {1, 0, "uplevel", uplevel_command},
+    {1, 0, "upvar", upvar_command},
     {1, 0, "variable", variable_command},
 };
 
@@ -71087,11 +77499,18 @@ th8VariablesGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
  *	write, so byte order does not apply; provided for
  *	symmetry with the multi-byte writers.
  *
+ * Why / How:
+ *	Low-level byte-store primitive that the integer format
+ *	path (`th8BinaryWriteInt`) dispatches to for 1-byte
+ *	specifiers.  Masks `v` to its low 8 bits and stores it;
+ *	one of the family of fixed-width store helpers that keep
+ *	the dispatcher straight-line.
+ *
  * Parameters:
  *	p -- one-byte output buffer (caller guarantees space).
  *	v -- source value; only the low 8 bits are used.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71114,11 +77533,18 @@ th8BinaryWriteU8(unsigned char *p, th8_uint64_t v)
  *	little-endian byte order (least-significant byte
  *	first).  Straight-line shifts; no branches.
  *
+ * Why / How:
+ *	Byte-store primitive for the 2-byte little-endian
+ *	integer specifiers (`s`, and `t` on little-endian
+ *	hosts).  Emitting bytes low-to-high with explicit
+ *	shifts makes the on-wire layout independent of the host
+ *	byte order.
+ *
  * Parameters:
  *	p -- two-byte output buffer (caller guarantees space).
  *	v -- source value; only the low 16 bits are used.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71142,11 +77568,17 @@ th8BinaryWriteU16Le(unsigned char *p, th8_uint64_t v)
  *	big-endian byte order (most-significant byte first).
  *	Straight-line shifts; no branches.
  *
+ * Why / How:
+ *	Byte-store primitive for the 2-byte big-endian integer
+ *	specifier (`S`).  Emitting the most-significant byte
+ *	first with explicit shifts makes the on-wire layout
+ *	independent of the host byte order.
+ *
  * Parameters:
  *	p -- two-byte output buffer (caller guarantees space).
  *	v -- source value; only the low 16 bits are used.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71169,11 +77601,18 @@ th8BinaryWriteU16Be(unsigned char *p, th8_uint64_t v)
  *	Store the low 32 bits of `v` to `p[0..3]` in
  *	little-endian byte order.  Straight-line shifts.
  *
+ * Why / How:
+ *	Byte-store primitive for the 4-byte little-endian
+ *	integer specifiers (`i`, and `n` on little-endian
+ *	hosts) and the little-endian single-precision float
+ *	writer.  Explicit shifts keep the layout host-order
+ *	independent.
+ *
  * Parameters:
  *	p -- four-byte output buffer.
  *	v -- source value; only the low 32 bits are used.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71198,11 +77637,17 @@ th8BinaryWriteU32Le(unsigned char *p, th8_uint64_t v)
  *	Store the low 32 bits of `v` to `p[0..3]` in
  *	big-endian byte order.  Straight-line shifts.
  *
+ * Why / How:
+ *	Byte-store primitive for the 4-byte big-endian integer
+ *	specifier (`I`) and the big-endian single-precision
+ *	float writer.  Explicit shifts keep the layout host-order
+ *	independent.
+ *
  * Parameters:
  *	p -- four-byte output buffer.
  *	v -- source value; only the low 32 bits are used.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71227,11 +77672,18 @@ th8BinaryWriteU32Be(unsigned char *p, th8_uint64_t v)
  *	Store all 64 bits of `v` to `p[0..7]` in little-endian
  *	byte order.  Straight-line shifts.
  *
+ * Why / How:
+ *	Byte-store primitive for the 8-byte little-endian
+ *	integer specifiers (`w`, and `m` on little-endian
+ *	hosts) and the little-endian double-precision float
+ *	writer.  Explicit shifts keep the layout host-order
+ *	independent.
+ *
  * Parameters:
  *	p -- eight-byte output buffer.
  *	v -- source value.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71260,11 +77712,17 @@ th8BinaryWriteU64Le(unsigned char *p, th8_uint64_t v)
  *	Store all 64 bits of `v` to `p[0..7]` in big-endian
  *	byte order.  Straight-line shifts.
  *
+ * Why / How:
+ *	Byte-store primitive for the 8-byte big-endian integer
+ *	specifier (`W`) and the big-endian double-precision
+ *	float writer.  Explicit shifts keep the layout host-order
+ *	independent.
+ *
  * Parameters:
  *	p -- eight-byte output buffer.
  *	v -- source value.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -71294,10 +77752,17 @@ th8BinaryWriteU64Be(unsigned char *p, th8_uint64_t v)
  *	`th8_int64_t`.  Single-byte access; endianness does not
  *	apply.
  *
+ * Why / How:
+ *	Byte-load primitive that the integer scan path
+ *	(`th8BinaryReadInt`) dispatches to for 1-byte specifiers
+ *	(`c`).  Casting through `signed char` performs the sign
+ *	extension the wider readers get from the shared
+ *	`th8BinarySignExtend*` helpers.
+ *
  * Parameters:
  *	p -- one-byte input buffer.
  *
- * Returns:
+ * Results:
  *	`p[0]` interpreted as a `signed char`, widened to
  *	`th8_int64_t` with sign preserved.
  *
@@ -71322,10 +77787,18 @@ th8BinaryReadI8(const unsigned char *p)
  *	little-endian and big-endian 16-bit signed readers to
  *	share their sign-extension logic.
  *
+ * Why / How:
+ *	Factoring the sign-extension out of `th8BinaryReadI16Le`
+ *	and `th8BinaryReadI16Be` keeps those readers to a single
+ *	byte-assembly expression each.  Testing bit 15 and
+ *	OR-ing in the high bits performs a portable arithmetic
+ *	extension without relying on implementation-defined
+ *	signed-shift behaviour.
+ *
  * Parameters:
  *	u -- input value; only the low 16 bits are inspected.
  *
- * Returns:
+ * Results:
  *	Sign-extended `th8_int64_t`: `(int16_t)(u & 0xFFFF)`
  *	widened to 64 bits with sign preserved.
  *
@@ -71351,10 +77824,18 @@ th8BinarySignExtend16(th8_uint64_t u)
  *	32-bit value to a 64-bit signed integer.  Shared by
  *	the LE/BE 32-bit signed readers.
  *
+ * Why / How:
+ *	Factoring the sign-extension out of `th8BinaryReadI32Le`
+ *	and `th8BinaryReadI32Be` keeps those readers to a single
+ *	byte-assembly expression each.  Testing bit 31 and
+ *	OR-ing in the high bits performs a portable arithmetic
+ *	extension without relying on implementation-defined
+ *	signed-shift behaviour.
+ *
  * Parameters:
  *	u -- input value; only the low 32 bits are inspected.
  *
- * Returns:
+ * Results:
  *	Sign-extended `th8_int64_t`.
  *
  * Side effects:
@@ -71379,10 +77860,16 @@ th8BinarySignExtend32(th8_uint64_t u)
  *	signed 16-bit value and sign-extend to 64 bits via
  *	`th8BinarySignExtend16`.
  *
+ * Why / How:
+ *	Byte-load primitive for the 2-byte little-endian integer
+ *	specifiers (`s`, and `t` on little-endian hosts).
+ *	Assembles the value low-byte-first, then delegates sign
+ *	extension to the shared helper.
+ *
  * Parameters:
  *	p -- two-byte input buffer.
  *
- * Returns:
+ * Results:
  *	Sign-extended `th8_int64_t`.
  *
  * Side effects:
@@ -71406,10 +77893,15 @@ th8BinaryReadI16Le(const unsigned char *p)
  *	16-bit value and sign-extend to 64 bits via
  *	`th8BinarySignExtend16`.
  *
+ * Why / How:
+ *	Byte-load primitive for the 2-byte big-endian integer
+ *	specifier (`S`).  Assembles the value high-byte-first,
+ *	then delegates sign extension to the shared helper.
+ *
  * Parameters:
  *	p -- two-byte input buffer.
  *
- * Returns:
+ * Results:
  *	Sign-extended `th8_int64_t`.
  *
  * Side effects:
@@ -71433,10 +77925,16 @@ th8BinaryReadI16Be(const unsigned char *p)
  *	signed 32-bit value and sign-extend to 64 bits via
  *	`th8BinarySignExtend32`.
  *
+ * Why / How:
+ *	Byte-load primitive for the 4-byte little-endian integer
+ *	specifiers (`i`, and `n` on little-endian hosts).
+ *	Assembles the value low-byte-first, then delegates sign
+ *	extension to the shared helper.
+ *
  * Parameters:
  *	p -- four-byte input buffer.
  *
- * Returns:
+ * Results:
  *	Sign-extended `th8_int64_t`.
  *
  * Side effects:
@@ -71461,10 +77959,15 @@ th8BinaryReadI32Le(const unsigned char *p)
  *	32-bit value and sign-extend to 64 bits via
  *	`th8BinarySignExtend32`.
  *
+ * Why / How:
+ *	Byte-load primitive for the 4-byte big-endian integer
+ *	specifier (`I`).  Assembles the value high-byte-first,
+ *	then delegates sign extension to the shared helper.
+ *
  * Parameters:
  *	p -- four-byte input buffer.
  *
- * Returns:
+ * Results:
  *	Sign-extended `th8_int64_t`.
  *
  * Side effects:
@@ -71491,10 +77994,17 @@ th8BinaryReadI32Be(const unsigned char *p)
  *	is a re-interpretation of the unsigned accumulator as
  *	signed.
  *
+ * Why / How:
+ *	Byte-load primitive for the 8-byte little-endian integer
+ *	specifiers (`w`, and `m` on little-endian hosts).
+ *	Assembles all eight bytes low-byte-first; because the
+ *	pattern is already 64 bits wide there is no separate
+ *	sign-extension helper.
+ *
  * Parameters:
  *	p -- eight-byte input buffer.
  *
- * Returns:
+ * Results:
  *	`p[0..7]` interpreted as a signed 64-bit integer.
  *
  * Side effects:
@@ -71521,10 +78031,16 @@ th8BinaryReadI64Le(const unsigned char *p)
  *	64-bit value.  Like `th8BinaryReadI64Le`, no
  *	sign-extension step is required.
  *
+ * Why / How:
+ *	Byte-load primitive for the 8-byte big-endian integer
+ *	specifier (`W`).  Assembles all eight bytes
+ *	high-byte-first; because the pattern is already 64 bits
+ *	wide there is no separate sign-extension helper.
+ *
  * Parameters:
  *	p -- eight-byte input buffer.
  *
- * Returns:
+ * Results:
  *	`p[0..7]` interpreted as a signed 64-bit integer.
  *
  * Side effects:
@@ -71584,12 +78100,20 @@ typedef int Th8_BinaryAssertFloat64[(sizeof(double) == 8) ? 1 : -1];
  *	The sign bit is irrelevant for the classification.
  *	Mirror of `th8BinaryIsNaN64`.
  *
+ * Why / How:
+ *	Drives the NaN canonicalisation in `th8BinaryFloat32Bits`
+ *	so that `[binary format f]` emits one stable quiet-NaN
+ *	pattern regardless of which NaN payload the host FPU
+ *	produced.  Two mask-and-compare tests suffice: exponent
+ *	all-ones separates NaN/Inf from finite, and a non-zero
+ *	mantissa separates NaN from Infinity.
+ *
  * Parameters:
  *	bits -- 32-bit pattern held in a 64-bit accumulator
  *		(typically from `th8BinaryFloat32Bits`); only the
  *		low 32 bits are inspected.
  *
- * Returns:
+ * Results:
  *	1 if `bits` denotes a NaN; 0 otherwise.
  *
  * Side effects:
@@ -71620,11 +78144,19 @@ th8BinaryIsNaN32(th8_uint64_t bits)
  *	The sign bit is irrelevant for the classification.
  *	Mirror of `th8BinaryIsNaN32`.
  *
+ * Why / How:
+ *	Drives the NaN canonicalisation in `th8BinaryFloat64Bits`
+ *	so that `[binary format d]` emits one stable quiet-NaN
+ *	pattern regardless of which NaN payload the host FPU
+ *	produced.  Two mask-and-compare tests suffice: exponent
+ *	all-ones separates NaN/Inf from finite, and a non-zero
+ *	mantissa separates NaN from Infinity.
+ *
  * Parameters:
  *	bits -- 64-bit pattern (typically obtained via
  *		`th8BinaryFloat64Bits`).
  *
- * Returns:
+ * Results:
  *	1 if `bits` denotes a NaN; 0 otherwise.
  *
  * Side effects:
@@ -71676,10 +78208,19 @@ typedef union {
  *	every TH8 toolchain) instead of `memcpy`, which avoids
  *	any dependency on `interp` state.
  *
+ * Why / How:
+ *	The write side of the single-precision float path: it
+ *	turns a host `float` into the exact 32-bit pattern the
+ *	byte writers emit.  Zeroing the union first then storing
+ *	`f` avoids a partially initialised accumulator, and
+ *	folding NaN to `TH8_BINARY_NAN_F32` (via
+ *	`th8BinaryIsNaN32`) makes output reproducible across
+ *	hosts.  Inverse of `th8BinaryBitsToFloat32`.
+ *
  * Parameters:
  *	f -- source IEEE 754 binary32 value.
  *
- * Returns:
+ * Results:
  *	The 32 low bits of the IEEE 754 representation, in a
  *	64-bit accumulator.  NaN payloads collapse to the
  *	canonical pattern.
@@ -71712,10 +78253,18 @@ th8BinaryFloat32Bits(float f)
  *	step is needed on the read side because consumers
  *	expect the exact pattern written.
  *
+ * Why / How:
+ *	The read side of the single-precision float path: it
+ *	turns the 32-bit pattern assembled by the byte readers
+ *	back into a host `float` for `[binary scan f]`.  Because
+ *	consumers want the exact bits that were written, no NaN
+ *	folding is applied here.  Inverse of
+ *	`th8BinaryFloat32Bits`.
+ *
  * Parameters:
  *	bits -- 64-bit input; only the low 32 bits are used.
  *
- * Returns:
+ * Results:
  *	The `float` value whose IEEE 754 binary32 representation
  *	matches `bits & 0xFFFFFFFFu`.
  *
@@ -71743,10 +78292,18 @@ th8BinaryBitsToFloat32(th8_uint64_t bits)
  *	`TH8_BINARY_NAN_F64` (`0x7FF8000000000000`).
  *	Type punning through `Th8_BinaryF64Bits`.
  *
+ * Why / How:
+ *	The write side of the double-precision float path: it
+ *	turns a host `double` into the exact 64-bit pattern the
+ *	byte writers emit.  Folding NaN to `TH8_BINARY_NAN_F64`
+ *	(via `th8BinaryIsNaN64`) makes `[binary format d]`
+ *	output reproducible across hosts.  Inverse of
+ *	`th8BinaryBitsToFloat64`.
+ *
  * Parameters:
  *	d -- source IEEE 754 binary64 value.
  *
- * Returns:
+ * Results:
  *	The 64-bit IEEE 754 representation.  NaN payloads
  *	collapse to the canonical pattern.
  *
@@ -71775,10 +78332,17 @@ th8BinaryFloat64Bits(double d)
  *	binary64 `double` via the `Th8_BinaryF64Bits` union.
  *	Inverse of `th8BinaryFloat64Bits`.
  *
+ * Why / How:
+ *	The read side of the double-precision float path: it
+ *	turns the 64-bit pattern assembled by the byte readers
+ *	back into a host `double` for `[binary scan d]`.  No NaN
+ *	folding is applied so consumers see the exact bits that
+ *	were written.  Inverse of `th8BinaryFloat64Bits`.
+ *
  * Parameters:
  *	bits -- 64-bit IEEE 754 binary64 representation.
  *
- * Returns:
+ * Results:
  *	The `double` value whose IEEE 754 representation
  *	matches `bits`.
  *
@@ -71903,9 +78467,29 @@ static const Th8_BinaryOpDef aBinaryOps[128] = {
 };
 
 /*
- * th8BinaryOpFor -- look up the op for a format letter.
- * Returns a pointer to the matching aBinaryOps entry, or NULL
- * if the letter is not a Phase 1 op.  One-decision lookup.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryOpFor --
+ *
+ *	Look up the op-table entry for a single format letter.
+ *
+ * Why / How:
+ *	The one place that maps a raw format byte to its
+ *	`Th8_BinaryOpDef`, so both drivers and the tokeniser
+ *	share identical letter validation.  Bytes outside
+ *	[0, 127] cannot index the 128-entry table and are
+ *	rejected up front; an in-range letter whose entry has
+ *	kind `TH8_BINARY_KIND_NONE` is an unused slot and also
+ *	returns NULL.
+ *
+ * Results:
+ *	A pointer to the matching `aBinaryOps` entry, or NULL if
+ *	`letter` is out of range or not a defined specifier.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 static const Th8_BinaryOpDef *
 th8BinaryOpFor(int letter)
@@ -71940,11 +78524,19 @@ th8BinaryOpFor(int letter)
  *	non-printable letter is rendered as `?` so the message
  *	stays clean for control bytes.
  *
+ * Why / How:
+ *	Centralising the message here (rather than in each
+ *	caller) guarantees `[binary format]` and `[binary scan]`
+ *	report bad specifiers identically and keeps the per-op
+ *	code free of `Th8_SetResult` calls.  Formats into a
+ *	fixed stack buffer, clamping the length so a truncated
+ *	`th8Snprintf` cannot over-read.
+ *
  * Parameters:
  *	interp -- live interpreter (receives the message).
  *	letter -- the rejected format letter (byte value).
  *
- * Returns:
+ * Results:
  *	`TH8_ERROR` unconditionally.
  *
  * Side effects:
@@ -71977,10 +78569,15 @@ th8BinaryErrBadFormat(Th8_Interp *interp, int letter)
  *	return `TH8_ERROR`.  Centralised so every caller emits
  *	an identical message.
  *
+ * Why / How:
+ *	Raised when the format string names more values than the
+ *	argument list supplies.  Uses `Th8_SetResultStatic` so
+ *	the constant message needs no allocation.
+ *
  * Parameters:
  *	interp -- live interpreter (receives the message).
  *
- * Returns:
+ * Results:
  *	`TH8_ERROR` unconditionally.
  *
  * Side effects:
@@ -72006,10 +78603,17 @@ th8BinaryErrNotEnoughArgs(Th8_Interp *interp)
  *	`th8BinaryNextToken` when a decimal count following a
  *	format letter exceeds `TH8_BINARY_MAX_COUNT`.
  *
+ * Why / How:
+ *	Bounds the decimal count so a hostile format string
+ *	cannot request an unbounded allocation; the tokeniser
+ *	calls this the moment the running total would exceed the
+ *	cap.  Uses `Th8_SetResultStatic` for the constant
+ *	message.
+ *
  * Parameters:
  *	interp -- live interpreter (receives the message).
  *
- * Returns:
+ * Results:
  *	`TH8_ERROR` unconditionally.
  *
  * Side effects:
@@ -72035,10 +78639,18 @@ th8BinaryErrCountOverflow(Th8_Interp *interp)
  *	cannot consume an unknown-length list (the op table's
  *	`acceptStar` flag is 0).
  *
+ * Why / How:
+ *	`*` means "count taken from the data" and is meaningful
+ *	only for specifiers that can size themselves from a
+ *	value; on the format side the fixed-cursor ops (`x`,
+ *	`@`) reject it.  Centralised so the diagnostic is
+ *	identical wherever the `bStarFmt` gate fails.  Uses
+ *	`Th8_SetResultStatic` for the constant message.
+ *
  * Parameters:
  *	interp -- live interpreter (receives the message).
  *
- * Returns:
+ * Results:
  *	`TH8_ERROR` unconditionally.
  *
  * Side effects:
@@ -72078,10 +78690,15 @@ th8BinaryErrStarFormat(Th8_Interp *interp)
  *	tokeniser to parse the count modifier that may follow a
  *	format letter.
  *
+ * Why / How:
+ *	A local predicate (rather than `<ctype.h>` `isdigit`)
+ *	so digit classification is locale-independent -- the
+ *	format-string grammar is pure ASCII.
+ *
  * Parameters:
  *	c -- byte value (typically promoted from `unsigned char`).
  *
- * Returns:
+ * Results:
  *	1 if `c` is one of `'0'..'9'`; 0 otherwise.
  *
  * Side effects:
@@ -72114,10 +78731,16 @@ th8BinaryIsDigit(int c)
  *	the format string is user-supplied and may
  *	legitimately contain any of these characters.
  *
+ * Why / How:
+ *	A local predicate (rather than `<ctype.h>` `isspace`)
+ *	so whitespace skipping is locale-independent and limited
+ *	to the four ASCII characters the format grammar allows
+ *	between fields.
+ *
  * Parameters:
  *	c -- byte value (typically promoted from `unsigned char`).
  *
- * Returns:
+ * Results:
  *	1 if `c` is one of `' '`, `'\t'`, `'\n'`, `'\r'`;
  *	0 otherwise.
  *
@@ -72157,6 +78780,14 @@ th8BinaryIsSpace(int c)
  *	     value greater than `TH8_BINARY_MAX_COUNT` via
  *	     `th8BinaryErrCountOverflow`).
  *
+ * Why / How:
+ *	The single tokeniser shared by both the format and scan
+ *	drivers, so the two directions parse specifiers
+ *	identically.  Reporting end-of-string as `*pLetter == 0`
+ *	(rather than a distinct return code) lets the drivers
+ *	loop on one `TH8_OK`/`TH8_ERROR` test and stop when the
+ *	letter is zero.
+ *
  * Parameters:
  *	interp  -- live interpreter (for error messages).
  *	zFmt    -- format string buffer.
@@ -72166,7 +78797,7 @@ th8BinaryIsSpace(int c)
  *	pCount  -- receives the count (`0` when `*` is used or at EOS).
  *	pBStar  -- receives 1 if `*` count, 0 otherwise.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on a parsed token (or at EOS).
  *	`TH8_ERROR` with the interpreter result set on a parse
  *	error (unknown letter, count overflow).
@@ -72259,10 +78890,37 @@ typedef struct Th8_BinaryFormatBuf {
 } Th8_BinaryFormatBuf;
 
 /*
- * th8BinaryReserveAt -- ensure pBuf->zBuf has at least iPos + nMore
- * bytes of allocated space, growing by doubling.  If iPos > nUsed
- * (i.e. an `@` seek opened a gap), zero-fill the gap before
- * returning.  Caller then writes at zBuf[iPos..iPos+nMore].
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryReserveAt --
+ *
+ *	Ensure `pBuf->zBuf` has at least `iPos + nMore` bytes of
+ *	allocated space, then guarantee everything up to `iPos`
+ *	is initialised so the caller may write at
+ *	`zBuf[iPos..iPos+nMore]`.
+ *
+ * Why / How:
+ *	The general reserve used by every format specifier,
+ *	including the `@`/`X` cursor ops that can move the write
+ *	position past the current high-water mark.  Growth is by
+ *	doubling to amortise reallocation; the add and the
+ *	doubling are both overflow-checked so a hostile count
+ *	cannot wrap `size_t`.  When an `@` seek leaves a gap
+ *	between `nUsed` and `iPos`, the gap is zero-filled so the
+ *	output never contains uninitialised bytes.
+ *
+ * Results:
+ *	`TH8_OK` when the space is reserved (and any gap zeroed);
+ *	`TH8_ERROR`, with an interpreter message, on size
+ *	overflow or an allocation failure.
+ *
+ * Side effects:
+ *	May allocate a larger buffer (copying and freeing the old
+ *	one), updating `pBuf->zBuf`, `pBuf->nAlloc`, and
+ *	`pBuf->nUsed`; may zero-fill a seek gap; may set the
+ *	interpreter result on error.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryReserveAt(
@@ -72308,11 +78966,31 @@ th8BinaryReserveAt(
 }
 
 /*
- * th8BinaryReserve -- legacy single-cursor reserve, used by the
- * integer fast path.  Reserves nMore bytes at pBuf->iCur and
- * updates nUsed when the write extends past it.  Callers do the
- * actual write after this returns, then advance pBuf->iCur and
- * pBuf->nUsed themselves.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryReserve --
+ *
+ *	Reserve `nMore` bytes at the buffer's current cursor
+ *	(`pBuf->iCur`).
+ *
+ * Why / How:
+ *	A thin convenience wrapper over `th8BinaryReserveAt` for
+ *	the common single-cursor case (the integer fast path and
+ *	other specifiers that always write at the cursor), so
+ *	those callers need not repeat `pBuf->iCur`.  The caller
+ *	performs the write, then advances the cursor via
+ *	`th8BinaryAdvanceCursor`.
+ *
+ * Results:
+ *	Whatever `th8BinaryReserveAt` returns: `TH8_OK` on
+ *	success, `TH8_ERROR` (with an interpreter message) on
+ *	overflow or allocation failure.
+ *
+ * Side effects:
+ *	Same as `th8BinaryReserveAt`: may grow the buffer and set
+ *	the interpreter result on error.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryReserve(Th8_Interp *interp, Th8_BinaryFormatBuf *pBuf, size_t nMore)
@@ -72328,21 +79006,39 @@ th8BinaryReserve(Th8_Interp *interp, Th8_BinaryFormatBuf *pBuf, size_t nMore)
 #    define TH8_BINARY_OP_BITWISE_AND 21
 
 /*
- * th8BinaryParseBigint -- truncate an arbitrary-precision
- * integer string modulo 2^64 using the native bigint
- * arithmetic engine (`th8BigintArith` with bitwise AND).
- * The caller has already detected via th8IsBigint that the
- * string is a valid integer too large for Th8_ToWideInt; this
- * routine computes (value & 0xFFFFFFFFFFFFFFFF) symbolically
- * as a bigint, then re-parses the result -- which is now in
- * 64-bit range -- via Th8_ToWideInt.  This is the
- * KIND_BIGINT-dispatch path: no Th8_Eval round-trip, no
- * temporary variables, no nested expression parser.
+ *----------------------------------------------------------------------
  *
- * Runtime gate: caller checks Th8_IsBigintEnabled(interp)
- * before invoking this routine, so we never reach
- * th8BigintArith with bigint disabled.  Compile gate:
- * TH8_ENABLE_BIGINT.
+ * th8BinaryParseBigint --
+ *
+ *	Truncate an arbitrary-precision integer string modulo
+ *	2^64 and return the result as a `th8_int64_t`.  The
+ *	caller has already established (via `th8IsBigint`) that
+ *	the string is a valid integer too large for
+ *	`Th8_ToWideInt`.
+ *
+ * Why / How:
+ *	Implements the `KIND_BIGINT` dispatch path.  It computes
+ *	`value & 0xFFFFFFFFFFFFFFFF` symbolically with the native
+ *	bigint engine (`th8BigintArith` with a bitwise-AND
+ *	opcode against the constant mask 2^64-1), then re-parses
+ *	the now-in-range decimal result through `Th8_ToWideInt`.
+ *	Doing the reduction in the bigint engine avoids a
+ *	`Th8_Eval` round-trip, temporary variables, and any
+ *	nested expression parser.  Compile-gated by
+ *	`TH8_ENABLE_BIGINT`; the caller has already checked the
+ *	runtime `Th8_IsBigintEnabled` gate.
+ *
+ * Results:
+ *	`TH8_OK` with `*pV` set to the low 64 bits of the value;
+ *	`TH8_ERROR` (with the engine's interpreter message) if
+ *	`th8BigintArith` or the re-parse fails.
+ *
+ * Side effects:
+ *	Sets the interpreter result to the reduced decimal string
+ *	(then consumes it), and on failure leaves an error
+ *	message there.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryParseBigint(
@@ -72366,29 +79062,42 @@ th8BinaryParseBigint(
 #  endif /* TH8_ENABLE_BIGINT */
 
 /*
- * th8BinaryParseTrunc -- parse `zArg` as an integer, accepting
- * Th8_ToWideInt-compatible inputs on the fast path AND
- * bignum inputs that exceed the 64-bit range via the
- * first-class KIND_BIGINT dispatch.
+ *----------------------------------------------------------------------
  *
- * Routing:
+ * th8BinaryParseTrunc --
  *
- *   1. Fast path: Th8_ToWideInt.  Zero bigint overhead for the
- *      common case.
+ *	Parse `zArg` as an integer for an integer format
+ *	specifier, truncating an over-wide but valid value to its
+ *	low 64 bits rather than rejecting it.
  *
- *   2. If the fast path failed, ask th8IsBigint whether the
- *      input is a *valid* integer that simply exceeded
- *      64-bit range (vs. a syntactically malformed number).
- *      The branch is compile-gated by TH8_ENABLE_BIGINT and
- *      runtime-gated by Th8_IsBigintEnabled(interp).
+ * Why / How:
+ *	Integer `[binary format]` fields take the low bits of the
+ *	value modulo the field width, so an input larger than 64
+ *	bits must be reduced, not refused.  The routing is:
+ *	  1. Fast path -- `Th8_ToWideInt`; zero bigint overhead
+ *	     for the common in-range case.
+ *	  2. On failure, `th8IsBigint` distinguishes a valid but
+ *	     over-wide integer from a malformed number (compile-
+ *	     gated by `TH8_ENABLE_BIGINT`, runtime-gated by
+ *	     `Th8_IsBigintEnabled`).
+ *	  3. If over-wide, dispatch to `th8BinaryParseBigint` to
+ *	     truncate modulo 2^64.
+ *	  4. If bigint is unavailable or the input is genuinely
+ *	     malformed, restore `Th8_ToWideInt`'s original error
+ *	     message (saved across the bigint attempt) and fail.
  *
- *   3. If yes, dispatch into th8BinaryParseBigint (the
- *      KIND_BIGINT routine): truncate modulo 2^64 via
- *      th8BigintArith and re-parse the now-in-range result.
+ * Results:
+ *	`TH8_OK` with `*pV` set to the (possibly truncated)
+ *	value; `TH8_ERROR`, with an interpreter message, on a
+ *	malformed integer or an internal allocation/engine
+ *	failure.
  *
- *   4. If bigint is disabled or the input is genuinely
- *      malformed, restore the original Th8_ToWideInt error
- *      message and return TH8_ERROR.
+ * Side effects:
+ *	Sets the interpreter result on error.  On the bigint
+ *	path, temporarily allocates and frees a copy of the saved
+ *	error message.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryParseTrunc(
@@ -72431,8 +79140,28 @@ th8BinaryParseTrunc(
 }
 
 /*
- * th8BinaryAdvanceCursor -- advance pBuf->iCur by n bytes and
- * bump nUsed if the write extended past it.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryAdvanceCursor --
+ *
+ *	Advance the format buffer's write cursor by `n` bytes
+ *	after a specifier has emitted its output.
+ *
+ * Why / How:
+ *	The cursor (`iCur`) and the result length (`nUsed`) are
+ *	separate because `@`/`X` can move the cursor backward
+ *	without shrinking the result.  Centralising the advance
+ *	here keeps that high-water-mark rule -- only ever raise
+ *	`nUsed`, never lower it -- in one place for every writer.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Advances `pBuf->iCur`; raises `pBuf->nUsed` if the new
+ *	cursor passes the previous high-water mark.
+ *
+ *----------------------------------------------------------------------
  */
 static void
 th8BinaryAdvanceCursor(Th8_BinaryFormatBuf *pBuf, size_t n)
@@ -72442,9 +79171,30 @@ th8BinaryAdvanceCursor(Th8_BinaryFormatBuf *pBuf, size_t n)
 }
 
 /*
- * th8BinaryWriteInt -- emit one integer value at the buffer's
- * cursor.  Caller has already reserved pOp->nWidth bytes.
- * Straight-line code; zero MC/DC decisions.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryWriteInt --
+ *
+ *	Emit one integer value of the specifier's width and byte
+ *	order at the buffer's cursor and advance past it.  The
+ *	caller has already reserved `pOp->nWidth` bytes.
+ *
+ * Why / How:
+ *	Dispatches on the combined `nWidth * 2 + eOrder` key to
+ *	the matching fixed-width byte-store primitive
+ *	(`th8BinaryWriteU8` .. `th8BinaryWriteU64Be`).  Encoding
+ *	width and order into one switch key keeps the per-op code
+ *	branch-free at the table level and lets every integer
+ *	specifier share this single writer.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes `pOp->nWidth` bytes into `pBuf->zBuf` at the cursor
+ *	and advances the cursor (raising `nUsed` as needed).
+ *
+ *----------------------------------------------------------------------
  */
 static void
 th8BinaryWriteInt(
@@ -72483,9 +79233,30 @@ th8BinaryWriteInt(
 }
 
 /*
- * th8BinaryWriteFloat32 -- write a single-precision IEEE 754
- * value at the buffer cursor.  NaN inputs are normalised to
- * the canonical pattern via th8BinaryFloat32Bits.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryWriteFloat32 --
+ *
+ *	Write a single-precision IEEE 754 value (the `f`/`r`/`R`
+ *	specifiers) at the buffer cursor and advance past the 4
+ *	bytes.  The caller has already reserved the space.
+ *
+ * Why / How:
+ *	Narrows the incoming `double` to `float`, converts to the
+ *	canonical 32-bit pattern via `th8BinaryFloat32Bits` (so
+ *	NaN payloads are normalised), then stores it with the
+ *	little- or big-endian U32 writer selected by `eOrder`.
+ *	Sharing the byte writers keeps the on-wire layout
+ *	identical to the integer path.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes 4 bytes into `pBuf->zBuf` at the cursor and
+ *	advances the cursor (raising `nUsed` as needed).
+ *
+ *----------------------------------------------------------------------
  */
 static void
 th8BinaryWriteFloat32(
@@ -72505,9 +79276,29 @@ th8BinaryWriteFloat32(
 }
 
 /*
- * th8BinaryWriteFloat64 -- write a double-precision IEEE 754
- * value at the buffer cursor.  NaN inputs are normalised to
- * the canonical pattern.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryWriteFloat64 --
+ *
+ *	Write a double-precision IEEE 754 value (the `d`/`q`/`Q`
+ *	specifiers) at the buffer cursor and advance past the 8
+ *	bytes.  The caller has already reserved the space.
+ *
+ * Why / How:
+ *	Converts the `double` to its canonical 64-bit pattern via
+ *	`th8BinaryFloat64Bits` (normalising NaN payloads), then
+ *	stores it with the little- or big-endian U64 writer
+ *	selected by `eOrder`.  Mirrors `th8BinaryWriteFloat32`
+ *	for the wider type.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes 8 bytes into `pBuf->zBuf` at the cursor and
+ *	advances the cursor (raising `nUsed` as needed).
+ *
+ *----------------------------------------------------------------------
  */
 static void
 th8BinaryWriteFloat64(
@@ -72547,10 +79338,15 @@ th8BinaryWriteFloat64(
  *	NUL for `a` (KIND_STR_NUL) and space for `A`
  *	(KIND_STR_SP).
  *
+ * Why / How:
+ *	Isolates the one difference between the `a` and `A`
+ *	string writers so `th8BinaryFormatStr` can stay a single
+ *	shared routine parameterised only by the pad byte.
+ *
  * Parameters:
  *	kind -- the op kind (TH8_BINARY_KIND_STR_NUL or _STR_SP).
  *
- * Returns:
+ * Results:
  *	`' '` for TH8_BINARY_KIND_STR_SP; `0` (NUL) otherwise.
  *
  * Side effects:
@@ -72566,9 +79362,31 @@ th8BinaryStrPadByte(unsigned char kind)
 }
 
 /*
- * th8BinaryFormatStr -- copy `count` bytes from zSrc/nSrc into the
- * output, padding with the kind-appropriate byte if nSrc < count.
- * Truncates if nSrc > count.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryFormatStr --
+ *
+ *	Emit a fixed-width `a`/`A` string field: copy up to
+ *	`count` bytes from `zSrc`, padding the tail with the
+ *	kind-appropriate byte when the source is shorter and
+ *	truncating when it is longer.
+ *
+ * Why / How:
+ *	Both string specifiers differ only in their pad byte, so
+ *	one routine parameterised by `th8BinaryStrPadByte(kind)`
+ *	serves both.  Exactly `count` bytes are always written
+ *	(copy of `min(nSrc, count)` plus pad), matching the Tcl
+ *	fixed-field semantics.  The caller has already reserved
+ *	`count` bytes.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes `count` bytes into `pBuf->zBuf` at the cursor and
+ *	advances the cursor (raising `nUsed` as needed).
+ *
+ *----------------------------------------------------------------------
  */
 static void
 th8BinaryFormatStr(
@@ -72600,10 +79418,14 @@ th8BinaryFormatStr(
  *	bit value.  Per Tcl 8.6, only `'0'` denotes a zero bit;
  *	every other character is treated as a one bit.
  *
+ * Why / How:
+ *	Encodes the Tcl `b`/`B` rule -- only the literal `'0'`
+ *	clears a bit -- in one place so both bit writers agree.
+ *
  * Parameters:
  *	c -- byte value taken from the source bit string.
  *
- * Returns:
+ * Results:
  *	0 if `c` is `'0'`; 1 otherwise.
  *
  * Side effects:
@@ -72634,10 +79456,17 @@ th8BinaryBitValue(int c)
  *	characters >= `'0'`; kept defensive against future
  *	callers per FINDINGS.md Finding 005 sec. 5b.
  *
+ * Why / How:
+ *	The nibble-decode step shared by the `h`/`H` hex writers.
+ *	A local table-free predicate keeps the classification
+ *	locale-independent; unrecognised bytes fold to 0 so a
+ *	malformed hex string produces zero nibbles rather than
+ *	garbage.
+ *
  * Parameters:
  *	c -- byte value (typically promoted from `unsigned char`).
  *
- * Returns:
+ * Results:
  *	0..15 for hex digits (`'0'..'9'`, `'a'..'f'`, `'A'..'F'`);
  *	0 for any other input.
  *
@@ -72659,12 +79488,35 @@ th8BinaryHexValue(int c)
 }
 
 /*
- * th8BinaryFormatBits -- pack `count` bits drawn from zSrc[0..]
- * (one char per bit) into ceil(count/8) bytes at the cursor.  Pad
- * bits beyond nSrc are 0.  bHiFirst selects high-bit-first (`B`)
- * vs low-bit-first (`b`).
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryFormatBits --
+ *
+ *	Pack a `b`/`B` bit-string field: draw `count` bits (one
+ *	source character each) and pack them into `ceil(count/8)`
+ *	bytes at the cursor, zero-padding any bits beyond the
+ *	source length.
+ *
+ * Why / How:
+ *	`bHiFirst` selects the within-byte bit order -- high-bit-
+ *	first for `B`, low-bit-first for `b` -- while each source
+ *	character's value comes from `th8BinaryBitValue` (only
+ *	`'0'` is a zero bit).  The output bytes are zeroed first
+ *	so untouched pad bits are 0.  The per-4096-bit
+ *	`Th8_Ready` poll (TH8K-009) keeps this
+ *	attacker-controlled loop cancellable.
+ *
+ * Results:
+ *	`TH8_OK` after packing all bits; `TH8_ERROR` if a
+ *	`Th8_Ready` poll reports cancellation/step.
+ *
+ * Side effects:
+ *	Writes `ceil(count/8)` bytes into `pBuf->zBuf` at the
+ *	cursor and advances the cursor (raising `nUsed`).
+ *
+ *----------------------------------------------------------------------
  */
-static void
+static int
 th8BinaryFormatBits(
     Th8_Interp *interp,
     Th8_BinaryFormatBuf *pBuf,
@@ -72679,23 +79531,52 @@ th8BinaryFormatBits(
 
     Th8_Memset(interp, p, 0, nBytes);
     for (iBit = 0; iBit < (size_t)count; iBit++) {
-	int bit = (iBit < nSrc) ? th8BinaryBitValue((unsigned char)zSrc[iBit])
-	                        : 0;
+	int bit;
 	size_t iByte = iBit / 8;
 	int iShift = bHiFirst ? (7 - (int)(iBit % 8)) : (int)(iBit % 8);
 
+	/* TH8K-009: cancellation/step polling on this attacker-controlled
+	 * per-bit loop; the caller owns pBuf->zBuf and frees it. */
+	if ((iBit & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	}
+	bit = (iBit < nSrc) ? th8BinaryBitValue((unsigned char)zSrc[iBit])
+	                    : 0;
 	if (bit) p[iByte] |= (unsigned char)(1u << iShift);
     }
     th8BinaryAdvanceCursor(pBuf, nBytes);
+    return TH8_OK;
 }
 
 /*
- * th8BinaryFormatHex -- pack `count` hex digits drawn from zSrc
- * (one char per nibble) into ceil(count/2) bytes at the cursor.
- * Pad nibbles beyond nSrc are 0.  bHiFirst selects high-nibble-
- * first (`H`) vs low-nibble-first (`h`).
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryFormatHex --
+ *
+ *	Pack an `h`/`H` hex-string field: draw `count` hex digits
+ *	(one source character each) and pack them into
+ *	`ceil(count/2)` bytes at the cursor, zero-padding any
+ *	nibbles beyond the source length.
+ *
+ * Why / How:
+ *	`bHiFirst` selects the within-byte nibble order -- high-
+ *	nibble-first for `H`, low-nibble-first for `h` -- while
+ *	each digit's value comes from `th8BinaryHexValue`.  The
+ *	output bytes are zeroed first so untouched pad nibbles
+ *	are 0.  The per-4096-nibble `Th8_Ready` poll (TH8K-009)
+ *	keeps this attacker-controlled loop cancellable.
+ *
+ * Results:
+ *	`TH8_OK` after packing all nibbles; `TH8_ERROR` if a
+ *	`Th8_Ready` poll reports cancellation/step.
+ *
+ * Side effects:
+ *	Writes `ceil(count/2)` bytes into `pBuf->zBuf` at the
+ *	cursor and advances the cursor (raising `nUsed`).
+ *
+ *----------------------------------------------------------------------
  */
-static void
+static int
 th8BinaryFormatHex(
     Th8_Interp *interp,
     Th8_BinaryFormatBuf *pBuf,
@@ -72710,11 +79591,16 @@ th8BinaryFormatHex(
 
     Th8_Memset(interp, p, 0, nBytes);
     for (iNib = 0; iNib < (size_t)count; iNib++) {
-	int v = (iNib < nSrc) ? th8BinaryHexValue((unsigned char)zSrc[iNib])
-	                      : 0;
+	int v;
 	size_t iByte = iNib / 2;
 	int iShift;
 
+	/* TH8K-009: cancellation/step polling on this attacker-controlled
+	 * per-nibble loop; the caller owns pBuf->zBuf and frees it. */
+	if ((iNib & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) return TH8_ERROR;
+	}
+	v = (iNib < nSrc) ? th8BinaryHexValue((unsigned char)zSrc[iNib]) : 0;
 	if (bHiFirst) {
 	    iShift = (iNib & 1u) ? 0 : 4;
 	} else {
@@ -72723,10 +79609,43 @@ th8BinaryFormatHex(
 	p[iByte] |= (unsigned char)((v & 0xF) << iShift);
     }
     th8BinaryAdvanceCursor(pBuf, nBytes);
+    return TH8_OK;
 }
 
 /*
- * binary_format_command -- implementation of [binary format].
+ *----------------------------------------------------------------------
+ *
+ * binary_format_command --
+ *
+ *	Implementation of `[binary format formatString ?arg ...?]`:
+ *	consume the format string and its value arguments and
+ *	produce the packed binary string as the interpreter
+ *	result.
+ *
+ * Why / How:
+ *	Drives the tokeniser (`th8BinaryNextToken`) over the
+ *	format string, and for each specifier looks up its op and
+ *	dispatches on `pOp->kind` to the matching writer, growing
+ *	a `Th8_BinaryFormatBuf` as it goes.  Value-consuming
+ *	specifiers pull the next `argv` entry (with `*` expanding
+ *	a single list argument across the count); the cursor ops
+ *	(`x`/`X`/`@`) consume no argument.  All errors funnel
+ *	through the shared `th8BinaryErr*` helpers and a single
+ *	`done:` label so the work buffer is always freed.
+ *
+ * Results:
+ *	`TH8_OK` with the packed bytes set as the interpreter
+ *	result; `TH8_ERROR` with a diagnostic on a bad specifier,
+ *	a missing/invalid argument, a count overflow, or an
+ *	allocation failure.  Too few arguments triggers
+ *	`Th8_WrongNumArgs`.
+ *
+ * Side effects:
+ *	Allocates and frees the output buffer; sets the
+ *	interpreter result (the packed string or an error
+ *	message).
+ *
+ *----------------------------------------------------------------------
  */
 static int
 binary_format_command(
@@ -72810,6 +79729,13 @@ binary_format_command(
 		for (j = 0; rc == TH8_OK && j < nList; j++) {
 		    th8_int64_t v = 0;
 
+		    /* TH8K-009: poll every element of this attacker-
+		     * controlled list-pack loop. */
+		    if (Th8_Ready(interp) != TH8_OK) {
+			Th8_Free(interp, azElem);
+			if (out.zBuf) Th8_Free(interp, out.zBuf);
+			return TH8_ERROR;
+		    }
 		    rc =
 		        th8BinaryParseTrunc(interp, azElem[j], anElem[j], &v);
 		    if (rc == TH8_OK) th8BinaryWriteInt(&out, pOp, v);
@@ -72878,9 +79804,10 @@ binary_format_command(
 	    nBytes = (size_t)((count + 7) / 8);
 	    rc = th8BinaryReserve(interp, &out, nBytes);
 	    if (rc != TH8_OK) goto done;
-	    th8BinaryFormatBits(
+	    rc = th8BinaryFormatBits(
 	        interp, &out, pOp->kind == TH8_BINARY_KIND_BITS_HI, count,
 	        zSrc, nSrc);
+	    if (rc != TH8_OK) goto done;
 	    break;
 	}
 	case TH8_BINARY_KIND_HEX_LO:
@@ -72901,9 +79828,10 @@ binary_format_command(
 	    nBytes = (size_t)((count + 1) / 2);
 	    rc = th8BinaryReserve(interp, &out, nBytes);
 	    if (rc != TH8_OK) goto done;
-	    th8BinaryFormatHex(
+	    rc = th8BinaryFormatHex(
 	        interp, &out, pOp->kind == TH8_BINARY_KIND_HEX_HI, count,
 	        zSrc, nSrc);
+	    if (rc != TH8_OK) goto done;
 	    break;
 	}
 	case TH8_BINARY_KIND_PAD: {
@@ -72967,6 +79895,13 @@ binary_format_command(
 		for (j = 0; rc == TH8_OK && j < nList; j++) {
 		    double d = 0.0;
 
+		    /* TH8K-009: poll every element of this attacker-
+		     * controlled list-pack loop. */
+		    if (Th8_Ready(interp) != TH8_OK) {
+			Th8_Free(interp, azElem);
+			if (out.zBuf) Th8_Free(interp, out.zBuf);
+			return TH8_ERROR;
+		    }
 		    rc = Th8_ToDouble(interp, azElem[j], anElem[j], &d);
 		    if (rc == TH8_OK) {
 			if (pOp->kind == TH8_BINARY_KIND_FLOAT) {
@@ -73114,6 +80049,14 @@ binary_format_command(
 			for (i2 = 0; i2 < nWidth / 2; i2++) {
 			    unsigned char t = out.zBuf[out.iCur + i2];
 
+			    /* TH8K-009: poll this attacker-controlled
+			     * byte-reverse loop every 4096 iterations. */
+			    if ((i2 & 0xFFF) == 0) {
+				if (Th8_Ready(interp) != TH8_OK) {
+				    if (out.zBuf) Th8_Free(interp, out.zBuf);
+				    return TH8_ERROR;
+				}
+			    }
 			    out.zBuf[out.iCur + i2] =
 			        out.zBuf[out.iCur + nWidth - 1 - i2];
 			    out.zBuf[out.iCur + nWidth - 1 - i2] = t;
@@ -73162,10 +80105,30 @@ done:
  */
 
 /*
- * th8BinaryReadInt -- read one integer value at the buffer's
- * cursor.  Caller has already ensured at least pOp->nWidth
- * bytes are available.  Returns the sign-extended value as
- * th8_int64_t.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryReadInt --
+ *
+ *	Read one integer value of the specifier's width and byte
+ *	order from `p`.  The caller has already ensured at least
+ *	`pOp->nWidth` bytes are available.
+ *
+ * Why / How:
+ *	The scan-side mirror of `th8BinaryWriteInt`: dispatches on
+ *	the combined `nWidth * 2 + eOrder` key to the matching
+ *	fixed-width byte-load primitive (`th8BinaryReadI8` ..
+ *	`th8BinaryReadI64Be`), each of which sign-extends to 64
+ *	bits.  One shared reader serves every integer specifier.
+ *
+ * Results:
+ *	The decoded value, sign-extended to `th8_int64_t` (0 for
+ *	an unrecognised width/order, which the op table never
+ *	produces).
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 static th8_int64_t
 th8BinaryReadInt(const unsigned char *p, const Th8_BinaryOpDef *pOp)
@@ -73191,8 +80154,35 @@ th8BinaryReadInt(const unsigned char *p, const Th8_BinaryOpDef *pOp)
 }
 
 /*
- * th8BinaryAssignInt -- format value as a decimal string and
- * write it to varName.  Returns TH8_OK / TH8_ERROR.
+ * [binary scan] binds its results into variables, so its result-assignment
+ * helpers and the scan sub-command itself require the variable subsystem.
+ * With TH8_ENABLE_VARIABLES off, [binary format] remains available but
+ * [binary scan] is not registered.
+ */
+#  if defined(TH8_ENABLE_VARIABLES)
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryAssignInt --
+ *
+ *	Format a single decoded integer as a decimal string and
+ *	assign it to the named scalar variable.
+ *
+ * Why / How:
+ *	The single-element output path for integer `[binary scan]`
+ *	specifiers (count 1).  Rendering into a small stack buffer
+ *	with `%lld` then one `Th8_SetVar` avoids heap traffic; the
+ *	list variant (`th8BinaryAssignIntList`) covers count > 1.
+ *
+ * Results:
+ *	`Th8_SetVar`'s return code (`TH8_OK` / `TH8_ERROR`).
+ *
+ * Side effects:
+ *	Mutates the named variable; sets the interpreter result on
+ *	failure.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryAssignInt(
@@ -73211,9 +80201,34 @@ th8BinaryAssignInt(
 }
 
 /*
- * th8BinaryAssignIntList -- format `count` values as a Tcl
- * list and write to varName.  Used for the `*` count case
- * on scan.  Returns TH8_OK / TH8_ERROR.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryAssignIntList --
+ *
+ *	Decode `count` integer elements starting at `p` and assign
+ *	them, formatted as a Tcl list of decimal strings, to the
+ *	named scalar variable.
+ *
+ * Why / How:
+ *	The multi-element output path for integer `[binary scan]`
+ *	specifiers with a count > 1 or a `*`.  Each element is
+ *	read via the shared `th8BinaryReadInt`, formatted with
+ *	`%lld`, and appended to a growing list buffer that is
+ *	assigned once at the end.  The per-element `Th8_Ready`
+ *	poll (TH8K-009) bounds work on an attacker-controlled
+ *	count so a huge scan stays cancellable, freeing the list
+ *	buffer on cancellation.
+ *
+ * Results:
+ *	`Th8_SetVar`'s return code on the final assignment;
+ *	`TH8_ERROR` if a `Th8_Ready` poll reports
+ *	cancellation/step.
+ *
+ * Side effects:
+ *	Allocates and frees a temporary list buffer; mutates the
+ *	named variable; sets the interpreter result on failure.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryAssignIntList(
@@ -73234,6 +80249,12 @@ th8BinaryAssignIntList(
 	int n;
 	th8_int64_t v = th8BinaryReadInt(p + (size_t)(i * pOp->nWidth), pOp);
 
+	/* TH8K-009: poll every element of this attacker-controlled
+	 * decode loop; free the list buffer owned here. */
+	if (Th8_Ready(interp) != TH8_OK) {
+	    if (zList) Th8_Free(interp, zList);
+	    return TH8_ERROR;
+	}
 	n = th8Snprintf(interp, buf, sizeof(buf), "%lld", (long long)v);
 	if (n < 0) n = 0;
 	if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
@@ -73249,8 +80270,30 @@ th8BinaryAssignIntList(
 }
 
 /*
- * th8BinaryScanStr -- assign `nRead` bytes of input to varName,
- * stripping trailing space/NUL when the kind is `A`.
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryScanStr --
+ *
+ *	Assign `nRead` bytes of scanned input to the named scalar
+ *	variable, stripping trailing spaces and NULs for the `A`
+ *	specifier.
+ *
+ * Why / How:
+ *	The output path for the `a`/`A` string scan specifiers.
+ *	`a` copies the field verbatim; `A` mirrors its format-side
+ *	space padding by trimming trailing `' '` and `'\0'` bytes,
+ *	so a value round-trips through `[binary format A]` /
+ *	`[binary scan A]`.  The kind selects which behaviour
+ *	applies.
+ *
+ * Results:
+ *	`Th8_SetVar`'s return code (`TH8_OK` / `TH8_ERROR`).
+ *
+ * Side effects:
+ *	Mutates the named variable; sets the interpreter result on
+ *	failure.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryScanStr(
@@ -73272,9 +80315,33 @@ th8BinaryScanStr(
 }
 
 /*
- * th8BinaryScanBits -- assign a `count`-character "01" string
- * decoded from `nBytes` of input.  bHiFirst selects high-bit-
- * first (`B`) vs low-bit-first (`b`).
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryScanBits --
+ *
+ *	Decode `count` bits from `zSrc` into a `count`-character
+ *	string of `'0'`/`'1'` and assign it to the named scalar
+ *	variable.
+ *
+ * Why / How:
+ *	The scan-side inverse of `th8BinaryFormatBits` for the
+ *	`b`/`B` specifiers; `bHiFirst` selects the within-byte bit
+ *	order (high-bit-first for `B`, low-bit-first for `b`).
+ *	Builds the text in a `count`-byte scratch buffer so the
+ *	whole string is assigned once.  The per-4096-bit
+ *	`Th8_Ready` poll (TH8K-009) keeps this attacker-controlled
+ *	loop cancellable, freeing the buffer on cancellation.  A
+ *	zero count short-circuits to an empty assignment.
+ *
+ * Results:
+ *	`Th8_SetVar`'s return code; `TH8_ERROR` on an allocation
+ *	failure or a cancelling `Th8_Ready` poll.
+ *
+ * Side effects:
+ *	Allocates and frees a scratch buffer; mutates the named
+ *	variable; sets the interpreter result on failure.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryScanBits(
@@ -73297,6 +80364,14 @@ th8BinaryScanBits(
 	int iShift = bHiFirst ? (7 - (int)(iBit % 8)) : (int)(iBit % 8);
 	int bit = (zSrc[iByte] >> iShift) & 1;
 
+	/* TH8K-009: poll this attacker-controlled per-bit loop
+	 * every 4096 iterations; free the buffer owned here. */
+	if ((iBit & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, zOut);
+		return TH8_ERROR;
+	    }
+	}
 	zOut[iBit] = (char)('0' + bit);
     }
     rc = Th8_SetVar(interp, zVarName, nVarName, zOut, (size_t)count);
@@ -73305,9 +80380,34 @@ th8BinaryScanBits(
 }
 
 /*
- * th8BinaryScanHex -- assign a `count`-character hex string
- * decoded from ceil(count/2) bytes of input.  bHiFirst selects
- * high-nibble-first (`H`) vs low-nibble-first (`h`).
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryScanHex --
+ *
+ *	Decode `count` hex nibbles from `ceil(count/2)` bytes of
+ *	`zSrc` into a `count`-character lowercase hex string and
+ *	assign it to the named scalar variable.
+ *
+ * Why / How:
+ *	The scan-side inverse of `th8BinaryFormatHex` for the
+ *	`h`/`H` specifiers; `bHiFirst` selects the within-byte
+ *	nibble order (high-nibble-first for `H`, low for `h`).
+ *	Each nibble indexes the fixed lowercase-hex table.  Builds
+ *	the text in a `count`-byte scratch buffer so it is
+ *	assigned once.  The per-4096-nibble `Th8_Ready` poll
+ *	(TH8K-009) keeps this attacker-controlled loop
+ *	cancellable, freeing the buffer on cancellation.  A zero
+ *	count short-circuits to an empty assignment.
+ *
+ * Results:
+ *	`Th8_SetVar`'s return code; `TH8_ERROR` on an allocation
+ *	failure or a cancelling `Th8_Ready` poll.
+ *
+ * Side effects:
+ *	Allocates and frees a scratch buffer; mutates the named
+ *	variable; sets the interpreter result on failure.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryScanHex(
@@ -73331,6 +80431,14 @@ th8BinaryScanHex(
 	int iShift;
 	int v;
 
+	/* TH8K-009: poll this attacker-controlled per-nibble loop
+	 * every 4096 iterations; free the buffer owned here. */
+	if ((iNib & 0xFFF) == 0) {
+	    if (Th8_Ready(interp) != TH8_OK) {
+		Th8_Free(interp, zOut);
+		return TH8_ERROR;
+	    }
+	}
 	if (bHiFirst) {
 	    iShift = (iNib & 1u) ? 0 : 4;
 	} else {
@@ -73344,11 +80452,38 @@ th8BinaryScanHex(
     return rc;
 }
 
+#  endif /* TH8_ENABLE_VARIABLES ([binary scan] assign helpers) */
+
 /*
- * th8BinaryFormatDoubleString -- render a double as a decimal
- * string suitable for round-trip back through Th8_ToDouble.
- * NaN renders as "NaN"; +/-Inf renders as "Inf"/"-Inf"; finite
- * values use %.17g (binary64) or %.9g (binary32).
+ *----------------------------------------------------------------------
+ *
+ * th8BinaryFormatDoubleString --
+ *
+ *	Render a `double` into `zBuf` as a decimal (or special)
+ *	string suitable for round-tripping back through
+ *	`Th8_ToDouble`.
+ *
+ * Why / How:
+ *	The shared float-to-text step behind `[binary scan f/d]`,
+ *	used by both the single- and multi-element assigners.  It
+ *	first classifies the value from its IEEE 754 bit pattern
+ *	(via `th8BinaryFloat32/64Bits` + `th8BinaryIsNaN32/64`)
+ *	so NaN renders as `"NaN"` and infinities as `"Inf"` /
+ *	`"-Inf"` rather than a platform-dependent `printf`
+ *	spelling.  Finite values use `%.17g` (binary64) or `%.9g`
+ *	(binary32) -- the shortest precisions that round-trip
+ *	every value of the type.  `bSingle` selects the 32-bit
+ *	path and its precision.
+ *
+ * Results:
+ *	The number of characters written (excluding the NUL), or
+ *	-1 if `nBuf` is too small for the chosen rendering.
+ *
+ * Side effects:
+ *	Writes into `zBuf`.  Does not touch the interpreter
+ *	result.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 th8BinaryFormatDoubleString(
@@ -73423,6 +80558,12 @@ th8BinaryFormatDoubleString(
  *	emitted as `"NaN"` / `"Inf"` / `"-Inf"` by
  *	`th8BinaryFormatDoubleString`.
  *
+ * Why / How:
+ *	The single-element output path for `[binary scan f/d]`.
+ *	Rendering into a small stack buffer then a single
+ *	`Th8_SetVar` avoids per-call heap traffic; the list
+ *	variant (`th8BinaryAssignDoubleList`) handles count > 1.
+ *
  * Parameters:
  *	interp   -- live interpreter.
  *	zVarName -- variable name (not necessarily NUL-terminated).
@@ -73431,7 +80572,7 @@ th8BinaryFormatDoubleString(
  *	bSingle  -- 1 for `float`-equivalent precision, 0 for full
  *		double precision.
  *
- * Returns:
+ * Results:
  *	`Th8_SetVar`'s return code (`TH8_OK` / `TH8_ERROR`).
  *
  * Side effects:
@@ -73469,6 +80610,14 @@ th8BinaryAssignDouble(
  *	variable.  Used by `[binary scan]` letters that take a
  *	count > 1 with a single output-variable name.
  *
+ * Why / How:
+ *	The multi-element output path for `[binary scan f/d]`.
+ *	Each element is decoded through the shared byte readers
+ *	and float bitcasts, appended to a growing list buffer,
+ *	and the whole list assigned once.  The per-element
+ *	`Th8_Ready` poll bounds work on an attacker-controlled
+ *	count so a huge scan stays cancellable.
+ *
  * Parameters:
  *	interp   -- live interpreter.
  *	zVarName -- variable name.
@@ -73479,7 +80628,7 @@ th8BinaryAssignDouble(
  *	eOrder   -- `TH8_BINARY_LE` or `TH8_BINARY_BE`.
  *	count    -- number of elements to consume.
  *
- * Returns:
+ * Results:
  *	`Th8_SetVar`'s return code on the final assignment;
  *	`TH8_ERROR` if any intermediate `Th8_ListAppend` /
  *	formatting step fails.
@@ -73514,6 +80663,12 @@ th8BinaryAssignDoubleList(
 	double d;
 	int n;
 
+	/* TH8K-009: poll every element of this attacker-controlled
+	 * decode loop; free the list buffer owned here. */
+	if (Th8_Ready(interp) != TH8_OK) {
+	    if (zList) Th8_Free(interp, zList);
+	    return TH8_ERROR;
+	}
 	if (bSingle) {
 	    bits = (eOrder == TH8_BINARY_LE)
 	             ? (th8_uint64_t)th8BinaryReadI32Le(q)
@@ -73540,13 +80695,44 @@ th8BinaryAssignDoubleList(
     return rc;
 }
 
+#  if defined(TH8_ENABLE_VARIABLES)
+
 /*
- * binary_scan_command -- implementation of [binary scan].
+ *----------------------------------------------------------------------
  *
- * Returns the number of variables successfully assigned (as
- * a decimal string in the interp result).  Partial scans
- * succeed; the caller compares the return value to the
- * number of varName args supplied.
+ * binary_scan_command --
+ *
+ *	Implementation of
+ *	`[binary scan string formatString ?varName ...?]`:
+ *	decode fields from the input string into the named
+ *	variables and report how many were assigned.
+ *
+ * Why / How:
+ *	Drives the shared tokeniser (`th8BinaryNextToken`) over
+ *	the format string against a byte cursor into the input.
+ *	For each value-producing specifier it checks that enough
+ *	input remains, decodes the field, and assigns it to the
+ *	next `varName` via the appropriate `th8BinaryAssign*` /
+ *	`th8BinaryScan*` helper; the cursor ops (`x`/`X`/`@`) move
+ *	the cursor without consuming a variable.  Scanning stops
+ *	early when the input is exhausted, so partial scans
+ *	succeed -- the caller compares the returned count to the
+ *	number of `varName` arguments supplied.
+ *
+ * Results:
+ *	`TH8_OK` with the number of variables assigned set as a
+ *	decimal string in the interpreter result; `TH8_ERROR`
+ *	with a diagnostic on a bad specifier or a failed variable
+ *	assignment.  Too few arguments triggers
+ *	`Th8_WrongNumArgs`.
+ *
+ * Side effects:
+ *	Assigns the scanned fields to the named variables; sets
+ *	the interpreter result (the assigned-count or an error
+ *	message).  May allocate/free temporary buffers via the
+ *	assign helpers.
+ *
+ *----------------------------------------------------------------------
  */
 static int
 binary_scan_command(
@@ -73766,7 +80952,7 @@ binary_scan_command(
 	    break;
 	}
 	case TH8_BINARY_KIND_BIGINT_FIXED: {
-#  if defined(TH8_ENABLE_BIGINT)
+#    if defined(TH8_ENABLE_BIGINT)
 	    int bBigEndian = (pOp->eOrder == TH8_BINARY_BE);
 	    size_t nWidth;
 
@@ -73873,12 +81059,12 @@ binary_scan_command(
 	    iArg++;
 	    iCur += nWidth;
 	    nAssigned++;
-#  else /* !TH8_ENABLE_BIGINT */
+#    else /* !TH8_ENABLE_BIGINT */
 	    Th8_SetResultStatic(
 	        interp, "j/J specifier requires TH8_ENABLE_BIGINT",
 	        TH8_NOLEN);
 	    return TH8_ERROR;
-#  endif
+#    endif
 	    break;
 	}
 	}
@@ -73889,6 +81075,8 @@ out:
     return TH8_OK;
 }
 
+#  endif /* TH8_ENABLE_VARIABLES (binary_scan_command) */
+
 /*
  *----------------------------------------------------------------------
  *
@@ -73897,53 +81085,16 @@ out:
  *----------------------------------------------------------------------
  */
 
+/* Published for th8_lang.c ensemble population + [info subcommands] (TH8K-025). */
+const Th8_SubCommand *th8_binary_aSub;
+
 static const Th8_SubCommand th8BinarySub[] = {
     {0, "format", binary_format_command},
-    {0, "scan", binary_scan_command},
+#  if defined(TH8_ENABLE_VARIABLES)
+    {0, "scan", binary_scan_command}, /* binds results into variables */
+#  endif
     {0, 0, 0},
 };
-
-/*
- *----------------------------------------------------------------------
- *
- * binary_command --
- *
- *	Implements the script-visible `[binary ...]` ensemble.
- *	Pure thin wrapper that hands the (`argc`, `argv`, `argl`)
- *	tuple off to `Th8_CallSubCommand`, which performs the
- *	usual ensemble-name-resolution against `th8BinarySub`
- *	(format, scan) and dispatches to the matching
- *	subcommand handler.
- *
- *	Diagnostics for unknown / ambiguous subcommands are
- *	emitted by `Th8_CallSubCommand` itself.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded to the subcommand).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The subcommand handler's return code, or `TH8_ERROR`
- *	with a diagnostic if the subcommand name is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs.
- *
- *----------------------------------------------------------------------
- */
-static int
-binary_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8BinarySub);
-}
 
 /*
  *----------------------------------------------------------------------
@@ -73954,7 +81105,7 @@ binary_command(
  */
 
 static Th8_CommandEntry th8BinaryCommands[] = {
-    {1, 0, "binary", binary_command},
+    {1, 0, "binary", 0}, /* pure ensemble (TH8K-025) */
 };
 
 /*
@@ -73976,13 +81127,20 @@ static Th8_CommandEntry th8BinaryCommands[] = {
  *
  *	NULL `pnCommand` is always an error.
  *
+ * Why / How:
+ *	The plugin's public entry point, matching the standard
+ *	two-call `Th8_CommandEntry` reporter contract (query the
+ *	count with a NULL buffer, then copy into a buffer of
+ *	that size).  This lets the loader size its array without
+ *	the plugin exposing its internal table directly.
+ *
  * Parameters:
  *	pCommand  -- caller-supplied output buffer or NULL to
  *		query the count only.
  *	pnCommand -- in/out count; receives the table size on
  *		query, must be >= table size on copy.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` on missing `pnCommand`
  *	or insufficient `*pnCommand`.
  *
@@ -74010,6 +81168,7 @@ th8BinaryGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
 	    pCommand[i] = th8BinaryCommands[i];
 	}
     }
+    th8_binary_aSub = th8BinarySub; /* publish for ensemble population */
     return TH8_OK;
 }
 
@@ -74076,28 +81235,103 @@ th8BinaryGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
  *----------------------------------------------------------------------
  */
 
+#if defined(TH8_ENABLE_VARIABLES)
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8ResetSecurityArray --
+ *
+ *	Internal checked reset of the ::th8_security array.  Sets all
+ *	seven elements to "none".
+ *
+ * Why / How:
+ *	Writes each of the seven ::th8_security elements (algorithmName,
+ *	dataName, flags, notAfter, notBefore, policy, publicKeyToken) to
+ *	"none" with an independent, allocation-capable Th8_SetVar, and
+ *	fails fast on the FIRST write that fails.  Each write is its own
+ *	single-condition if so no compound MC/DC decision is formed.  On
+ *	failure the array is left partially set; the caller
+ *	(Th8_RegisterLanguage) discards the interpreter rather than
+ *	presenting a partial security state as a complete language
+ *	(TH8K-006).
+ *
+ * Results:
+ *	TH8_OK only when all seven writes succeed; TH8_ERROR on the first
+ *	Th8_SetVar failure.
+ *
+ * Side effects:
+ *	Sets (and may allocate storage for) the ::th8_security array
+ *	elements in the interpreter; on failure the array is left in a
+ *	partially reset state.
+ *
+ *----------------------------------------------------------------------
+ */
+static int
+th8ResetSecurityArray(Th8_Interp *interp)
+{
+    if (Th8_SetVar(
+            interp, "::th8_security(algorithmName)", TH8_NOLEN, "none",
+            TH8_NOLEN) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_SetVar(
+            interp, "::th8_security(dataName)", TH8_NOLEN, "none",
+            TH8_NOLEN) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_SetVar(
+            interp, "::th8_security(flags)", TH8_NOLEN, "none", TH8_NOLEN) !=
+        TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_SetVar(
+            interp, "::th8_security(notAfter)", TH8_NOLEN, "none",
+            TH8_NOLEN) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_SetVar(
+            interp, "::th8_security(notBefore)", TH8_NOLEN, "none",
+            TH8_NOLEN) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_SetVar(
+            interp, "::th8_security(policy)", TH8_NOLEN, "none", TH8_NOLEN) !=
+        TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_SetVar(
+            interp, "::th8_security(publicKeyToken)", TH8_NOLEN, "none",
+            TH8_NOLEN) != TH8_OK) {
+	return TH8_ERROR;
+    }
+    return TH8_OK;
+}
+
 /*
  *----------------------------------------------------------------------
  *
  * Th8_ResetSecurityArray --
  *
- *	Set all elements of the ::th8_security array to "none".
- *	This is the canonical way to reset the security state;
- *	all callers should use this instead of setting the
- *	individual elements directly.
+ *	Public entry point: set all seven elements of the ::th8_security
+ *	array to "none".  This is the canonical way to reset the security
+ *	state; callers should use it instead of setting the individual
+ *	elements directly.
  *
  * Why / How:
- *	The security array has seven elements (algorithmName,
- *	dataName, flags, notAfter, notBefore, policy,
- *	publicKeyToken) that must always be set together.  This
- *	function guarantees atomicity of the reset: no caller can
- *	accidentally leave a stale element.  Bug 41 fix (2026-06-07):
- *	`flags` was previously populated by the harpy annotation
- *	extractor but not reset here, leaving a stale value across
- *	subsequent security contexts.
+ *	Delegates to the internal checked th8ResetSecurityArray and
+ *	propagates its status, so a caller can no longer be handed a
+ *	silently partial security array (TH8K-006/-020).  On TH8_ERROR the
+ *	array may be partially reset; the security state is indeterminate
+ *	and the caller MUST treat that as fatal for the current evaluation
+ *	(Th8_RegisterLanguage discards the interpreter; the harpy policy
+ *	chain rejects the eval), so a partial array is never observed by a
+ *	running script.  Bug 41 fix (2026-06-07): `flags` was previously
+ *	populated by the harpy annotation extractor but not reset here,
+ *	leaving a stale value across subsequent security contexts.
  *
  * Results:
- *	None.
+ *	TH8_OK when all seven elements were reset; TH8_ERROR on the first
+ *	Th8_SetVar allocation failure (array possibly partially reset).
  *
  * Side effects:
  *	Sets seven elements of the ::th8_security array variable.
@@ -74105,27 +81339,131 @@ th8BinaryGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
  *----------------------------------------------------------------------
  */
 
-#if defined(TH8_ENABLE_VARIABLES)
-void
+int
 Th8_ResetSecurityArray(Th8_Interp *interp)
 {
-    Th8_SetVar(
-        interp, "::th8_security(algorithmName)", TH8_NOLEN, "none",
-        TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::th8_security(dataName)", TH8_NOLEN, "none", TH8_NOLEN);
-    Th8_SetVar(interp, "::th8_security(flags)", TH8_NOLEN, "none", TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::th8_security(notAfter)", TH8_NOLEN, "none", TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::th8_security(notBefore)", TH8_NOLEN, "none", TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::th8_security(policy)", TH8_NOLEN, "none", TH8_NOLEN);
-    Th8_SetVar(
-        interp, "::th8_security(publicKeyToken)", TH8_NOLEN, "none",
-        TH8_NOLEN);
+    return th8ResetSecurityArray(interp);
 }
 #endif
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8PopulateEnsemble --
+ *
+ *	Install every sub-command in a static catalogue into an ensemble
+ *	command's per-interpreter sub-command hash (TH8K-025).
+ *
+ * Why / How:
+ *	Iterates the NUL-terminated Th8_SubCommand catalogue and calls the
+ *	public Th8_CreateSubCommand for each; the parent command must already
+ *	exist.  A NULL catalogue (an unbuilt plugin) is a no-op success.  This
+ *	is the full-language path; sub-command subsetting will select a subset
+ *	of the catalogue instead.
+ *
+ * Results:
+ *	TH8_OK when every sub-command registered, or TH8_ERROR (with the
+ *	failing call's message) on the first failure.
+ *
+ * Side effects:
+ *	Populates the ensemble command's sub-command hash.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8PopulateEnsemble(
+    Th8_Interp *interp, /* Interpreter. */
+    const char *zCmdName, /* Ensemble command name. */
+    const Th8_SubCommand *aSub) /* Sub-command catalogue (NUL-terminated). */
+{
+    int i;
+
+    if (!aSub) return TH8_OK; /* Plugin not built -- nothing to populate. */
+    for (i = 0; aSub[i].zName; i++) {
+	if (Th8_CreateSubCommand(
+	        interp, zCmdName, aSub[i].zName, aSub[i].xProc, 0, 0, 0) !=
+	    TH8_OK) {
+	    return TH8_ERROR;
+	}
+    }
+    return TH8_OK;
+}
+
+/*
+ * The built-in (statically linked) plugin registry: plugin name -> its
+ * GetCommands function, compile-time gated.  File-static so both
+ * th8RegisterStaticPlugins (register all) and the named-subset engine
+ * (register a selected plugin) resolve plugins from one source of truth.
+ */
+
+typedef struct th8StaticPluginRec {
+    const char *zName;
+    Th8_GetCommandsProc xGetCommands;
+} th8StaticPluginRec;
+
+static const th8StaticPluginRec th8StaticPlugins[] = {
+#if defined(TH8_PLUGIN_BINARY)
+    {"binary", th8BinaryGetCommands},
+#endif
+#if defined(TH8_PLUGIN_CONTROL)
+    {"control", th8ControlGetCommands},
+#endif
+#if defined(TH8_PLUGIN_EVENTS)
+    {"events", th8EventsGetCommands},
+#endif
+#if defined(TH8_ENABLE_VARIABLES) && defined(TH8_ENABLE_CRYPTOGRAPHY)
+    {"cryptography", th8CryptoGetCommands},
+#endif
+#if defined(TH8_ENABLE_CRYPTOGRAPHY)
+    {"harpy", th8HarpyGetCommands},
+#endif
+#if defined(TH8_PLUGIN_EXPRESSIONS)
+    {"expressions", th8ExpressionsGetCommands},
+#endif
+#if defined(TH8_PLUGIN_EXTENSIBILITY)
+    {"extensibility", th8ExtensibilityGetCommands},
+#endif
+#if defined(TH8_PLUGIN_FILE_SYSTEMS)
+    {"file_systems", th8FilesystemsGetCommands},
+#endif
+#if defined(TH8_PLUGIN_FORMATTING)
+    {"formatting", th8FormattingGetCommands},
+#endif
+#if defined(TH8_PLUGIN_INTROSPECTION)
+    {"introspection", th8IntrospectionGetCommands},
+#endif
+#if defined(TH8_PLUGIN_IO)
+    {"io", th8IoGetCommands},
+#endif
+#if defined(TH8_PLUGIN_LISTS)
+    {"lists", th8ListsGetCommands},
+#endif
+#if defined(TH8_PLUGIN_LOOPING)
+    {"looping", th8LoopingGetCommands},
+#endif
+#if defined(TH8_PLUGIN_MANAGEMENT)
+    {"management", th8ManagementGetCommands},
+#endif
+#if defined(TH8_PLUGIN_PROCEDURES)
+    {"procedures", th8ProceduresGetCommands},
+#endif
+#if defined(TH8_ENABLE_REGEXP)
+    {"regular_expressions", th8RegexpGetCommands},
+#endif
+#if defined(TH8_PLUGIN_STRINGS)
+    {"strings", th8StringsGetCommands},
+#endif
+#if defined(TH8_PLUGIN_TIMEKEEPING)
+    {"timekeeping", th8TimekeepingGetCommands},
+#endif
+#if defined(TH8_PLUGIN_VARIABLES)
+    {"variables", th8VariablesGetCommands},
+#endif
+};
+
+#define TH8_NUM_STATIC_PLUGINS                                               \
+    ((int)(sizeof(th8StaticPlugins) / sizeof(th8StaticPlugins[0])))
 
 /*
  *----------------------------------------------------------------------
@@ -74146,7 +81484,10 @@ Th8_ResetSecurityArray(Th8_Interp *interp)
  *	plugin system deduplicates by name.
  *
  * Results:
- *	None.
+ *	TH8_OK if every static plugin is registered (or was already
+ *	registered); TH8_ERROR if a plugin fails to register for a real
+ *	reason (e.g. OOM), so language registration is not reported
+ *	complete when it is not (TH8K-006).
  *
  * Side effects:
  *	Registers plugins in the interpreter's plugin hash table.
@@ -74154,79 +81495,910 @@ Th8_ResetSecurityArray(Th8_Interp *interp)
  *----------------------------------------------------------------------
  */
 
-static void
+static int
 th8RegisterStaticPlugins(Th8_Interp *interp)
 {
-    static struct {
-	const char *zName;
-	Th8_GetCommandsProc xGetCommands;
-    } aPlugin[] = {
-#if defined(TH8_PLUGIN_BINARY)
-        {"binary", th8BinaryGetCommands},
-#endif
-#if defined(TH8_PLUGIN_CONTROL)
-        {"control", th8ControlGetCommands},
-#endif
-#if defined(TH8_PLUGIN_EVENTS)
-        {"events", th8EventsGetCommands},
-#endif
-#if defined(TH8_ENABLE_VARIABLES) && defined(TH8_ENABLE_CRYPTOGRAPHY)
-        {"cryptography", th8CryptoGetCommands},
-#endif
-#if defined(TH8_ENABLE_CRYPTOGRAPHY)
-        {"harpy", th8HarpyGetCommands},
-#endif
-#if defined(TH8_PLUGIN_EXPRESSIONS)
-        {"expressions", th8ExpressionsGetCommands},
-#endif
-#if defined(TH8_PLUGIN_EXTENSIBILITY)
-        {"extensibility", th8ExtensibilityGetCommands},
-#endif
-#if defined(TH8_PLUGIN_FILE_SYSTEMS)
-        {"file_systems", th8FilesystemsGetCommands},
-#endif
-#if defined(TH8_PLUGIN_FORMATTING)
-        {"formatting", th8FormattingGetCommands},
+    int i;
+
+    for (i = 0; i < TH8_NUM_STATIC_PLUGINS; i++) {
+	size_t nName = Th8_Strlen(interp, th8StaticPlugins[i].zName);
+
+	/*
+	 * Tolerate re-registration (Th8_RestoreInterp re-runs this on an
+	 * interp that still has its plugins): skip a plugin that is
+	 * already present.  But a plugin that is NOT present and fails to
+	 * register is a real failure (e.g. OOM) that must be propagated
+	 * so the language is not reported complete when it is not
+	 * (TH8K-006).
+	 */
+	if (th8PluginRegistered(interp, th8StaticPlugins[i].zName, nName)) {
+	    continue;
+	}
+	if (Th8_RegisterPlugin(
+	        interp, th8StaticPlugins[i].zName,
+	        th8StaticPlugins[i].xGetCommands) != TH8_OK) {
+	    return TH8_ERROR;
+	}
+    }
+    return TH8_OK;
+}
+
+
+/*
+ * Ensemble registry: which plugin owns each ensemble command, and the
+ * published sub-command catalogue to populate it from.  One source of truth for
+ * both full-language registration (Th8_RegisterLanguage) and plugin-subset
+ * registration.  Names are bare (th8LookupCommand resolves them in the global
+ * namespace).  Each ppaSub points at the plugin-owned catalogue pointer, which
+ * the plugin's *GetCommands assigns; it is non-NULL once that plugin is built.
+ */
+
+typedef struct th8EnsembleRec {
+    const char *zPlugin; /* Owning plugin (matches th8StaticPlugins). */
+    const char *zEnsemble; /* Ensemble command name (bare). */
+    const Th8_SubCommand **ppaSub; /* Published catalogue pointer. */
+} th8EnsembleRec;
+
+static const th8EnsembleRec th8Ensembles[] = {
+#if defined(TH8_PLUGIN_STRINGS)
+    {"strings", "string", &th8_string_aSub},
 #endif
 #if defined(TH8_PLUGIN_INTROSPECTION)
-        {"introspection", th8IntrospectionGetCommands},
+    {"introspection", "info", &th8_info_aSub},
 #endif
-#if defined(TH8_PLUGIN_IO)
-        {"io", th8IoGetCommands},
-#endif
-#if defined(TH8_PLUGIN_LISTS)
-        {"lists", th8ListsGetCommands},
-#endif
-#if defined(TH8_PLUGIN_LOOPING)
-        {"looping", th8LoopingGetCommands},
+#if defined(TH8_PLUGIN_FILE_SYSTEMS)
+    {"file_systems", "file", &th8_file_aSub},
 #endif
 #if defined(TH8_PLUGIN_MANAGEMENT)
-        {"management", th8ManagementGetCommands},
-#endif
-#if defined(TH8_PLUGIN_PROCEDURES)
-        {"procedures", th8ProceduresGetCommands},
-#endif
-#if defined(TH8_ENABLE_REGEXP)
-        {"regular_expressions", th8RegexpGetCommands},
-#endif
-#if defined(TH8_PLUGIN_STRINGS)
-        {"strings", th8StringsGetCommands},
-#endif
-#if defined(TH8_PLUGIN_TIMEKEEPING)
-        {"timekeeping", th8TimekeepingGetCommands},
+    {"management", "namespace", &th8_namespace_aSub},
+    {"management", "interp", &th8_interp_aSub},
 #endif
 #if defined(TH8_PLUGIN_VARIABLES)
-        {"variables", th8VariablesGetCommands},
+    {"variables", "array", &th8_array_aSub},
 #endif
-    };
-    int i;
-    int n = (int)(sizeof(aPlugin) / sizeof(aPlugin[0]));
+#if defined(TH8_PLUGIN_EXTENSIBILITY)
+    {"extensibility", "package", &th8_package_aSub},
+#endif
+#if defined(TH8_PLUGIN_TIMEKEEPING)
+    {"timekeeping", "clock", &th8_clock_aSub},
+#endif
+#if defined(TH8_PLUGIN_LISTS)
+    {"lists", "dict", &th8_dict_aSub},
+#endif
+#if defined(TH8_PLUGIN_BINARY)
+    {"binary", "binary", &th8_binary_aSub},
+#endif
+#if defined(TH8_ENABLE_CRYPTOGRAPHY)
+    {"harpy", "flags", &th8_flags_aSub},
+#endif
+};
 
-    for (i = 0; i < n; i++) {
-	/* Silently tolerate re-registration. */
-	(void)Th8_RegisterPlugin(
-	    interp, aPlugin[i].zName, aPlugin[i].xGetCommands);
+#define TH8_NUM_ENSEMBLES                                                    \
+    ((int)(sizeof(th8Ensembles) / sizeof(th8Ensembles[0])))
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8CStrEq --
+ *
+ *	Return 1 iff the two NUL-terminated strings are equal.
+ *
+ * Why / How:
+ *	A small helper for the subset engine's name comparisons (catalogue names
+ *	and caller-supplied subset names are all C strings), using the platform
+ *	length and compare primitives.
+ *
+ * Results:
+ *	1 if equal, else 0.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8CStrEq(Th8_Interp *interp, const char *zA, const char *zB)
+{
+    size_t nA = Th8_Strlen(interp, zA);
+
+    return nA == Th8_Strlen(interp, zB) &&
+           Th8_Memcmp(interp, zA, zB, nA) == 0;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8PopulatePluginEnsembles --
+ *
+ *	Populate the per-interpreter sub-command hashes of every ensemble owned
+ *	by plugin zPlugin, from that plugin's published catalogues.
+ *
+ * Why / How:
+ *	Called after a plugin is registered (full language or a plugin subset)
+ *	so its ensemble commands gain their sub-commands.  A catalogue pointer
+ *	that is still NULL (plugin not built) is skipped.
+ *
+ * Results:
+ *	TH8_OK, or TH8_ERROR on a sub-command registration failure (e.g. OOM).
+ *
+ * Side effects:
+ *	Registers sub-commands into the interpreter.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8PopulatePluginEnsembles(Th8_Interp *interp, const char *zPlugin)
+{
+    int i;
+
+    for (i = 0; i < TH8_NUM_ENSEMBLES; i++) {
+	if (th8CStrEq(interp, zPlugin, th8Ensembles[i].zPlugin) &&
+	    *th8Ensembles[i].ppaSub) {
+	    if (th8PopulateEnsemble(
+	            interp, th8Ensembles[i].zEnsemble,
+	            *th8Ensembles[i].ppaSub) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
     }
+    return TH8_OK;
+}
+
+/*
+ * Curated fine-grained subset: a read-only slice of [file].  Demonstrates the
+ * hybrid model -- individual COMMAND + SUBCOMMAND members alongside the
+ * plugin-granular subsets.  The COMMAND member installs the (NULL-handler)
+ * ensemble shell; the SUBCOMMAND members fill in only the safe, read-only
+ * operations, so `file delete` etc. are simply absent.
+ */
+
+static const Th8_SubsetMemberDef th8SafeFileMembers[] = {
+#if defined(TH8_PLUGIN_FILE_SYSTEMS)
+    {TH8_SUBSET_COMMAND, 0, "file"},
+    {TH8_SUBSET_SUBCOMMAND, "file", "exists"},
+    {TH8_SUBSET_SUBCOMMAND, "file", "dirname"},
+    {TH8_SUBSET_SUBCOMMAND, "file", "tail"},
+    {TH8_SUBSET_SUBCOMMAND, "file", "extension"},
+    {TH8_SUBSET_SUBCOMMAND, "file", "rootname"},
+    {TH8_SUBSET_SUBCOMMAND, "file", "join"},
+#endif
+    {0, 0, 0} /* Guarantees a non-empty array when file_systems is off. */
+};
+
+/* "math": grant [expr] plus the math functions.  Demonstrates the FUNCTION
+ * member type (a specific function by name AND the "*" wildcard for all), the
+ * capability the hybrid subset model exposes for embedders that want arithmetic
+ * without the rest of the language. */
+static const Th8_SubsetMemberDef th8MathMembers[] = {
+#if defined(TH8_ENABLE_EXPRESSIONS)
+    {TH8_SUBSET_COMMAND, 0, "expr"},
+    {TH8_SUBSET_FUNCTION, 0, "abs"},
+    {TH8_SUBSET_FUNCTION, 0, "*"},
+#endif
+    {0, 0, 0} /* Guarantees a non-empty array when expressions are off. */
+};
+
+static const Th8_SubsetDef th8CuratedSubsets[] = {
+    {1, "safe-file", th8SafeFileMembers,
+     (int)(sizeof(th8SafeFileMembers) / sizeof(th8SafeFileMembers[0])) - 1},
+    {1, "math", th8MathMembers,
+     (int)(sizeof(th8MathMembers) / sizeof(th8MathMembers[0])) - 1},
+};
+
+#define TH8_NUM_CURATED                                                      \
+    ((int)(sizeof(th8CuratedSubsets) / sizeof(th8CuratedSubsets[0])))
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetFindPlugin --
+ *
+ *	Resolve a subset NAME to a built-in plugin record (each plugin is a
+ *	subset whose membership is its own table), or NULL.
+ *
+ * Why / How:
+ *	Linear scan of the static plugin registry by name.
+ *
+ * Results:
+ *	The matching plugin record, or NULL.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static const th8StaticPluginRec *
+th8SubsetFindPlugin(Th8_Interp *interp, const char *zName)
+{
+    int i;
+
+    for (i = 0; i < TH8_NUM_STATIC_PLUGINS; i++) {
+	if (th8CStrEq(interp, zName, th8StaticPlugins[i].zName)) {
+	    return &th8StaticPlugins[i];
+	}
+    }
+    return NULL;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetFindCurated --
+ *
+ *	Resolve a subset NAME to a curated subset definition, or NULL.
+ *
+ * Why / How:
+ *	Linear scan of the curated subset catalogue by name.
+ *
+ * Results:
+ *	The matching curated subset, or NULL.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static const Th8_SubsetDef *
+th8SubsetFindCurated(Th8_Interp *interp, const char *zName)
+{
+    int i;
+
+    for (i = 0; i < TH8_NUM_CURATED; i++) {
+	if (th8CStrEq(interp, zName, th8CuratedSubsets[i].zName)) {
+	    return &th8CuratedSubsets[i];
+	}
+    }
+    return NULL;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetFindCommandProc --
+ *
+ *	Resolve a command NAME to its implementation by scanning the built-in
+ *	plugin command tables (the authoritative source).
+ *
+ * Why / How:
+ *	For a COMMAND subset member: ask each plugin's GetCommands for its table
+ *	and match the name.  An ensemble command legitimately has a NULL xProc,
+ *	so "found" is reported separately from the (possibly NULL) proc.
+ *
+ * Results:
+ *	1 if found (writes *pxProc), 0 if no such built-in command, -1 on an
+ *	allocation failure while scanning.
+ *
+ * Side effects:
+ *	None (temporary allocations are freed).
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8SubsetFindCommandProc(
+    Th8_Interp *interp,
+    const char *zName,
+    Th8_CommandProc *pxProc)
+{
+    size_t nName = Th8_Strlen(interp, zName);
+    int pi;
+
+    for (pi = 0; pi < TH8_NUM_STATIC_PLUGINS; pi++) {
+	int nCmd = 0;
+	Th8_CommandEntry *aEntry;
+	int ci;
+
+	if (th8StaticPlugins[pi].xGetCommands(NULL, &nCmd) != TH8_OK ||
+	    nCmd <= 0) {
+	    continue;
+	}
+	aEntry = (Th8_CommandEntry *)
+	    TH8_ALLOC_MUL(interp, (size_t)nCmd, sizeof(Th8_CommandEntry));
+	if (!aEntry) return -1;
+	if (th8StaticPlugins[pi].xGetCommands(aEntry, &nCmd) != TH8_OK) {
+	    Th8_Free(interp, aEntry);
+	    continue;
+	}
+	for (ci = 0; ci < nCmd; ci++) {
+	    if (Th8_Strlen(interp, aEntry[ci].zName) == nName &&
+	        Th8_Memcmp(interp, aEntry[ci].zName, zName, nName) == 0) {
+		*pxProc = aEntry[ci].xProc;
+		Th8_Free(interp, aEntry);
+		return 1;
+	    }
+	}
+	Th8_Free(interp, aEntry);
+    }
+    return 0;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetFindEnsembleSub --
+ *
+ *	Resolve an (ensemble, sub-command) pair to its catalogue entry.
+ *
+ * Why / How:
+ *	Find the ensemble in th8Ensembles (by bare command name), then scan its
+ *	published catalogue for the sub-command name.
+ *
+ * Results:
+ *	The Th8_SubCommand entry, or NULL if the ensemble or sub-command is not
+ *	a built-in.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static const Th8_SubCommand *
+th8SubsetFindEnsembleSub(
+    Th8_Interp *interp,
+    const char *zEnsemble,
+    const char *zSub)
+{
+    size_t nSub = Th8_Strlen(interp, zSub);
+    int i;
+
+    for (i = 0; i < TH8_NUM_ENSEMBLES; i++) {
+	const Th8_SubCommand *aSub;
+	int j;
+
+	if (!th8CStrEq(interp, zEnsemble, th8Ensembles[i].zEnsemble)) {
+	    continue;
+	}
+	aSub = *th8Ensembles[i].ppaSub;
+	if (!aSub) return NULL;
+	for (j = 0; aSub[j].zName; j++) {
+	    if (Th8_Strlen(interp, aSub[j].zName) == nSub &&
+	        Th8_Memcmp(interp, aSub[j].zName, zSub, nSub) == 0) {
+		return &aSub[j];
+	    }
+	}
+	return NULL;
+    }
+    return NULL;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetResolveMember --
+ *
+ *	Validate one curated subset member against the authoritative tables,
+ *	WITHOUT mutating the interpreter (the up-front resolve pass).
+ *
+ * Why / How:
+ *	So an unknown member (a manifest that drifted from the command surface)
+ *	makes Th8_RegisterSubsets register nothing and report the bad member,
+ *	instead of a half-applied allowlist.
+ *
+ * Results:
+ *	TH8_OK if the member resolves; TH8_ERROR (with a message) otherwise.
+ *
+ * Side effects:
+ *	On error, sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8SubsetResolveMember(Th8_Interp *interp, const Th8_SubsetMemberDef *pM)
+{
+    switch (pM->eType) {
+    case TH8_SUBSET_COMMAND: {
+	Th8_CommandProc xProc = 0;
+	int rc = th8SubsetFindCommandProc(interp, pM->zName, &xProc);
+
+	if (rc < 0)
+	    return TH8_ERROR; /* OOM (result already "out of memory"?) */
+	if (rc == 0) {
+	    Th8_ErrorMessage(
+	        interp, "subset member: no such command:", pM->zName,
+	        TH8_NOLEN);
+	    return TH8_ERROR;
+	}
+	return TH8_OK;
+    }
+    case TH8_SUBSET_FUNCTION:
+#if defined(TH8_ENABLE_EXPRESSIONS)
+	if (th8CStrEq(interp, pM->zName, "*") ||
+	    th8FindMathFunc(
+	        interp, pM->zName, Th8_Strlen(interp, pM->zName))) {
+	    return TH8_OK;
+	}
+#endif
+	Th8_ErrorMessage(
+	    interp, "subset member: no such function:", pM->zName, TH8_NOLEN);
+	return TH8_ERROR;
+    case TH8_SUBSET_SUBCOMMAND:
+	if (pM->zEnsemble &&
+	    th8SubsetFindEnsembleSub(interp, pM->zEnsemble, pM->zName)) {
+	    return TH8_OK;
+	}
+	Th8_ErrorMessage(
+	    interp, "subset member: no such subcommand:", pM->zName,
+	    TH8_NOLEN);
+	return TH8_ERROR;
+    case TH8_SUBSET_PLUGIN:
+	if (th8SubsetFindPlugin(interp, pM->zName)) return TH8_OK;
+	Th8_ErrorMessage(
+	    interp, "subset member: no such plugin:", pM->zName, TH8_NOLEN);
+	return TH8_ERROR;
+    default:
+	Th8_SetResultStatic(
+	    interp, "subset member: unknown member type", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetApplyPlugin --
+ *
+ *	Register a plugin subset: install the plugin (if absent) and populate
+ *	its ensembles; the "expressions" plugin also brings the math functions.
+ *
+ * Why / How:
+ *	A plugin subset's membership IS the plugin's command table -- reuse the
+ *	tested Th8_RegisterPlugin path, then th8PopulatePluginEnsembles.
+ *
+ * Results:
+ *	TH8_OK, or TH8_ERROR on a registration failure.
+ *
+ * Side effects:
+ *	Registers commands, sub-commands, and (for "expressions") math functions.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8SubsetApplyPlugin(Th8_Interp *interp, const th8StaticPluginRec *pP)
+{
+    size_t nName = Th8_Strlen(interp, pP->zName);
+
+    if (!th8PluginRegistered(interp, pP->zName, nName)) {
+	if (Th8_RegisterPlugin(interp, pP->zName, pP->xGetCommands) !=
+	    TH8_OK) {
+	    return TH8_ERROR;
+	}
+    }
+    if (th8PopulatePluginEnsembles(interp, pP->zName) != TH8_OK) {
+	return TH8_ERROR;
+    }
+#if defined(TH8_ENABLE_EXPRESSIONS)
+    if (th8CStrEq(interp, pP->zName, "expressions")) {
+	if (th8RegisterMathFuncs(interp) != TH8_OK) return TH8_ERROR;
+    }
+#endif
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetApplyMember --
+ *
+ *	Register one curated subset member.  Two-phase: phase 1 installs
+ *	structure (PLUGIN / COMMAND / FUNCTION), phase 2 installs SUBCOMMAND
+ *	members (whose parent ensemble command must already exist).
+ *
+ * Why / How:
+ *	Splitting the phases lets a subset name `file` (COMMAND, phase 1) and
+ *	`file exists` (SUBCOMMAND, phase 2) in any order, and lets a SUBCOMMAND
+ *	member land on an ensemble a DIFFERENT selected subset provided.  A
+ *	command a prior subset already installed is skipped (th8CommandExists),
+ *	so a second registration cannot replace and wipe an ensemble.
+ *
+ * Results:
+ *	TH8_OK, or TH8_ERROR on a registration failure.
+ *
+ * Side effects:
+ *	Registers a command / function / sub-command / plugin.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8SubsetApplyMember(
+    Th8_Interp *interp,
+    const Th8_SubsetMemberDef *pM,
+    int phase)
+{
+    switch (pM->eType) {
+    case TH8_SUBSET_PLUGIN:
+	if (phase != 1) return TH8_OK;
+	{
+	    const th8StaticPluginRec
+	        *pP = th8SubsetFindPlugin(interp, pM->zName);
+
+	    return pP ? th8SubsetApplyPlugin(interp, pP) : TH8_OK;
+	}
+    case TH8_SUBSET_COMMAND:
+	if (phase != 1) return TH8_OK;
+	if (th8CommandExists(interp, pM->zName, TH8_NOLEN)) return TH8_OK;
+	{
+	    Th8_CommandProc xProc = 0;
+	    int rc = th8SubsetFindCommandProc(interp, pM->zName, &xProc);
+
+	    if (rc <= 0) return (rc < 0) ? TH8_ERROR : TH8_OK;
+	    return Th8_CreateCommand(interp, pM->zName, xProc, 0, 0, 0);
+	}
+    case TH8_SUBSET_FUNCTION:
+	if (phase != 1) return TH8_OK;
+#if defined(TH8_ENABLE_EXPRESSIONS)
+	if (th8CStrEq(interp, pM->zName, "*")) {
+	    return th8RegisterMathFuncs(interp);
+	}
+	return th8RegisterOneMathFunc(
+	    interp, pM->zName, Th8_Strlen(interp, pM->zName));
+#else
+	return TH8_OK;
+#endif
+    case TH8_SUBSET_SUBCOMMAND:
+	if (phase != 2) return TH8_OK;
+	{
+	    const Th8_SubCommand *pSub =
+	        th8SubsetFindEnsembleSub(interp, pM->zEnsemble, pM->zName);
+
+	    if (!pSub) return TH8_OK; /* resolved earlier; defensive */
+	    return Th8_CreateSubCommand(
+	        interp, pM->zEnsemble, pM->zName, pSub->xProc, 0, 0, 0);
+	}
+    default:
+	return TH8_OK;
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_RegisterSubsets --
+ *
+ *	Register the named subsets (an allowlist) into interp.  See th8.h.
+ *
+ * Why / How:
+ *	Resolve every subset name (and every curated member) up front so an
+ *	unknown name registers nothing (transactional).  Then register the
+ *	essential syntax, plugin subsets, and curated members -- curated members
+ *	in two phases so sub-commands land after their ensemble commands exist.
+ *	Union/dedup is free (idempotent plugin/command registration).  A later
+ *	OOM leaves a partial language; the caller must discard the interpreter.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR (with a message) on an unknown name/member
+ *	or a registration failure.
+ *
+ * Side effects:
+ *	Registers language surface into the interpreter.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_RegisterSubsets(
+    Th8_Interp *interp,
+    const char *const *azNames,
+    int nNames)
+{
+    int i;
+
+    if (!interp) return TH8_ERROR;
+    TH8_ASSERT_OWNER(interp);
+    if (nNames < 0 || (nNames > 0 && !azNames)) {
+	Th8_SetResultStatic(
+	    interp, "Th8_RegisterSubsets: invalid arguments", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+
+    /* Resolve pass: every name must be a plugin or curated subset, and every
+     * curated member must resolve.  Register nothing on any failure. */
+    for (i = 0; i < nNames; i++) {
+	const Th8_SubsetDef *pCur;
+
+	if (!azNames[i]) {
+	    Th8_SetResultStatic(
+	        interp, "Th8_RegisterSubsets: null subset name", TH8_NOLEN);
+	    return TH8_ERROR;
+	}
+	if (th8SubsetFindPlugin(interp, azNames[i])) continue;
+	pCur = th8SubsetFindCurated(interp, azNames[i]);
+	if (!pCur) {
+	    Th8_ErrorMessage(
+	        interp, "no such subset:", azNames[i], TH8_NOLEN);
+	    return TH8_ERROR;
+	}
+	{
+	    int m;
+
+	    for (m = 0; m < pCur->nMember; m++) {
+		if (th8SubsetResolveMember(interp, &pCur->aMember[m]) !=
+		    TH8_OK) {
+		    return TH8_ERROR;
+		}
+	    }
+	}
+    }
+
+    /* Essential syntax: the {*} expansion operator (as Th8_RegisterLanguage). */
+    if (Th8_RegisterExpansion(interp, "*", 1, 0, 0) != TH8_OK) {
+	return TH8_ERROR;
+    }
+
+    /* Apply pass 1: plugin subsets + curated structure members. */
+    for (i = 0; i < nNames; i++) {
+	const th8StaticPluginRec
+	    *pP = th8SubsetFindPlugin(interp, azNames[i]);
+
+	if (pP) {
+	    if (th8SubsetApplyPlugin(interp, pP) != TH8_OK) return TH8_ERROR;
+	} else {
+	    const Th8_SubsetDef
+	        *pCur = th8SubsetFindCurated(interp, azNames[i]);
+	    int m;
+
+	    for (m = 0; m < pCur->nMember; m++) {
+		if (th8SubsetApplyMember(interp, &pCur->aMember[m], 1) !=
+		    TH8_OK) {
+		    return TH8_ERROR;
+		}
+	    }
+	}
+    }
+
+    /* Apply pass 2: curated SUBCOMMAND members (ensembles now exist). */
+    for (i = 0; i < nNames; i++) {
+	const Th8_SubsetDef *pCur = th8SubsetFindCurated(interp, azNames[i]);
+	int m;
+
+	if (!pCur) continue;
+	for (m = 0; m < pCur->nMember; m++) {
+	    if (th8SubsetApplyMember(interp, &pCur->aMember[m], 2) !=
+	        TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
+    }
+
+    Th8_SetResult(interp, 0, 0);
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_ListSubsets --
+ *
+ *	Set the interpreter result to the list of valid subset names (every
+ *	built-in plugin plus every curated subset).  See th8.h.
+ *
+ * Why / How:
+ *	Builds a well-formed list with Th8_ListAppend.
+ *
+ * Results:
+ *	TH8_OK.
+ *
+ * Side effects:
+ *	Sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_ListSubsets(Th8_Interp *interp)
+{
+    char *zList = 0;
+    size_t nList = 0;
+    int i;
+
+    if (!interp) return TH8_ERROR;
+    for (i = 0; i < TH8_NUM_STATIC_PLUGINS; i++) {
+	if (Th8_ListAppend(
+	        interp, &zList, &nList, th8StaticPlugins[i].zName,
+	        TH8_NOLEN) != TH8_OK) {
+	    Th8_Free(interp, zList);
+	    return TH8_ERROR;
+	}
+    }
+    for (i = 0; i < TH8_NUM_CURATED; i++) {
+	if (Th8_ListAppend(
+	        interp, &zList, &nList, th8CuratedSubsets[i].zName,
+	        TH8_NOLEN) != TH8_OK) {
+	    Th8_Free(interp, zList);
+	    return TH8_ERROR;
+	}
+    }
+    Th8_SetResult(interp, zList ? zList : "", zList ? nList : 0);
+    Th8_Free(interp, zList);
+    return TH8_OK;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8SubsetAppendMember --
+ *
+ *	Append one member's audit form ("<type> <name>", or
+ *	"subcommand <ensemble> <name>") to a list.
+ *
+ * Why / How:
+ *	Shared by Th8_GetSubsetMembers for both member kinds.
+ *
+ * Results:
+ *	TH8_OK, or TH8_ERROR on an append failure.
+ *
+ * Side effects:
+ *	Grows the caller's list.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8SubsetAppendMember(
+    Th8_Interp *interp,
+    char **pzList,
+    size_t *pnList,
+    const char *zType,
+    const char *zEnsemble,
+    const char *zName)
+{
+    char *zElem = 0;
+    size_t nElem = 0;
+    int rc = TH8_OK;
+
+    if (Th8_StringAppend(interp, &zElem, &nElem, zType, TH8_NOLEN) !=
+            TH8_OK ||
+        Th8_StringAppend(interp, &zElem, &nElem, " ", 1) != TH8_OK) {
+	Th8_Free(interp, zElem);
+	return TH8_ERROR;
+    }
+    if (zEnsemble) {
+	if (Th8_StringAppend(interp, &zElem, &nElem, zEnsemble, TH8_NOLEN) !=
+	        TH8_OK ||
+	    Th8_StringAppend(interp, &zElem, &nElem, " ", 1) != TH8_OK) {
+	    Th8_Free(interp, zElem);
+	    return TH8_ERROR;
+	}
+    }
+    if (Th8_StringAppend(interp, &zElem, &nElem, zName, TH8_NOLEN) !=
+        TH8_OK) {
+	Th8_Free(interp, zElem);
+	return TH8_ERROR;
+    }
+    rc = Th8_ListAppend(interp, pzList, pnList, zElem, nElem);
+    Th8_Free(interp, zElem);
+    return rc;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * Th8_GetSubsetMembers --
+ *
+ *	Set the interpreter result to the resolved members of one subset.  See
+ *	th8.h.
+ *
+ * Why / How:
+ *	For a plugin subset, enumerate its command table and its ensembles'
+ *	sub-commands (and, for "expressions", the math functions) -- the same
+ *	membership registration installs.  For a curated subset, list each
+ *	member, validating it resolves so a drifted manifest fails here.
+ *
+ * Results:
+ *	TH8_OK; TH8_ERROR (with a message) for an unknown subset name.
+ *
+ * Side effects:
+ *	Sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+Th8_GetSubsetMembers(Th8_Interp *interp, const char *zName)
+{
+    const th8StaticPluginRec *pP;
+    const Th8_SubsetDef *pCur;
+    char *zList = 0;
+    size_t nList = 0;
+
+    if (!interp || !zName) return TH8_ERROR;
+
+    pP = th8SubsetFindPlugin(interp, zName);
+    if (pP) {
+	int nCmd = 0;
+	Th8_CommandEntry *aEntry;
+	int ci, ei;
+
+	if (pP->xGetCommands(NULL, &nCmd) == TH8_OK && nCmd > 0) {
+	    aEntry = (Th8_CommandEntry *)
+	        TH8_ALLOC_MUL(interp, (size_t)nCmd, sizeof(Th8_CommandEntry));
+	    if (!aEntry) return TH8_ERROR;
+	    if (pP->xGetCommands(aEntry, &nCmd) != TH8_OK) {
+		Th8_Free(interp, aEntry);
+		return TH8_ERROR;
+	    }
+	    for (ci = 0; ci < nCmd; ci++) {
+		if (th8SubsetAppendMember(
+		        interp, &zList, &nList, "command", 0,
+		        aEntry[ci].zName) != TH8_OK) {
+		    Th8_Free(interp, aEntry);
+		    Th8_Free(interp, zList);
+		    return TH8_ERROR;
+		}
+	    }
+	    Th8_Free(interp, aEntry);
+	}
+	/* Ensemble sub-commands owned by this plugin. */
+	for (ei = 0; ei < TH8_NUM_ENSEMBLES; ei++) {
+	    const Th8_SubCommand *aSub;
+	    int j;
+
+	    if (!th8CStrEq(interp, pP->zName, th8Ensembles[ei].zPlugin)) {
+		continue;
+	    }
+	    aSub = *th8Ensembles[ei].ppaSub;
+	    for (j = 0; aSub && aSub[j].zName; j++) {
+		if (th8SubsetAppendMember(
+		        interp, &zList, &nList, "subcommand",
+		        th8Ensembles[ei].zEnsemble,
+		        aSub[j].zName) != TH8_OK) {
+		    Th8_Free(interp, zList);
+		    return TH8_ERROR;
+		}
+	    }
+	}
+#if defined(TH8_ENABLE_EXPRESSIONS)
+	if (th8CStrEq(interp, pP->zName, "expressions")) {
+	    if (th8SubsetAppendMember(
+	            interp, &zList, &nList, "function", 0, "*") != TH8_OK) {
+		Th8_Free(interp, zList);
+		return TH8_ERROR;
+	    }
+	}
+#endif
+	Th8_SetResult(interp, zList ? zList : "", zList ? nList : 0);
+	Th8_Free(interp, zList);
+	return TH8_OK;
+    }
+
+    pCur = th8SubsetFindCurated(interp, zName);
+    if (pCur) {
+	int m;
+
+	for (m = 0; m < pCur->nMember; m++) {
+	    const Th8_SubsetMemberDef *pM = &pCur->aMember[m];
+	    const char *zType = (pM->eType == TH8_SUBSET_COMMAND) ? "command"
+	                      : (pM->eType == TH8_SUBSET_FUNCTION)
+	                          ? "function"
+	                      : (pM->eType == TH8_SUBSET_SUBCOMMAND)
+	                          ? "subcommand"
+	                          : "plugin";
+
+	    if (th8SubsetResolveMember(interp, pM) != TH8_OK) {
+		Th8_Free(interp, zList);
+		return TH8_ERROR;
+	    }
+	    if (th8SubsetAppendMember(
+	            interp, &zList, &nList, zType, pM->zEnsemble,
+	            pM->zName) != TH8_OK) {
+		Th8_Free(interp, zList);
+		return TH8_ERROR;
+	    }
+	}
+	Th8_SetResult(interp, zList ? zList : "", zList ? nList : 0);
+	Th8_Free(interp, zList);
+	return TH8_OK;
+    }
+
+    Th8_ErrorMessage(interp, "no such subset:", zName, TH8_NOLEN);
+    return TH8_ERROR;
 }
 
 
@@ -74263,14 +82435,21 @@ th8RegisterStaticPlugins(Th8_Interp *interp)
  *
  * Why / How:
  *	All commands are registered through the plugin system via
- *	th8RegisterStaticPlugins.  This function also initializes
- *	ensemble sub-command table pointers by triggering each
- *	ensemble once, registers the {*} expansion operator, the
- *	built-in math functions, the built-in Tcl/TH8 packages,
- *	and the ::th8_security system variable array.
+ *	th8RegisterStaticPlugins, which also initializes the ensemble
+ *	sub-command table pointers directly (each plugin's *GetCommands
+ *	assigns them).  This function additionally registers the {*}
+ *	expansion operator, the built-in math functions, the built-in
+ *	Tcl/TH8 packages, and the ::th8_security system variable array.
  *
  * Results:
- *	TH8_OK.
+ *	TH8_OK if the full built-in language registered successfully.
+ *	TH8_ERROR if any required step failed (e.g. OOM registering a
+ *	plugin, math function, expansion operator, built-in package, or
+ *	the security system variable) -- the previous version always
+ *	returned TH8_OK, hiding a partial/inconsistent language
+ *	(TH8K-006).  On TH8_ERROR the interpreter's language is partially
+ *	registered; the caller SHOULD discard the interpreter rather than
+ *	use it.
  *
  * Side effects:
  *	Commands are created in the interpreter.
@@ -74281,29 +82460,26 @@ th8RegisterStaticPlugins(Th8_Interp *interp)
 int
 Th8_RegisterLanguage(Th8_Interp *interp) /* Interpreter. */
 {
+    TH8_ASSERT_OWNER(interp);
+
     /*
      * All commands are now registered through the plugin system.
      * The aCmd[] table has been fully replaced by th8RegisterStaticPlugins.
      */
 
     /*
-     * Force-initialize the ensemble subcommand table pointers
-     * by calling each ensemble once (no-arg call triggers
-     * pointer assignment before returning an error, which we
-     * discard).
+     * The ensemble subcommand-table pointers (th8_info_aSub,
+     * th8_file_aSub, th8_string_aSub, th8_namespace_aSub,
+     * th8_package_aSub, th8_array_aSub) are initialized DIRECTLY by each
+     * plugin's *GetCommands function during th8RegisterStaticPlugins
+     * below -- there is deliberately no eval-based "force-init" here
+     * (TH8K-006).  The former loop called each ensemble with no args to
+     * trigger the assignment, but it ran BEFORE th8RegisterStaticPlugins
+     * (so the commands did not yet exist -- every eval failed "no such
+     * command") AND discarded every result (so it could not distinguish
+     * the intended usage error from a real OOM).  It was both broken and
+     * redundant; removing it also removes a swallowed-error path.
      */
-
-    {
-	const char *azEns[] = {"info",    "file",  "string", "namespace",
-	                       "package", "array", 0};
-	size_t anEns[] = {4, 4, 6, 9, 7, 5};
-	int j;
-
-	for (j = 0; azEns[j]; j++) {
-	    Th8_Eval(interp, 0, azEns[j], anEns[j], NULL, 0);
-	}
-	Th8_ClearResult(interp);
-    }
 
     /*
      * Register the built-in {*} expansion operator.
@@ -74311,7 +82487,9 @@ Th8_RegisterLanguage(Th8_Interp *interp) /* Interpreter. */
      * The host can unregister it for strict 8.4 compatibility.
      */
 
-    Th8_RegisterExpansion(interp, "*", 1, 0, 0);
+    if (Th8_RegisterExpansion(interp, "*", 1, 0, 0) != TH8_OK) {
+	return TH8_ERROR;
+    }
 
     /*
      * Register built-in math functions (abs, int, double, sin,
@@ -74319,34 +82497,71 @@ Th8_RegisterLanguage(Th8_Interp *interp) /* Interpreter. */
      */
 
 #if defined(TH8_ENABLE_EXPRESSIONS)
-    th8RegisterMathFuncs(interp);
+    if (th8RegisterMathFuncs(interp) != TH8_OK) {
+	return TH8_ERROR;
+    }
 #endif
 
     /*
      * Register built-in plugins.  This must happen before any
      * Th8_Eval calls that use plugin-provided commands (package,
-     * file, lappend, etc.).
+     * file, lappend, etc.).  A real registration failure (OOM) is
+     * propagated so callers are not told the language is complete when
+     * it is not (TH8K-006).
      */
 
-    th8RegisterStaticPlugins(interp);
+    if (th8RegisterStaticPlugins(interp) != TH8_OK) {
+	return TH8_ERROR;
+    }
+
+    /*
+     * Populate the ensemble commands' per-interpreter sub-command hashes from
+     * their static catalogues (TH8K-025), iterating the shared th8Ensembles
+     * table (the same source the plugin-subset path uses).  Done AFTER the
+     * plugins register the top-level ensemble command and BEFORE any eval that
+     * could use it.  An unbuilt plugin leaves its catalogue pointer NULL
+     * (skipped).
+     */
+
+    {
+	int e;
+
+	for (e = 0; e < TH8_NUM_ENSEMBLES; e++) {
+	    if (*th8Ensembles[e].ppaSub &&
+	        th8PopulateEnsemble(
+	            interp, th8Ensembles[e].zEnsemble,
+	            *th8Ensembles[e].ppaSub) != TH8_OK) {
+		return TH8_ERROR;
+	    }
+	}
+    }
 
     /*
      * Add the directory containing the process executable to the
      * auto-path because it may contain (test?) packages, etc.
      */
 
-    Th8_Eval(
-        interp, 0,
-        "lappend ::auto_path [file dirname [info nameofexecutable]]",
-        TH8_NOLEN, NULL, 0);
+    if (Th8_Eval(
+            interp, 0,
+            "lappend ::auto_path [file dirname [info nameofexecutable]]",
+            TH8_NOLEN, NULL, 0) != TH8_OK) {
+	return TH8_ERROR;
+    }
 
     /*
      * Provide the built-in static packages that are already to
      * be present in the interpreter.
      */
 
-    Th8_Eval(interp, 0, "package provide Tcl 8.6.21", TH8_NOLEN, NULL, 0);
-    Th8_Eval(interp, 0, "package provide TH8 1.0", TH8_NOLEN, NULL, 0);
+    if (Th8_Eval(
+            interp, 0, "package provide Tcl 8.6.21", TH8_NOLEN, NULL, 0) !=
+        TH8_OK) {
+	return TH8_ERROR;
+    }
+    if (Th8_Eval(interp, 0, "package provide TH8 1.0", TH8_NOLEN, NULL, 0) !=
+        TH8_OK) {
+	return TH8_ERROR;
+    }
 
     /*
      * System variables: read-only from scripts.
@@ -74358,9 +82573,19 @@ Th8_RegisterLanguage(Th8_Interp *interp) /* Interpreter. */
      */
 
 #if defined(TH8_ENABLE_VARIABLES)
-    Th8_ResetSecurityArray(interp);
+    /*
+     * Use the CHECKED reset: a transient OOM while setting any of the
+     * seven ::th8_security elements must fail registration rather than
+     * leave a partially-populated security array behind a TH8_OK return
+     * (TH8K-006).
+     */
+    if (th8ResetSecurityArray(interp) != TH8_OK) {
+	return TH8_ERROR;
+    }
 
-    Th8_DeclareSystemVar(interp, "::th8_security", TH8_NOLEN);
+    if (Th8_DeclareSystemVar(interp, "::th8_security", TH8_NOLEN) != TH8_OK) {
+	return TH8_ERROR;
+    }
 #endif
 
     return TH8_OK;
@@ -74426,42 +82651,35 @@ Th8_RegisterLanguage(Th8_Interp *interp) /* Interpreter. */
  */
 
 static void *
-th8MemNeedMemory(Th8_Interp *interp, size_t nByte)
+th8MemNeedMemory(
+    Th8_Interp *interp, /* Interpreter under memory pressure. */
+    size_t nByte, /* Requested size (already validated by the caller). */
+    int bPanic, /* Forwarded to th8MallocCommon (panic-on-failure). */
+    const char *zFile, /* Caller __FILE__ for the fault filter. */
+    int nLine) /* Caller __LINE__ for the fault filter. */
 {
-    const Th8_Platform *pPlat;
-
     if (!interp) return NULL;
 
     /*
-     * Step 1: Clear the IR cache.  This releases all cached
-     * type conversions, list splits, and buffer pool entries.
+     * Step 1: Clear the IR cache.  This releases all cached type
+     * conversions, list splits, and buffer pool entries.  Freeing them
+     * decrements the interpreter's accounted bytes (nAllocBytes), which is
+     * what can make the retry below fit under Th8_SetAllocLimit.
      */
 
     th8ClearCache(interp);
 
     /*
-     * Step 2: Sanity check.  Reject requests that exceed the
-     * maximum allocation size.  This prevents a corrupted size_t
-     * from causing a massive allocation attempt.
+     * Step 2: Retry through the ONE limit-checked, zero-filled, accounted
+     * allocation core (TH8K-023).  Delegating to th8MallocCommon -- rather
+     * than a raw xMalloc as before -- is what makes this second chance
+     * respect the per-interpreter memory limit and update the accounting
+     * EXACTLY ONCE, in one place.  th8MallocCommon never invokes xNeedMemory,
+     * so this cannot recurse.  Th8_SafeAlloc does not re-zero or re-account
+     * the result, so the block th8MallocCommon returns is used as-is.
      */
 
-    if (nByte == 0 || nByte > TH8_MX_ALLOC) {
-	return NULL;
-    }
-
-    /*
-     * Step 3: Retry the allocation via the interpreter's
-     * current xMalloc callback.  This goes through the real
-     * platform allocator (not through Th8_Malloc, which would
-     * recurse back into Th8_SafeAlloc and xNeedMemory).
-     */
-
-    pPlat = Th8_GetPlatform(interp);
-    if (ALWAYS(pPlat) && pPlat->xMalloc) {
-	return pPlat->xMalloc(interp, pPlat->pCtx, nByte);
-    }
-
-    return NULL;
+    return th8MallocCommon(interp, nByte, bPanic, zFile, nLine);
 }
 
 
@@ -74475,7 +82693,7 @@ th8MemNeedMemory(Th8_Interp *interp, size_t nByte)
  */
 
 static const Th8_Platform th8MemPlatformData = {
-    5,    /* nVersion */
+    1,    /* nVersion */
     0,    /* xInitialize */
     0,    /* xFinalize */
 
@@ -74604,8 +82822,11 @@ static const Th8_Platform th8MemPlatformData = {
     /* DNS */
     0, 0,   /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -74618,6 +82839,19 @@ static const Th8_Platform th8MemPlatformData = {
  * Th8_GetMemPlatform --
  *
  *	Return the static memory-recovery platform struct.
+ *
+ * Why / How:
+ *	Returns the address of a single file-scope Th8_Platform table
+ *	(th8MemPlatformData) whose only populated slot is the
+ *	xNeedMemory memory-recovery callback; every other slot is zero
+ *	so merging it into a platform overrides nothing else.  Static
+ *	storage means no allocation and process-lifetime validity.
+ *
+ * Results:
+ *	Pointer to the static memory-recovery Th8_Platform struct.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -74704,6 +82938,13 @@ Th8_GetMemPlatform(void)
  *	(and thus the test-library dump command) always resolves; it
  *	simply reports that a debug build is required.
  *
+ * Why / How:
+ *	The real dump only exists in a TH8_MEM_DEBUG build, but the
+ *	internal-stubs table is fixed at link time and must resolve the
+ *	symbol in every build.  This stub keeps the ABI stable by
+ *	ignoring its path arguments and failing with a clear message
+ *	instead of being absent.
+ *
  * Results:
  *	TH8_ERROR, with an explanatory interpreter result.
  *
@@ -74735,6 +82976,12 @@ th8MemTrackDump(Th8_Interp *interp, const char *zPath, size_t nPath)
  *	"ensure the tracker holds nothing", which is trivially true here).
  *	The symbol exists unconditionally so the internal-stubs table
  *	(and thus the test-library reset command) always resolves.
+ *
+ * Why / How:
+ *	Like the dump stub, this keeps the internal-stubs ABI stable in a
+ *	non-debug build.  Because there is no tracker state to release, a
+ *	reset trivially succeeds and reports zero blocks cleared, so
+ *	callers can invoke it unconditionally regardless of build type.
  *
  * Results:
  *	TH8_OK; interpreter result set to "0" (blocks cleared).
@@ -74939,6 +83186,14 @@ th8MemTraceHash(void *const *aFrames, int nFrames)
  *	fail).  Runs BEFORE the table lock is taken, so any lazy first-call
  *	unwind setup happens outside the lock.
  *
+ * Why / How:
+ *	Prefers the platform's xStackBackTrace callback (which skips the
+ *	innermost tracker frames) so dumps begin at the allocation
+ *	funnel.  If that callback is absent or returns nothing, it
+ *	degrades to the single immediate caller via
+ *	__builtin_return_address on GCC/Clang -- capture must never fail
+ *	(R5/R6), only produce fewer frames.
+ *
  * Results:
  *	Number of frames captured (0 if none available).
  *
@@ -75029,6 +83284,12 @@ th8MemRawAlloc(size_t nByte)
  *	process-global platform's xFree callback (see th8MemRawAlloc for
  *	why the tracker never uses the per-interp platform or Th8_Free).
  *
+ * Why / How:
+ *	Mirrors th8MemRawAlloc so bookkeeping is freed through the same
+ *	stable process-global allocator it was allocated from.  A NULL
+ *	pointer, or a missing xFree callback (only before
+ *	Th8_Initialize), is treated as a no-op so callers need not guard.
+ *
  * Results:
  *	None.
  *
@@ -75060,6 +83321,12 @@ th8MemRawFree(void *p)
  *	n is zero or the callback is unavailable (only possible before
  *	Th8_Initialize, where the tracker does not run).
  *
+ * Why / How:
+ *	Routes byte copies through the same stable process-global
+ *	platform the tracker uses for everything else, avoiding a direct
+ *	libc/per-interp dependency.  The zero-length / no-callback short
+ *	circuit keeps it safe to call before Th8_Initialize.
+ *
  * Results:
  *	None.
  *
@@ -75086,6 +83353,12 @@ th8MemCopy(void *dst, const void *src, size_t n)
  *	Zero n bytes of a tracker structure via the stable process-global
  *	platform's xMemset (see th8MemCopy).  A no-op if n is zero or the
  *	callback is unavailable.
+ *
+ * Why / How:
+ *	Same stable-platform rationale as th8MemCopy: newly allocated
+ *	tracker structures are cleared via the platform xMemset rather
+ *	than a direct memset, with a zero-length / no-callback short
+ *	circuit for safety before Th8_Initialize.
  *
  * Results:
  *	None.
@@ -75115,6 +83388,13 @@ th8MemZero(void *dst, size_t n)
  *	callback is unavailable it reports "equal" for a zero-length
  *	compare and "not equal" otherwise -- a safe default that only
  *	applies before Th8_Initialize, where the tracker does not run.
+ *
+ * Why / How:
+ *	Used to compare interned stack frames when deduplicating traces.
+ *	Routes through the stable process-global xMemcmp for the same
+ *	reason as th8MemCopy; if the callback is unavailable it reports
+ *	equality only for a zero-length compare, a conservative default
+ *	that never runs once the tracker is active.
  *
  * Results:
  *	<0, 0, or >0 like memcmp.
@@ -75146,6 +83426,24 @@ th8MemCmp(const void *a, const void *b, size_t n)
  *	known.  Must be called with the table lock held.  On allocation
  *	failure returns NULL (the caller still records the block,
  *	traceless).
+ *
+ * Why / How:
+ *	Many live blocks share the same allocation call site, so storing
+ *	each stack once and referencing it by pointer keeps the tracker's
+ *	footprint bounded (R9).  The frame array is hashed, the matching
+ *	bucket is scanned for an identical stack (same hash, frame count,
+ *	and bytes), and a hit is reused; a miss allocates a new trace via
+ *	th8MemRawAlloc, assigns it the next stable id, copies the frames,
+ *	and links it at the bucket head.
+ *
+ * Results:
+ *	Pointer to the interned th8MemTrace for this stack, or NULL if
+ *	the frame-array size computation overflows or the allocation
+ *	fails.
+ *
+ * Side effects:
+ *	May allocate a new trace node from the process-global platform,
+ *	link it into g_aTrace, and advance g_nNextTraceId.
  *
  *----------------------------------------------------------------------
  */
@@ -75196,6 +83494,20 @@ th8MemInternTrace(void *const *aFrames, int nFrames)
  *	Returns non-zero if a node was removed.  Interned traces are NOT
  *	freed (they are shared and cheap to retain for the process life).
  *
+ * Why / How:
+ *	Walks the address-bucket chain for pAddr; on a match it splices
+ *	the node out, subtracts its recorded size from g_nLiveBytes
+ *	(clamped at zero) and decrements g_nLiveBlocks, then frees the
+ *	node via th8MemRawFree.  The shared interned trace is left in
+ *	place because it may still describe other live blocks.
+ *
+ * Results:
+ *	1 if a node for pAddr was found and removed; 0 otherwise.
+ *
+ * Side effects:
+ *	Unlinks and frees the address node; decrements the live byte and
+ *	block totals.  Must be called with the global mutex held.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -75235,6 +83547,24 @@ th8MemUnlink(void *pAddr)
  *	captured stack.  Called from th8MallocCommon after a successful
  *	xMalloc.  No-op if pAddr is NULL or if already inside a tracker
  *	hook on this thread.
+ *
+ * Why / How:
+ *	The thread-local g_inHook guard prevents re-entry when the
+ *	tracker's own bookkeeping allocations run.  The stack is captured
+ *	BEFORE taking the lock (leaf-lock discipline, R4); then a node is
+ *	allocated, filled in with the address, size, and interned trace,
+ *	and pushed onto its address bucket under the global mutex while
+ *	the live totals are advanced.  The per-allocation interp is
+ *	intentionally ignored -- the tracker runs entirely through the
+ *	stable process-global platform.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Allocates and links an address node; increments g_nLiveBytes and
+ *	g_nLiveBlocks; may intern a new trace.  Briefly holds the global
+ *	mutex.  No-op on NULL pAddr or re-entry.
  *
  *----------------------------------------------------------------------
  */
@@ -75288,6 +83618,21 @@ th8MemTrackAlloc(Th8_Interp *interp, void *pAddr, size_t nByte)
  *	in-place case (pOld == pNew) correctly by unlinking then
  *	re-inserting.
  *
+ * Why / How:
+ *	Structurally identical to th8MemTrackAlloc (same g_inHook guard,
+ *	capture-before-lock discipline, and process-global platform use),
+ *	but first unlinks the old address record under the lock so an
+ *	in-place realloc does not leave a stale or duplicate node.  The
+ *	new block is then recorded with the realloc site's own stack.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Removes the old address node (if any) and links a new one;
+ *	adjusts g_nLiveBytes / g_nLiveBlocks; may intern a new trace.
+ *	Briefly holds the global mutex.  No-op on NULL pNew or re-entry.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -75336,6 +83681,21 @@ th8MemTrackRealloc(Th8_Interp *interp, void *pOld, void *pNew, size_t nByte)
  *	before the underlying xFree.  Freeing an untracked address
  *	(e.g. one allocated via a direct xMalloc that bypassed the
  *	funnel) is a silent no-op -- never an error.
+ *
+ * Why / How:
+ *	Raises the g_inHook re-entry guard, takes the global mutex, and
+ *	delegates to th8MemUnlink, which removes the node (if tracked)
+ *	and adjusts the live totals.  An untracked address simply finds
+ *	no node, so freeing blocks that bypassed the tracked funnel is
+ *	harmless.  The per-allocation interp is ignored, as elsewhere.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Removes the address node for pAddr (if any) and decrements the
+ *	live totals.  Briefly holds the global mutex.  No-op on NULL
+ *	pAddr or re-entry.
  *
  *----------------------------------------------------------------------
  */
@@ -75546,6 +83906,20 @@ th8MemChanPuts(
  *	raw PC.  On Windows the raw PC is written (dbghelp symbolization
  *	is deferred -- see the note in th8MemTrackDump).
  *
+ * Why / How:
+ *	Formats one line into a fixed 256-byte buffer via th8Snprintf.
+ *	On POSIX/macOS dladdr maps the PC to "symbol+offset (module)";
+ *	if the lookup fails (static function or no symbol) it falls back
+ *	to the raw PC with "<unknown>".  On Windows it always writes the
+ *	raw hex PC.  The formatted line is written only when it fit the
+ *	buffer, so a truncated frame is dropped rather than mangled.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes up to one line to the open channel via th8MemChanWrite.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -75617,6 +83991,16 @@ th8MemWriteFrame(
  *	reports its own authoritative live totals; the test library's
  *	logical-list-vs-side-table comparison provides the near-term
  *	cross-check (design section 3.4).
+ *
+ * Why / How:
+ *	Groups live blocks by their interned trace so each unique call
+ *	site is reported once with aggregate counts rather than one line
+ *	per allocation.  The two robustness choices above -- probing for
+ *	an existing file before create, and snapshotting the live set
+ *	under the lock but writing the file with the lock released --
+ *	avoid clobbering test output and a self-deadlock through the
+ *	channel write path, respectively.  Symbolization is delegated to
+ *	th8MemWriteFrame per frame.
  *
  * Results:
  *	TH8_OK on success (interpreter result = live block count);
@@ -76174,7 +84558,14 @@ Th8_EvalFileAsData(
      * the evaluated script has access to the full TH8 language.
      */
 
-    Th8_RegisterLanguage(pChild);
+    if (Th8_RegisterLanguage(pChild) != TH8_OK) {
+	Th8_SetResult(
+	    interp, "Th8_EvalFileAsData: cannot register language",
+	    TH8_NOLEN);
+	Th8_DeleteInterp(pChild);
+	Th8_FreePlatform(pChildPlat);
+	return TH8_ERROR;
+    }
 
     /*
      * Step 3: If the parent has signed-only policy enabled,
@@ -76717,7 +85108,7 @@ th8NullGetCwd(
  */
 
 static Th8_Platform th8NullIoPlatformData = {
-    5,   /* nVersion */
+    1,   /* nVersion */
     0,   /* xInitialize */
     0,   /* xFinalize */
 
@@ -76846,8 +85237,11 @@ static Th8_Platform th8NullIoPlatformData = {
     /* DNS (none) */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -77064,7 +85458,7 @@ th8UnwindStackBackTrace(
  */
 
 static Th8_Platform th8UnwindPlatformData = {
-    5, /* nVersion */
+    1, /* nVersion */
     0, 0, 0, 0, /* xInitialize, xFinalize, xPreDeleteInterp, xDeleteInterp */
 
     /* Memory */
@@ -77119,8 +85513,11 @@ static Th8_Platform th8UnwindPlatformData = {
     /* DNS */
     0, 0, /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the compiler unwind runtime. */
+    /* Diagnostics -- the compiler unwind runtime. */
     th8UnwindStackBackTrace, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -77136,6 +85533,14 @@ static Th8_Platform th8UnwindPlatformData = {
  *	Internal: it is merged by Th8_UseDefaultPlatform to supply
  *	xStackBackTrace on GCC/Clang targets that lack a native OS stack
  *	walk.  Not part of the public platform-getter surface.
+ *
+ * Why / How:
+ *	Returns the address of a single file-scope Th8_Platform table
+ *	(th8UnwindPlatformData) whose only populated slot is the
+ *	stack-backtrace callback; all other slots are zero so that a
+ *	merge overrides nothing else.  Returning a pointer to static
+ *	storage means there is no allocation and the table lives for the
+ *	life of the process.
  *
  * Results:
  *	Pointer to a static Th8_Platform struct.
@@ -77406,6 +85811,7 @@ const Th8StubsTable th8StubsTableData = {
     Th8_Finalize,
     Th8_GetInternalStubs,
     Th8_IntCmpXchg,
+    Th8_Int64CmpXchg,
     Th8_CreateInterp,
     Th8_RestoreInterp,
     Th8_DeleteInterp,
@@ -77482,6 +85888,9 @@ const Th8StubsTable th8StubsTableData = {
     0,
 #endif
     Th8_CreateCommand,
+    Th8_CreateSubCommand,
+    Th8_DeleteSubCommand,
+    Th8_GetSubCommandInfo,
     Th8_DeleteCommand,
     Th8_GetCommandInfo,
     Th8_SetCommandCopy,
@@ -77663,7 +86072,11 @@ const Th8StubsTable th8StubsTableData = {
 #else
     0,
 #endif
+#if defined(TH8_ENABLE_CRYPTOGRAPHY)
     Th8_GetEmbeddedKeyring,
+#else
+    0,
+#endif
 #if defined(TH8_ENABLE_CRYPTOGRAPHY) && defined(TH8_ENABLE_TEST_KEY)
     Th8_GetEmbeddedKeyTest,
 #else
@@ -77727,8 +86140,13 @@ const Th8StubsTable th8StubsTableData = {
     Th8_SetOverflowCheck,
     Th8_GetOverflowCheck,
     Th8_SetAllocLimit,
+    Th8_SetSafeLimits,
+    Th8_SetDeadline,
+    Th8_GetDeadline,
+    Th8_SetTimeLimitMs,
     Th8_GetAllocLimit,
     Th8_GetAllocBytes,
+    Th8_GetAllocPeak,
 #if defined(TH8_ENABLE_LOAD)
     Th8_EnableLoad,
 #else
@@ -77819,7 +86237,6 @@ const Th8StubsTable th8StubsTableData = {
     0,
 #endif
     Th8_WrongNumArgs,
-    Th8_CallSubCommand,
     Th8_ReportTaint,
     Th8_Input,
     Th8_Output,
@@ -77893,6 +86310,7 @@ const Th8StubsTable th8StubsTableData = {
     Th8_GetPid,
     Th8_GetParentPid,
     Th8_GetThreadId,
+    Th8_GetInterpThreadId,
     Th8_GetEnv,
     Th8_KeyValue,
     Th8_SetPlatformContext,
@@ -77980,6 +86398,9 @@ const Th8StubsTable th8StubsTableData = {
     0,
 #endif
     Th8_RegisterLanguage,
+    Th8_RegisterSubsets,
+    Th8_ListSubsets,
+    Th8_GetSubsetMembers,
 #if defined(TH8_ENABLE_VARIABLES)
     Th8_ResetSecurityArray,
 #else
@@ -78274,7 +86695,11 @@ static const Th8InternalStubsTable th8InternalStubsTableData = {
     th8SetPlatformLibs,
     th8SignalAllStates,
     th8Step,
+#if defined(TH8_ENABLE_BIGINT)
     th8BigintCacheStore,
+#else
+    NULL, /* th8BigintCacheStore defined only with TH8_ENABLE_BIGINT */
+#endif
 #if defined(TH8_PLUGIN_FILE_SYSTEMS)
     th8IsDeviceName,
 #else
@@ -78324,14 +86749,24 @@ static const Th8InternalStubsTable th8InternalStubsTableData = {
     th8GetFramePaVar,
     th8GetInterpPaChannels,
     th8GetArraySearchHash,
+#if defined(TH8_ENABLE_VARIABLES)
     th8GetArrayElementHash,
+#else
+    NULL, /* th8GetArrayElementHash defined only with TH8_ENABLE_VARIABLES */
+#endif
     th8CheckExpansionPrefix,
     th8AsyncStateXorBMutexReady,
     th8AsyncStateScrubField,
     th8XchgInterpPlatform,
+#if defined(TH8_ENABLE_BIGINT)
     th8_bigint_calloc,
     th8BigintSetup,
     th8BigintTeardown,
+#else
+    NULL, /* th8_bigint_calloc defined only with TH8_ENABLE_BIGINT */
+    NULL, /* th8BigintSetup defined only with TH8_ENABLE_BIGINT */
+    NULL, /* th8BigintTeardown defined only with TH8_ENABLE_BIGINT */
+#endif
 #if defined(TH8_ENABLE_FAULT_INJECTION)
     th8FaultStrEqAscii,
     th8FaultPathMatchesBaseName,
@@ -78351,13 +86786,21 @@ static const Th8InternalStubsTable th8InternalStubsTableData = {
 #if defined(TH8_ENABLE_CRYPTOGRAPHY)
     th8PolicyIsHttpUri,
     th8PolicyDaysInMonth,
+#  if defined(TH8_ENABLE_VARIABLES)
     th8SecureCheckCanary,
+#  else
+    NULL, /* th8SecureCheckCanary: secure vars need CRYPTOGRAPHY && VARIABLES */
+#  endif
     th8NtpSortTimes,
     th8AfParseHexKey,
     th8RsaParseCapi,
     th8HttpsTimeVerifySignature,
     th8HttpsTimeFindField,
+#  if defined(TH8_ENABLE_VARIABLES)
     th8SecureHasMasterKey,
+#  else
+    NULL, /* th8SecureHasMasterKey: secure vars need CRYPTOGRAPHY && VARIABLES */
+#  endif
     th8PolicyResetCachedKeys,
     th8PolicyVerifyData,
     th8AfFlagSetAdd,
@@ -78365,11 +86808,19 @@ static const Th8InternalStubsTable th8InternalStubsTableData = {
     th8AfMapGet,
     th8TestRsaKeyClearPubBlob,
     th8TestRsaKeyRestorePubBlob,
+    th8RsaSignRawBlock,
     th8NtpValidateResponse,
 #else
-    0,
-    0,
-    0,
+    /*
+     * One 0 per crypto-branch entry whose struct field is UNCONDITIONAL
+     * (declared outside the struct's `#if defined(TH8_ENABLE_CRYPTOGRAPHY)`
+     * block).  The four entries whose struct fields live INSIDE that block
+     * -- th8_TestRsaKeyClearPubBlob, th8_TestRsaKeyRestorePubBlob,
+     * th8_RsaSignRawBlock, th8_NtpValidateResponse -- vanish entirely when
+     * cryptography is disabled, so they get NO slot here (a 0 for them would
+     * be an excess initializer that shifts th8_MemTrackDump/Reset out of
+     * alignment).  14 unconditional crypto-branch entries -> 14 zeros.
+     */
     0,
     0,
     0,
@@ -78399,6 +86850,7 @@ static const Th8InternalStubsTable th8InternalStubsTableData = {
  *	Public accessor for the TH8 internal stubs table.  Returns
  *	a pointer to the read-only Th8InternalStubsTable instance.
  *
+ * Why / How:
  *	The caller is expected to cast to
  *	`const Th8InternalStubsTable *` (declared in
  *	th8InternalDecls.h) and verify the magic / version fields
@@ -79177,11 +87629,29 @@ ConversionResult ConvertUTF8toUTF32(
 #line 16 "src/th8_spilornis.c"
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8_spilornis_isspace --
  *
  *	Narrow-char space classification for the Spilornis parser.
  *	Maps iswspace() to a simple ASCII check since we operate
  *	in UTF-8 mode where all delimiters are ASCII.
+ *
+ * Why / How:
+ *	Tests the character against the six ASCII whitespace codes
+ *	(space, tab, newline, carriage return, form feed, vertical tab)
+ *	directly instead of calling the locale-sensitive iswspace(),
+ *	giving deterministic, locale-independent results for the
+ *	UTF-8 byte stream the parser consumes.
+ *
+ * Results:
+ *	Nonzero if c is one of the six ASCII whitespace characters;
+ *	zero otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 int
@@ -82075,11 +90545,24 @@ static TH8_THREAD_LOCAL volatile int th8_regex_oom_flag = 0;
  *	interpreter.  Returns NULL if no interpreter is set or if
  *	the OOM flag has been raised.
  *
+ * Why / How:
+ *	The engine reaches this via its MALLOC macro (regcustom_th8.h)
+ *	and has no interp of its own, so the allocation is charged to
+ *	the thread-local th8_regex_interp published by th8RegexSetup.
+ *	Short-circuits when th8_regex_oom_flag is set (a prior
+ *	cancel/limit was seen) so the engine unwinds through its
+ *	out-of-memory path, and when Th8_Ready reports a
+ *	cancel/limit it raises that flag first.  The NULL-interp
+ *	guard is the Bug 26 family fix: a NEVER-style assert would
+ *	collapse under TH8_OMIT_AUXILIARY_SAFETY_CHECKS and deref a
+ *	NULL interp when the engine is invoked outside a setup window.
+ *
  * Results:
  *	Pointer to allocated memory, or NULL on failure.
  *
  * Side effects:
- *	Allocates memory via the platform allocator.
+ *	Allocates memory via the platform allocator.  May set
+ *	th8_regex_oom_flag when the interpreter is not ready.
  *
  *----------------------------------------------------------------------
  */
@@ -82116,11 +90599,20 @@ th8_regex_malloc(size_t n)
  *	Free memory allocated by th8_regex_malloc.  Routes through
  *	Th8_Free using the global regex interpreter.
  *
+ * Why / How:
+ *	The engine reaches this via its FREE macro and has no interp
+ *	of its own, so the block is returned to the thread-local
+ *	th8_regex_interp that allocated it.  When no interp is set
+ *	(the Bug 26 window: engine invoked outside a setup/teardown
+ *	pair) it is a no-op, mirroring the standard free(NULL) shape
+ *	and avoiding the TH8_OMIT NULL-deref.
+ *
  * Results:
  *	None.
  *
  * Side effects:
- *	Frees memory via the platform allocator.
+ *	Frees memory via the platform allocator (no-op when no
+ *	interpreter is set).
  *
  *----------------------------------------------------------------------
  */
@@ -82150,11 +90642,22 @@ th8_regex_free(void *p)
  *	pointer valid and frees it during cleanup (same ANSI C
  *	realloc contract as libtommath).
  *
+ * Why / How:
+ *	The engine reaches this via its REALLOC macro against the
+ *	thread-local th8_regex_interp.  The NULL-interp guard is the
+ *	Bug 26 family fix (see th8_regex_malloc).  A cancel/limit
+ *	seen via Th8_Ready raises th8_regex_oom_flag and returns
+ *	NULL; because ANSI realloc leaves the original block valid
+ *	on failure, the engine's own cleanup frees it -- so this
+ *	must not free p itself.
+ *
  * Results:
- *	Pointer to reallocated memory, or NULL on failure.
+ *	Pointer to reallocated memory, or NULL on failure (original
+ *	block left intact).
  *
  * Side effects:
- *	Reallocates memory via the platform allocator.
+ *	Reallocates memory via the platform allocator.  May set
+ *	th8_regex_oom_flag when the interpreter is not ready.
  *
  *----------------------------------------------------------------------
  */
@@ -82184,6 +90687,15 @@ th8_regex_realloc(void *p, size_t n)
  *	the INTERRUPT macro.  If interrupted, sets the OOM flag so
  *	all subsequent MALLOC calls return NULL, forcing the engine
  *	to abort via its out-of-memory error path.
+ *
+ * Why / How:
+ *	The Spencer engine has no direct notion of TH8 cancellation
+ *	or resource limits, so this bridge polls Th8_Ready on the
+ *	thread-local th8_regex_interp from inside the engine's inner
+ *	loops.  Rather than aborting mid-loop, it converts a not-ready
+ *	condition into the engine's existing out-of-memory unwind by
+ *	raising th8_regex_oom_flag, which makes every later allocation
+ *	fail cleanly.  A no-op when no interpreter is set.
  *
  * Results:
  *	1 if the interpreter is interrupted, 0 otherwise.
@@ -82221,6 +90733,21 @@ th8_regex_interrupted(void)
  *	Called by the Spencer engine's stack_is_too_deep() inline.
  *	Routes to th8CheckStack.
  *
+ * Why / How:
+ *	The engine's recursive matcher guards against C-stack
+ *	exhaustion by asking the host whether the stack is nearly
+ *	full; TH8 answers using th8CheckStack on the thread-local
+ *	th8_regex_interp, which applies TH8's configured stack limit.
+ *	A no-op returning 0 (not too deep) when no interpreter is
+ *	set, so the engine keeps its own default behavior.
+ *
+ * Results:
+ *	Non-zero if the stack is too deep to recurse further, 0
+ *	otherwise (including when no interpreter is set).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -82242,6 +90769,14 @@ th8_regex_stack_too_deep(void)
  *	Character classification bridge for isalnum.  Routes through
  *	TH8's th8IsAlnum for ASCII characters.  Returns 0 for
  *	non-ASCII code points until Unicode tables are integrated.
+ *
+ * Why / How:
+ *	The engine's bracket-expression and locale code classify
+ *	code points through this bridge; TH8 answers from its own
+ *	th8IsAlnum table so behavior does not depend on the C
+ *	library's locale.  Only the ASCII range (c < 128) is defined
+ *	so far, so higher code points deliberately return 0 rather
+ *	than a locale-dependent guess.
  *
  * Results:
  *	Non-zero if the character is alphanumeric, 0 otherwise.
@@ -82267,6 +90802,12 @@ th8_regex_isalnum(unsigned int c)
  *	Character classification bridge for isalpha.  Returns 0 for
  *	non-ASCII code points.
  *
+ * Why / How:
+ *	Same design as th8_regex_isalnum: the engine classifies code
+ *	points through TH8's own th8IsAlpha table (not the C library
+ *	locale), and only the ASCII range (c < 128) is defined, so
+ *	higher code points return 0.
+ *
  * Results:
  *	Non-zero if the character is alphabetic, 0 otherwise.
  *
@@ -82290,6 +90831,12 @@ th8_regex_isalpha(unsigned int c)
  *
  *	Character classification bridge for isdigit.  Returns 0 for
  *	non-ASCII code points.
+ *
+ * Why / How:
+ *	Same design as th8_regex_isalnum: the engine classifies code
+ *	points through TH8's own th8IsDigit table (not the C library
+ *	locale), and only the ASCII range (c < 128) is defined, so
+ *	higher code points return 0.
  *
  * Results:
  *	Non-zero if the character is a digit, 0 otherwise.
@@ -82315,6 +90862,12 @@ th8_regex_isdigit(unsigned int c)
  *	Character classification bridge for isspace.  Returns 0 for
  *	non-ASCII code points.
  *
+ * Why / How:
+ *	Same design as th8_regex_isalnum: the engine classifies code
+ *	points through TH8's own th8IsSpace table (not the C library
+ *	locale), and only the ASCII range (c < 128) is defined, so
+ *	higher code points return 0.
+ *
  * Results:
  *	Non-zero if the character is whitespace, 0 otherwise.
  *
@@ -82339,11 +90892,20 @@ th8_regex_isspace(unsigned int c)
  *	Bridge memcpy for the Spencer engine.  Routes through
  *	Th8_Memcpy using the global regex interpreter.
  *
+ * Why / How:
+ *	TH8's layer discipline forbids the engine from calling the C
+ *	library directly, so regcustom_th8.h redirects its memcpy to
+ *	this bridge, which dispatches to the platform's memcpy
+ *	callback via the thread-local th8_regex_interp.  With no
+ *	interpreter set there is nothing to dispatch through, so it
+ *	returns dst untouched.
+ *
  * Results:
  *	The dst pointer.
  *
  * Side effects:
- *	Copies n bytes from src to dst.
+ *	Copies n bytes from src to dst (no-op when no interpreter is
+ *	set).
  *
  *----------------------------------------------------------------------
  */
@@ -82366,8 +90928,16 @@ th8_regex_memcpy(void *dst, const void *src, size_t n)
  *	Bridge memcmp for the Spencer engine.  Routes through
  *	Th8_Memcmp using the global regex interpreter.
  *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_memcpy: the
+ *	engine's memcmp is redirected here and dispatched to the
+ *	platform callback via the thread-local th8_regex_interp.
+ *	With no interpreter set it returns 0 (compare-equal) since
+ *	there is nothing to dispatch through.
+ *
  * Results:
- *	Negative, zero, or positive integer indicating comparison.
+ *	Negative, zero, or positive integer indicating comparison
+ *	(0 when no interpreter is set).
  *
  * Side effects:
  *	None.
@@ -82393,11 +90963,19 @@ th8_regex_memcmp(const void *a, const void *b, size_t n)
  *	Bridge memset for the Spencer engine.  Routes through the
  *	platform's xMemset callback.
  *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_memcpy: the
+ *	engine's memset is redirected here.  It calls the platform's
+ *	xMemset callback directly (via Th8_GetPlatform on the
+ *	thread-local th8_regex_interp) only when both the interp and
+ *	the callback are present; otherwise it leaves dst unchanged.
+ *
  * Results:
  *	The dst pointer.
  *
  * Side effects:
- *	Fills n bytes of dst with value c.
+ *	Fills n bytes of dst with value c (no-op when no interpreter
+ *	or no xMemset callback is available).
  *
  *----------------------------------------------------------------------
  */
@@ -82423,6 +91001,15 @@ th8_regex_memset(void *dst, int c, size_t n)
  *
  *	Bridge strlen for the Spencer engine.  Routes through the
  *	platform's xStrlen callback with a hand-rolled fallback.
+ *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_memcpy: the
+ *	engine's strlen is redirected here and dispatched to the
+ *	platform's xStrlen callback.  Because strlen is a pure query
+ *	that can be needed even outside a setup window (or on a
+ *	platform without the callback), it also carries a
+ *	self-contained byte-counting fallback so it always returns a
+ *	correct length.
  *
  * Results:
  *	Length of the NUL-terminated string.
@@ -82462,6 +91049,13 @@ th8_regex_strlen(const char *s)
  *	Bridge strcmp for the Spencer engine.  Routes through the
  *	platform's xStrcmp callback with a byte-by-byte fallback.
  *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_strlen: the
+ *	engine's strcmp is redirected here and dispatched to the
+ *	platform's xStrcmp callback, with a self-contained
+ *	byte-by-byte fallback so a missing interp or callback still
+ *	yields a correct ordering.
+ *
  * Results:
  *	Negative, zero, or positive integer indicating comparison.
  *
@@ -82498,6 +91092,14 @@ th8_regex_strcmp(const char *s1, const char *s2)
  *	Bridge strcpy for the Spencer engine.  Uses th8_regex_strlen
  *	and th8_regex_memcpy internally.
  *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_memcpy: the
+ *	engine's strcpy is redirected here.  Rather than call the C
+ *	library it is composed from the other bridges -- it measures
+ *	src with th8_regex_strlen and copies length + 1 bytes (to
+ *	include the NUL) with th8_regex_memcpy -- so it inherits their
+ *	platform routing automatically.
+ *
  * Results:
  *	The dst pointer.
  *
@@ -82524,6 +91126,13 @@ th8_regex_strcpy(char *dst, const char *src)
  *
  *	Bridge strchr for the Spencer engine.  Routes through the
  *	platform's xStrchr callback with a linear-scan fallback.
+ *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_strlen: the
+ *	engine's strchr is redirected here and dispatched to the
+ *	platform's xStrchr callback, with a self-contained linear
+ *	scan fallback that (like C strchr) also matches a search for
+ *	the terminating NUL.
  *
  * Results:
  *	Pointer to the first occurrence of c in s, or NULL.
@@ -82561,11 +91170,21 @@ th8_regex_strchr(const char *s, int c)
  *	Bridge sprintf for the Spencer engine.  Routes through the
  *	platform's xVsnprintf callback with a 256-byte limit.
  *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_memcpy: the
+ *	engine's sprintf is redirected here.  The engine only uses it
+ *	to format short error/diagnostic strings, so this collects
+ *	the varargs and dispatches to the platform's bounded
+ *	xVsnprintf with a fixed 256-byte cap -- turning an unbounded
+ *	sprintf into a safe snprintf.  With no interp or callback it
+ *	writes nothing.
+ *
  * Results:
- *	Number of characters written, or 0 if no interpreter.
+ *	Number of characters written, or 0 when no interpreter or no
+ *	xVsnprintf callback is available.
  *
  * Side effects:
- *	Writes formatted output into buf.
+ *	Writes formatted output into buf (up to 256 bytes).
  *
  *----------------------------------------------------------------------
  */
@@ -82598,6 +91217,14 @@ th8_regex_sprintf(char *buf, const char *fmt, ...)
  *
  *	Bridge atoi for the Spencer engine.  Routes through the
  *	platform's xAtoi callback with a hand-rolled fallback.
+ *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_strlen: the
+ *	engine's atoi is redirected here and dispatched to the
+ *	platform's xAtoi callback, with a self-contained fallback
+ *	that skips leading blanks, honors an optional +/- sign, and
+ *	accumulates decimal digits so a missing interp or callback
+ *	still parses correctly.
  *
  * Results:
  *	Integer value of the string.
@@ -82648,11 +91275,19 @@ th8_regex_atoi(const char *s)
  *	Bridge qsort for the Spencer engine.  Routes through the
  *	platform's xQsort callback.
  *
+ * Why / How:
+ *	Same layer-discipline rationale as th8_regex_memcpy: the
+ *	engine's qsort is redirected here and dispatched to the
+ *	platform's xQsort callback via the thread-local
+ *	th8_regex_interp.  There is no in-tree fallback sort, so with
+ *	no interp or callback the array is simply left unsorted.
+ *
  * Results:
  *	None.
  *
  * Side effects:
- *	Sorts the array in place.
+ *	Sorts the array in place (no-op when no interpreter or no
+ *	xQsort callback is available).
  *
  *----------------------------------------------------------------------
  */
@@ -82695,6 +91330,24 @@ th8_regex_qsort(
  *	Convert a UTF-8 string to a chr (UTF-32) array using
  *	ConvertUTF_v2 for strict UTF-8 validation.  Caller must
  *	free the result with Th8_Free.
+ *
+ * Why / How:
+ *	The Spencer engine matches over fixed-width 32-bit code
+ *	points, so TH8's UTF-8 command arguments must be widened at
+ *	the API boundary.  A worst-case buffer of one UTF-32 unit per
+ *	input byte (plus a NUL) is allocated, then ConvertUTF8toUTF32
+ *	runs first in strictConversion mode; if the input is
+ *	malformed it re-runs in lenientConversion mode so bad bytes
+ *	become U+FFFD instead of failing the command.  The decoded
+ *	length is reported through *pnChr.
+ *
+ * Results:
+ *	Pointer to a newly allocated, NUL-terminated UTF-32 array
+ *	(caller frees with Th8_Free), with *pnChr set to the code
+ *	point count; NULL on allocation failure, with *pnChr set to 0.
+ *
+ * Side effects:
+ *	Allocates memory on the interpreter's allocator.
  *
  *----------------------------------------------------------------------
  */
@@ -82749,6 +91402,25 @@ th8Utf8ToChr(Th8_Interp *interp, const char *z, size_t n, int *pnChr)
  *
  *	Convert a chr (UTF-32) array back to UTF-8 using
  *	ConvertUTF_v2.  Caller must free with Th8_Free.
+ *
+ * Why / How:
+ *	The inverse of th8Utf8ToChr: match results and extracted
+ *	substrings leave the engine as UTF-32 and must be narrowed
+ *	back to UTF-8 before being returned as TH8 results.  A
+ *	non-positive nChr is handled up front by returning a fresh
+ *	empty string, guarding both the multiply and the converter
+ *	against a zero/negative count; otherwise a worst-case buffer
+ *	of four bytes per code point (plus a NUL) is allocated and
+ *	ConvertUTF32toUTF8 fills it in strictConversion mode.  The
+ *	byte length is reported through *pnUtf8.
+ *
+ * Results:
+ *	Pointer to a newly allocated, NUL-terminated UTF-8 string
+ *	(caller frees with Th8_Free), with *pnUtf8 set to its byte
+ *	length; NULL on allocation failure, with *pnUtf8 set to 0.
+ *
+ * Side effects:
+ *	Allocates memory on the interpreter's allocator.
  *
  *----------------------------------------------------------------------
  */
@@ -82844,10 +91516,20 @@ th8RegexSetup(Th8_Interp *interp)
  *	error) so the mutex never deadlocks subsequent
  *	callers.
  *
+ * Why / How:
+ *	The bridge's file-scope state (th8_regex_interp,
+ *	th8_regex_oom_flag) and the global mutex are shared serially
+ *	across regex operations, so each operation must publish them
+ *	on entry (th8RegexSetup) and retract them here on every exit
+ *	path.  Clearing the interp pointer prevents a later,
+ *	setup-less engine invocation from charging work to a stale
+ *	interp (the Bug 26 window), and releasing the mutex last
+ *	keeps subsequent callers from deadlocking.
+ *
  * Parameters:
  *	(none)
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -82886,6 +91568,23 @@ th8RegexTeardown(void)
  *	does not exceed the NFA state limit.  Returns TH8_OK if the
  *	pattern is acceptable, TH8_ERROR if it is too complex.
  *
+ * Why / How:
+ *	A pathological pattern can compile into an enormous NFA and
+ *	drive catastrophic match times (a regex-bomb), so before any
+ *	pattern is executed its state count is measured with
+ *	th8_regex_analyze and compared against TH8_REGEX_MAX_STATES.
+ *	Rejecting at compile time -- rather than relying only on the
+ *	per-operation cancel/limit checks -- caps worst-case cost up
+ *	front.
+ *
+ * Results:
+ *	TH8_OK if the pattern is within the state limit; TH8_ERROR
+ *	(with an interpreter result of "regular expression too
+ *	complex") if it exceeds TH8_REGEX_MAX_STATES.
+ *
+ * Side effects:
+ *	On rejection, sets the interpreter result message.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -82909,12 +91608,41 @@ th8RegexCheckComplexity(Th8_Interp *interp, const regex_t *pRe)
  *
  * regexp_command --
  *
- *	Match a string against a regular expression.
+ *	Implements the Tcl [regexp] command: match a string against a
+ *	regular expression.
  *
  *	regexp ?SWITCHES? PATTERN STRING ?MATCHVAR? ?SUBVAR ...?
  *
- *	Stub: reports "not yet wired" until the command-level
- *	integration with th8_regcomp/th8_regexec is complete.
+ *	Supports -nocase, -expanded, -line, -linestop, -lineanchor,
+ *	-all, -inline, -indices, -start, -about, and -- switches.
+ *
+ * Why / How:
+ *	Parses the switch prefix into REG_* compile/exec flags, then
+ *	widens the pattern and subject to UTF-32 with th8Utf8ToChr,
+ *	compiles via th8_regcomp, and rejects regex-bombs with
+ *	th8RegexCheckComplexity before executing.  th8_regexec is run
+ *	in a loop (advancing past each match, and past zero-length
+ *	matches by one, so -all cannot spin) collecting results.  The
+ *	-inline form builds a result list of matches/submatches; the
+ *	variable form stores each (sub)match into the caller's
+ *	MATCHVAR/SUBVAR arguments; -indices reports "start end" pairs
+ *	instead of text; -about returns compiled-pattern metadata
+ *	without matching.  All setup/teardown of the shared engine
+ *	state is bracketed by th8RegexSetup/th8RegexTeardown on every
+ *	exit path.
+ *
+ * Results:
+ *	TH8_OK on success.  The interpreter result is the match count
+ *	for -all, the match list for -inline, or 1/0 for a plain
+ *	match; -about yields a metadata dictionary.  TH8_ERROR (with
+ *	an interpreter result message) on a wrong argument count, a
+ *	bad switch, a compile error, an over-complex pattern, out of
+ *	memory, or interpreter cancellation/limit.
+ *
+ * Side effects:
+ *	Allocates and frees working buffers; may set caller variables
+ *	(when TH8_ENABLE_VARIABLES); sets the interpreter result.
+ *	Enters and leaves the global regex mutex.
  *
  *----------------------------------------------------------------------
  */
@@ -83354,9 +92082,39 @@ cleanup:
  *
  * regsub_command --
  *
- *	Perform regular expression substitution.
+ *	Implements the Tcl [regsub] command: perform regular
+ *	expression substitution.
  *
  *	regsub ?SWITCHES? PATTERN STRING REPLACEMENT ?VARNAME?
+ *
+ *	Supports -nocase, -all, -line, and -- switches.
+ *
+ * Why / How:
+ *	Parses the switch prefix into REG_* flags, widens the pattern
+ *	and subject to UTF-32 with th8Utf8ToChr, compiles via
+ *	th8_regcomp, and rejects regex-bombs with
+ *	th8RegexCheckComplexity.  It then walks matches with
+ *	th8_regexec, appending the pre-match text, then the expanded
+ *	replacement -- where & is the whole match, \1..\9 are
+ *	submatches, and \\ or any escaped char is a literal -- and
+ *	finally the trailing text.  Zero-length matches advance by
+ *	one code point (copied through) so -all cannot spin.  When no
+ *	match occurs the original string is emitted unchanged.  Shared
+ *	engine state is bracketed by th8RegexSetup/th8RegexTeardown on
+ *	every exit path.
+ *
+ * Results:
+ *	TH8_OK on success: with a VARNAME the substituted string is
+ *	stored in that variable and the result is the substitution
+ *	count; without one the result is the substituted string.
+ *	TH8_ERROR (with an interpreter result message) on a wrong
+ *	argument count, a bad switch, a compile error, an over-complex
+ *	pattern, or out of memory.
+ *
+ * Side effects:
+ *	Allocates and frees working buffers; may set the caller's
+ *	VARNAME variable (when TH8_ENABLE_VARIABLES); sets the
+ *	interpreter result.  Enters and leaves the global regex mutex.
  *
  *----------------------------------------------------------------------
  */
@@ -83676,11 +92434,20 @@ static Th8_CommandEntry th8RegexpCommands[] = {
  *
  *	NULL `pnCommand` is always an error.
  *
+ * Why / How:
+ *	The plugin loader discovers a plugin's commands with a
+ *	two-call protocol: first a count-only call (NULL pCommand)
+ *	to learn how many entries exist, then a second call with a
+ *	buffer of that size to copy them out.  This implements that
+ *	protocol over the static th8RegexpCommands table, refusing to
+ *	write past a caller buffer that is too small so the loader
+ *	never overflows.
+ *
  * Parameters:
  *	pCommand  -- caller-supplied output buffer or NULL.
  *	pnCommand -- in/out count.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` on missing
  *	`pnCommand` or insufficient buffer.
  *
@@ -93570,8 +102337,31 @@ freecvec(struct cvec *cv)
  */
 
 /*
- * pg_set_regex_collation -- called by pg_regcomp to set the
- * collation context.  TH8 ignores collation.
+ *----------------------------------------------------------------------
+ *
+ * pg_set_regex_collation --
+ *
+ *	Called by pg_regcomp to establish the collation context for a
+ *	compilation.  TH8 ignores collation.
+ *
+ * Why / How:
+ *	In PostgreSQL this OID selects the locale that drives
+ *	classification and case folding.  TH8 has a single,
+ *	locale-independent (ASCII) classification, so the parameter is
+ *	accepted for source compatibility with the vendored engine but
+ *	is deliberately a no-op -- there is no per-compilation locale
+ *	state to set.
+ *
+ * Parameters:
+ *	collation -- collation OID (ignored).
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 void
@@ -93603,10 +102393,18 @@ pg_set_regex_collation(Oid collation)
  *	ASCII decimal-digit predicate (`'0'..'9'`).  Non-ASCII
  *	input (`c >= 128`) returns 0.
  *
+ * Why / How:
+ *	regc_locale.c calls these regc_wc_* predicates directly when
+ *	building POSIX character-class cvecs (the engine core uses the
+ *	separate isXXX macros).  The test is a direct ASCII range
+ *	comparison rather than a C-library call so classification is
+ *	locale-independent and deterministic; code points at or above
+ *	128 answer 0 until Unicode tables are wired in.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is `'0'..'9'`; 0 otherwise.
  *
  * Side effects:
@@ -93629,10 +102427,16 @@ regc_wc_isdigit(chr c)
  *	ASCII alphabetic-letter predicate (`'a'..'z'`, `'A'..'Z'`).
  *	Non-ASCII input returns 0.
  *
+ * Why / How:
+ *	Same design as regc_wc_isdigit: called by regc_locale.c to
+ *	build character-class cvecs, tested inline against the two
+ *	ASCII letter ranges so classification stays locale-independent;
+ *	code points at or above 128 answer 0.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is an ASCII letter; 0 otherwise.
  *
  * Side effects:
@@ -93658,10 +102462,16 @@ regc_wc_isalpha(chr c)
  *	ASCII alphanumeric predicate -- the disjunction of
  *	`regc_wc_isdigit` and `regc_wc_isalpha`.
  *
+ * Why / How:
+ *	Called by regc_locale.c to build character-class cvecs.
+ *	Composed from the digit and letter predicates rather than
+ *	duplicating their ranges, so it inherits their ASCII,
+ *	locale-independent semantics automatically.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is an ASCII letter or digit; 0 otherwise.
  *
  * Side effects:
@@ -93685,10 +102495,16 @@ regc_wc_isalnum(chr c)
  *	alphanumerics plus underscore.  Mirrors `\w` in regex
  *	syntax.
  *
+ * Why / How:
+ *	Called by regc_locale.c when expanding the `\w` word class.
+ *	Built as regc_wc_isalnum plus a literal underscore so the
+ *	class exactly matches Tcl's word-character definition and
+ *	inherits the ASCII, locale-independent semantics.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is alphanumeric or `'_'`; 0 otherwise.
  *
  * Side effects:
@@ -93711,10 +102527,16 @@ regc_wc_isword(chr c)
  *	ASCII uppercase-letter predicate (`'A'..'Z'`).
  *	Non-ASCII input returns 0.
  *
+ * Why / How:
+ *	Same design as regc_wc_isdigit: called by regc_locale.c to
+ *	build character-class cvecs, tested inline against the ASCII
+ *	uppercase range so classification stays locale-independent;
+ *	code points at or above 128 answer 0.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is `'A'..'Z'`; 0 otherwise.
  *
  * Side effects:
@@ -93737,10 +102559,16 @@ regc_wc_isupper(chr c)
  *	ASCII lowercase-letter predicate (`'a'..'z'`).
  *	Non-ASCII input returns 0.
  *
+ * Why / How:
+ *	Same design as regc_wc_isdigit: called by regc_locale.c to
+ *	build character-class cvecs, tested inline against the ASCII
+ *	lowercase range so classification stays locale-independent;
+ *	code points at or above 128 answer 0.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is `'a'..'z'`; 0 otherwise.
  *
  * Side effects:
@@ -93765,10 +102593,16 @@ regc_wc_islower(chr c)
  *	ends so SPACE (`0x20`) and DEL (`0x7F`) are not
  *	graphic.
  *
+ * Why / How:
+ *	Called by regc_locale.c to build the `[:graph:]` class.
+ *	Expressed as a single open-interval range (0x20 < c < 0x7F)
+ *	so that both SPACE and the DEL control character are excluded,
+ *	matching the POSIX definition of a visible glyph.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is in `(0x20, 0x7F)`; 0 otherwise.
  *
  * Side effects:
@@ -93791,10 +102625,16 @@ regc_wc_isgraph(chr c)
  *	Printable-character predicate -- graphic characters
  *	plus the space character itself (`0x20..0x7E`).
  *
+ * Why / How:
+ *	Called by regc_locale.c to build the `[:print:]` class.
+ *	Differs from regc_wc_isgraph only in including SPACE (the
+ *	lower bound is inclusive), matching the POSIX distinction that
+ *	print = graph plus the space character.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is in `[0x20, 0x7F)`; 0 otherwise.
  *
  * Side effects:
@@ -93817,10 +102657,17 @@ regc_wc_isprint(chr c)
  *	Punctuation predicate -- graphic ASCII characters
  *	that are not alphanumeric.  Non-ASCII input returns 0.
  *
+ * Why / How:
+ *	Called by regc_locale.c to build the `[:punct:]` class.
+ *	Derived compositionally as "graphic and not alphanumeric"
+ *	rather than as an explicit character list, so it stays
+ *	consistent with the graph and alnum predicates; non-ASCII
+ *	input answers 0.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is ASCII punctuation; 0 otherwise.
  *
  * Side effects:
@@ -93847,10 +102694,16 @@ regc_wc_ispunct(chr c)
  *	characters Tcl `[regexp]` recognises: space, tab,
  *	newline, carriage return, form feed, and vertical tab.
  *
+ * Why / How:
+ *	Called by regc_locale.c to build the `[:space:]` class.
+ *	Enumerated as an explicit six-way comparison rather than a
+ *	range because ASCII whitespace is not contiguous, and this
+ *	exact set is what Tcl `[regexp]` treats as whitespace.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	1 if `c` is one of the six whitespace characters;
  *	0 otherwise.
  *
@@ -93876,10 +102729,17 @@ regc_wc_isspace(chr c)
  *	ASCII lowercase-to-uppercase conversion.  Non-letter
  *	and non-ASCII input is returned unchanged.
  *
+ * Why / How:
+ *	Used by regc_locale.c when case-folding characters for
+ *	-nocase matching.  Only the ASCII a..z range is folded, by
+ *	subtracting the fixed 'a'-'A' offset; every other code point
+ *	(including all non-ASCII) is passed through unchanged so no
+ *	locale-specific case mapping is assumed.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	`c - ('a' - 'A')` if `c` is `'a'..'z'`; `c` otherwise.
  *
  * Side effects:
@@ -93905,10 +102765,16 @@ regc_wc_toupper(chr c)
  *	ASCII uppercase-to-lowercase conversion.  Non-letter
  *	and non-ASCII input is returned unchanged.
  *
+ * Why / How:
+ *	The inverse of regc_wc_toupper, used by regc_locale.c for
+ *	-nocase case-folding.  Only the ASCII A..Z range is folded, by
+ *	adding the fixed 'a'-'A' offset; every other code point
+ *	(including all non-ASCII) is passed through unchanged.
+ *
  * Parameters:
  *	c -- input code point.
  *
- * Returns:
+ * Results:
  *	`c + ('a' - 'A')` if `c` is `'A'..'Z'`; `c` otherwise.
  *
  * Side effects:
@@ -93974,7 +102840,7 @@ typedef int (*pg_wc_probefunc)(chr c);
  *	cclasscode -- class code; accepted for call-site symmetry
  *		      but not consulted by the scan.
  *
- * Returns:
+ * Results:
  *	A cvec of matching characters, or NULL on memory failure.
  *
  * Side effects:
@@ -94045,9 +102911,35 @@ regc_ctype_get_cache_impl(
 
 
 /*
- * pg_char_and_wchar_strncmp -- compare a char* string with a
- * chr* string.  Used by regc_locale.c for collation element
- * matching.
+ *----------------------------------------------------------------------
+ *
+ * pg_char_and_wchar_strncmp --
+ *
+ *	Compare up to n characters of a narrow char* string against a
+ *	wide chr* string.  Used by regc_locale.c for collation-element
+ *	name matching.
+ *
+ * Why / How:
+ *	The two strings live in different widths -- collation-element
+ *	names arrive as char* while the engine's alphabet is chr* --
+ *	so a plain strncmp cannot be used.  Each char byte is widened
+ *	to unsigned before comparison to avoid sign issues, and the
+ *	scan stops early on the first difference or on a shared NUL,
+ *	giving strncmp-style ordering semantics across the two widths.
+ *
+ * Parameters:
+ *	s1 -- narrow (char) string.
+ *	s2 -- wide (chr) string.
+ *	n  -- maximum number of characters to compare.
+ *
+ * Results:
+ *	-1, 0, or 1 as s1 is less than, equal to, or greater than s2
+ *	over the first n characters (or up to a shared NUL).
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -94067,12 +102959,35 @@ pg_char_and_wchar_strncmp(const char *s1, const chr *s2, size_t n)
 }
 
 
-/*
- * GetDatabaseEncoding -- PostgreSQL function.  Return a dummy
- * value.  PG_UTF8 is 6 in PostgreSQL.
- */
-
 #define PG_UTF8 6
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * GetDatabaseEncoding --
+ *
+ *	Report the server encoding to the vendored engine.  A TH8
+ *	stand-in for the PostgreSQL function of the same name.
+ *
+ * Why / How:
+ *	The engine's inherited code queries this to decide how to
+ *	interpret bytes.  TH8 always operates on UTF-8 (its chr arrays
+ *	are decoded from UTF-8 at the boundary), so this
+ *	unconditionally returns PostgreSQL's PG_UTF8 code (6) rather
+ *	than consulting any real database-encoding state, which TH8
+ *	does not have.
+ *
+ * Parameters:
+ *	(none)
+ *
+ * Results:
+ *	PG_UTF8 (6), always.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
+ */
 
 static int
 GetDatabaseEncoding(void)
@@ -94938,7 +103853,7 @@ casecmp(const chr *x, const chr *y, /* strings to compare */
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 10905 "bin/regex_amalg.c"
+#line 11053 "bin/regex_amalg.c"
 
 
 
@@ -98169,7 +107084,7 @@ pickss(struct vars *v,
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 14135 "bin/regex_amalg.c"
+#line 14283 "bin/regex_amalg.c"
 
 
 
@@ -98763,7 +107678,7 @@ pg_regfree(regex_t *re)
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 14728 "bin/regex_amalg.c"
+#line 14876 "bin/regex_amalg.c"
 
 
 
@@ -99613,7 +108528,7 @@ findprefix(struct cnfa *cnfa,
  * given care here and elsewhere.
  */
 /* amalgamation: regcustom_th8.h already included */
-#line 15577 "bin/regex_amalg.c"
+#line 15725 "bin/regex_amalg.c"
 
 
 
@@ -100458,11 +109373,21 @@ th8_bigint_malloc(size_t n)
  *	  *  `nmemb * size` overflow -- libtommath sees
  *	     `MP_MEM`.
  *
+ * Why / How:
+ *	libtommath's XCALLOC hook takes no user-data pointer, so the
+ *	interp is threaded in through the thread-local
+ *	th8_bigint_interp set by th8BigintSetup.  The explicit
+ *	nmemb/size overflow test is redundant with TH8_ALLOC_MUL's
+ *	internal check but kept as a belt-and-suspenders guard;
+ *	together with the NULL-interp and not-ready guards every
+ *	failure funnels to a NULL return that libtommath reads as
+ *	MP_MEM.  Plain guards, not NEVER(), per the Bug 26 family.
+ *
  * Parameters:
  *	nmemb -- element count.
  *	size  -- bytes per element.
  *
- * Returns:
+ * Results:
  *	Zeroed allocation of `nmemb * size` bytes on success;
  *	NULL on any failure (libtommath maps to `MP_MEM`).
  *
@@ -100502,12 +109427,22 @@ th8_bigint_calloc(size_t nmemb, size_t size)
  *	return NULL the same way as `th8_bigint_malloc` /
  *	`th8_bigint_calloc`; same Bug 26 reasoning applies.
  *
+ * Why / How:
+ *	Bridges libtommath's XREALLOC to TH8_ATTEMPT_REALLOC so a
+ *	failed grow returns NULL without aborting: libtommath's
+ *	mp_grow keeps the original a->dp valid on failure and
+ *	mp_clear frees it later, matching the ANSI C realloc
+ *	contract.  oldsize is part of the hook signature but unused
+ *	(the per-interp allocator tracks sizes itself).  NULL-interp
+ *	and not-ready guards return NULL the same Bug 26 way as the
+ *	sibling allocators.
+ *
  * Parameters:
  *	mem     -- existing buffer (may be NULL on first call).
  *	oldsize -- previous buffer size (unused).
  *	newsize -- requested new size.
  *
- * Returns:
+ * Results:
  *	The (possibly relocated) buffer on success;
  *	NULL on failure (caller retains ownership of `mem`).
  *
@@ -100551,11 +109486,19 @@ th8_bigint_realloc(void *mem, size_t oldsize, size_t newsize)
  *	The `size` parameter is part of libtommath's
  *	allocator signature but unused by TH8.
  *
+ * Why / How:
+ *	Bridges libtommath's XFREE to Th8_Free through the
+ *	thread-local interp.  size is part of the hook signature but
+ *	unused.  A NULL th8_bigint_interp makes this a no-op that
+ *	leaks the buffer rather than crashing -- the known
+ *	late-shutdown mode after th8BigintTeardown -- again a plain
+ *	guard, not NEVER(), per Bug 26.
+ *
  * Parameters:
  *	mem  -- buffer to free, or NULL.
  *	size -- buffer size (unused).
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -100587,10 +109530,18 @@ th8_bigint_free(void *mem, size_t size)
  *	(libtommath's allocator hooks take no user-data
  *	parameter, hence the thread-local convention).
  *
+ * Why / How:
+ *	libtommath's allocator hooks take no user-data argument, so
+ *	every bigint operation must publish its interp somewhere the
+ *	bridge callbacks can find it: this stamps it into the
+ *	thread-local th8_bigint_interp.  On builds without native TLS
+ *	it also takes the global bigint mutex first, so setup/teardown
+ *	bracket every operation as a critical section.
+ *
  * Parameters:
  *	interp -- interpreter to install.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -100617,10 +109568,17 @@ th8BigintSetup(Th8_Interp *interp)
  *	helper on its way out, even on error paths, so the
  *	mutex never deadlocks subsequent callers.
  *
+ * Why / How:
+ *	The inverse of th8BigintSetup: clears the thread-local interp
+ *	pointer and releases the global bigint mutex.  Every bigint
+ *	operation must reach it on the way out -- including error
+ *	paths -- or a later caller would deadlock on the still-held
+ *	mutex.
+ *
  * Parameters:
  *	(none)
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -100659,6 +109617,28 @@ struct Th8_Bigint {
  *
  *	Look up a cached mp_int for the given string.  Returns the
  *	mp_int pointer (cache-owned, read-only borrow) or NULL on miss.
+ *
+ * Why / How:
+ *	th8IsBigint memoises parsed values in the interpreter's
+ *	TH8_CACHE_BIGINT internal-rep cache keyed by (z, n); this is
+ *	the read side, letting the arithmetic/compare paths reuse an
+ *	already-parsed mp_int instead of re-scanning the string.  A
+ *	hit requires the slot to exist, be marked iValid, and carry a
+ *	non-NULL pBigint (the "is a bigint" memo, versus the
+ *	iValid+NULL "not a bigint" memo).  The NULL-interp guard and
+ *	nested pCached test are plain guards (Bug 26/28 family), not
+ *	NEVER/ALWAYS, so an OOM miss or omitted safety check degrades
+ *	to a cache miss.
+ *
+ * Results:
+ *	A borrowed, cache-owned mp_int pointer on a hit; NULL on a
+ *	miss, a NULL interp, or an OOM cache lookup.  The caller must
+ *	not free or retain it past the cache entry's lifetime.
+ *
+ * Side effects:
+ *	No value is written by this function, but the underlying
+ *	Th8_FindInCache probe may create or evict a slot in the
+ *	interpreter's bigint cache.
  */
 
 static mp_int *
@@ -100696,6 +109676,27 @@ th8BigintCacheGet(Th8_Interp *interp, const char *z, size_t n)
  *	Store a parsed mp_int in the cache.  The cache takes ownership
  *	of a COPY of the mp_int.  Also sets iValid so th8IsBigint
  *	cache hits work.
+ *
+ * Why / How:
+ *	The write side paired with th8BigintCacheGet: th8IsBigint
+ *	calls it once it has confirmed a string is a bigint, so later
+ *	arithmetic can reuse the value.  It finds (or creates) the
+ *	(z, n) cache slot and, only when the slot is fresh (defensive
+ *	ALWAYS guards on !iValid / !pBigint), allocates a Th8_Bigint
+ *	and stores an mp_init_copy of pSrc -- the cache owns its own
+ *	copy, not the caller's mp_int.  The copy is bracketed by
+ *	th8BigintSetup/Teardown so libtommath allocates through the
+ *	interp.  NULL interp/pSrc are plain guards (Bug 26 family).
+ *
+ * Results:
+ *	None (void).  On OOM at any step it simply leaves the entry
+ *	unpopulated.
+ *
+ * Side effects:
+ *	May allocate a Th8_Bigint and an mp_int copy owned by the
+ *	interpreter's bigint cache and populate the (z, n) slot
+ *	(possibly creating/evicting it via Th8_FindInCache); briefly
+ *	takes the bigint mutex.
  */
 
 TH8_INTERNAL void
@@ -100754,6 +109755,19 @@ th8BigintCacheStore(
  *	Free a Th8_Bigint and its internal mp_int.  Called from
  *	th8CacheEntryFree (in th8_cache.c) when a bigint cache
  *	entry is evicted.
+ *
+ * Why / How:
+ *	The destructor for a cached Th8_Bigint.  It brackets mp_clear
+ *	with th8BigintSetup/Teardown so libtommath frees the mp_int
+ *	digits through the interp allocator, then frees the wrapper
+ *	itself.  A NULL pBigint is a no-op.
+ *
+ * Results:
+ *	None (void).
+ *
+ * Side effects:
+ *	Frees the mp_int's digits and the Th8_Bigint wrapper via the
+ *	per-interp allocator; briefly takes the bigint mutex.
  */
 
 void
@@ -100803,8 +109817,24 @@ th8BigintDestroy(Th8_Interp *interp, Th8_Bigint *pBigint)
  *	Parse a string as an mp_int.  Handles decimal, hex (0x),
  *	octal (0o), and binary (0b) prefixes.
  *
+ * Why / How:
+ *	The one string->mp_int parser shared by every bigint entry
+ *	point.  It hand-scans leading whitespace and an optional sign,
+ *	recognises 0x/0o/0b radix prefixes (defaulting to decimal),
+ *	copies the remaining digits into a fixed 512-byte stack buffer
+ *	so it can NUL-terminate for libtommath's mp_read_radix, then
+ *	applies mp_neg for a negative sign.  Oversized inputs are
+ *	truncated to the buffer, and the copy runs through the
+ *	thread-local interp's Th8_Memcpy.
+ *
  * Results:
- *	MP_OKAY on success.
+ *	MP_OKAY on success; the mp_err from mp_read_radix or mp_neg on
+ *	failure.
+ *
+ * Side effects:
+ *	Writes the parsed value into *a (which the caller must have
+ *	mp_init'd), growing it through libtommath's interp-routed
+ *	allocator; uses a 512-byte stack buffer.
  *
  *----------------------------------------------------------------------
  */
@@ -100879,6 +109909,24 @@ th8BigintFromStr(mp_int *a, const char *z, size_t n)
  *	Convert an mp_int to a decimal string and set it as the
  *	interpreter result.
  *
+ * Why / How:
+ *	The shared render step: every arithmetic/scan path funnels
+ *	its result mp_int through here.  It sizes a buffer from
+ *	mp_count_bits/3 plus slop, renders base-10 with mp_to_radix,
+ *	and publishes it through Th8_SetResult (which copies), then
+ *	frees the scratch buffer.  Assumes the bracketing
+ *	th8BigintSetup is already active so the allocation routes
+ *	through the interp.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the decimal string;
+ *	TH8_ERROR (result set to an error message) on allocation
+ *	failure or an mp_to_radix conversion error.
+ *
+ * Side effects:
+ *	Allocates and frees a scratch buffer via the interp allocator
+ *	and sets the interpreter result.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -100912,9 +109960,91 @@ th8BigintToResult(Th8_Interp *interp, const mp_int *a)
 /*
  *----------------------------------------------------------------------
  *
+ * th8ScanBignum --
+ *
+ *	Parse a (possibly signed and radix-prefixed) integer string as
+ *	an arbitrary-precision value and set the interpreter result to
+ *	its decimal representation.
+ *
+ * Why / How:
+ *	The `scan` command's `ll` size modifier stores a value with no
+ *	width limit (BigInt).  scan stages every converted value through
+ *	the interpreter result and then reads it back, so this helper
+ *	fits that model: it brackets the libtommath work with
+ *	th8BigintSetup/Teardown, parses via th8BigintFromStr (which
+ *	understands `0x`/`0o`/`0b` prefixes and a leading sign), and
+ *	renders decimal via th8BigintToResult.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the decimal string;
+ *	TH8_ERROR (with an error result) if the value cannot be parsed.
+ *
+ * Side effects:
+ *	Sets the interpreter result.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8ScanBignum(Th8_Interp *interp, const char *zStr, size_t n)
+{
+    mp_int a;
+    mp_err err;
+    int rc;
+
+    th8BigintSetup(interp);
+    if (mp_init(&a) != MP_OKAY) {
+	th8BigintTeardown();
+	Th8_SetResultStatic(interp, "bigint init failed", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    err = th8BigintFromStr(&a, zStr, n);
+    if (err != MP_OKAY) {
+	mp_clear(&a);
+	th8BigintTeardown();
+	Th8_SetResultStatic(
+	    interp, "scan: invalid arbitrary-precision integer", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    rc = th8BigintToResult(interp, &a);
+    mp_clear(&a);
+    th8BigintTeardown();
+    return rc;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8BigintArith --
  *
  *	Perform a bigint binary arithmetic operation.
+ *
+ * Why / How:
+ *	The evaluator dispatches every bigint binary operator here.
+ *	It mp_init_multi's three temporaries, loads each operand
+ *	(reusing a cached mp_int from th8BigintCacheGet when present,
+ *	else parsing via th8BigintFromStr, guarded by defensive
+ *	ALWAYS since binary ops always have two operands), then a
+ *	switch on eOp calls the matching libtommath primitive.
+ *	Arithmetic/bitwise ops render their result with
+ *	th8BigintToResult; the comparison ops (LT..NE) instead set a
+ *	0/1 integer result from mp_cmp.  Divide/modulus by zero and
+ *	negative shift/exponent counts are caught explicitly.  The
+ *	whole body is bracketed by th8BigintSetup/Teardown and a
+ *	single mp_clear_multi cleanup.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the decimal result
+ *	string (or "0"/"1" for a comparison); TH8_ERROR with an error
+ *	message for a bad operand, divide-by-zero, negative
+ *	shift/exponent, unsupported op, out-of-memory, or arithmetic
+ *	error.
+ *
+ * Side effects:
+ *	Sets the interpreter result; allocates and frees libtommath
+ *	temporaries via the per-interp allocator; takes and releases
+ *	the bigint mutex.
  *
  *----------------------------------------------------------------------
  */
@@ -101106,6 +110236,24 @@ done:
  *
  *	Perform a unary bigint operation.
  *
+ * Why / How:
+ *	The unary counterpart to th8BigintArith.  It loads the single
+ *	operand (cache hit or th8BigintFromStr), switches on eOp for
+ *	unary minus, unary plus, bitwise-not (mp_complement), and
+ *	logical-not (1 iff the value is zero), then renders the
+ *	result with th8BigintToResult.  Bracketed by
+ *	th8BigintSetup/Teardown with an mp_clear_multi cleanup.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the decimal result;
+ *	TH8_ERROR with an error message for a non-integer operand, an
+ *	unsupported op, out-of-memory, or a libtommath error.
+ *
+ * Side effects:
+ *	Sets the interpreter result; allocates and frees libtommath
+ *	temporaries via the per-interp allocator; takes and releases
+ *	the bigint mutex.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -101180,6 +110328,25 @@ done:
  *
  *	Compare two bigint string values.
  *
+ * Why / How:
+ *	Provides a three-way comparison for callers that need an
+ *	ordering rather than a rendered result.  It loads both
+ *	operands (cache hit or th8BigintFromStr), calls mp_cmp, and
+ *	maps MP_LT/MP_GT/MP_EQ to -1/1/0 in *pCmp.  Unlike the
+ *	arith/unary helpers it does NOT set the interpreter result on
+ *	success -- only on error.  Bracketed by
+ *	th8BigintSetup/Teardown.
+ *
+ * Results:
+ *	TH8_OK with *pCmp set to -1, 0, or 1; TH8_ERROR (interpreter
+ *	result set to an error message) if either operand is not an
+ *	integer or on out-of-memory.
+ *
+ * Side effects:
+ *	Writes *pCmp; allocates and frees libtommath temporaries via
+ *	the per-interp allocator; sets the interpreter result only on
+ *	error; takes and releases the bigint mutex.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -101240,6 +110407,29 @@ bad:
  *
  *	Check if a string represents a valid integer that exceeds
  *	th8_int64_t range.
+ *
+ * Why / How:
+ *	The gate the evaluator uses to decide whether a token needs
+ *	the bigint path at all: a value is a bigint only if it parses
+ *	as an integer AND needs more than 63 bits.  It first consults
+ *	the TH8_CACHE_BIGINT memo (iValid+pBigint = yes, iValid+NULL =
+ *	no); on a miss it parses with th8BigintFromStr, checks
+ *	mp_count_bits > 63, and caches the outcome either way -- a
+ *	positive result stashes the parsed mp_int via
+ *	th8BigintCacheStore so later arithmetic skips re-parsing, a
+ *	negative result records the iValid+NULL "not a bigint" memo.
+ *	The plain pCached guards and ALWAYS interp guard are Bug 26/28
+ *	family (OOM-tolerant, TH8_OMIT-safe).
+ *
+ * Results:
+ *	1 if the string is a valid integer exceeding 63 bits;
+ *	0 otherwise (including non-integer strings and OOM).
+ *
+ * Side effects:
+ *	Populates the interpreter's bigint internal-rep cache (a memo
+ *	and, for a true result, a copied mp_int); allocates libtommath
+ *	temporaries via the per-interp allocator; takes and releases
+ *	the bigint mutex.  Does not set the interpreter result.
  *
  *----------------------------------------------------------------------
  */
@@ -101338,6 +110528,23 @@ cache_result:
  *
  *	Convert a bigint string to double.
  *
+ * Why / How:
+ *	Backs the exact-to-double coercion used when a bigint operand
+ *	meets a floating-point one.  It loads the value (cache hit or
+ *	th8BigintFromStr) and calls libtommath's mp_get_double,
+ *	writing the (possibly rounded or overflowed-to-inf) result to
+ *	*pVal.  Bracketed by th8BigintSetup/Teardown.
+ *
+ * Results:
+ *	TH8_OK with *pVal set to the double approximation; TH8_ERROR
+ *	(interpreter result set to an error message) if the string is
+ *	not an integer or on out-of-memory.
+ *
+ * Side effects:
+ *	Writes *pVal; allocates and frees a libtommath temporary via
+ *	the per-interp allocator; sets the interpreter result only on
+ *	error; takes and releases the bigint mutex.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -101386,6 +110593,28 @@ th8BigintToDouble(Th8_Interp *interp, const char *z, size_t n, double *pVal)
  *	Returns TH8_ERROR with the "integer value too large for
  *	j/J field" message when the value does not fit in the
  *	field's representable range.
+ *
+ * Why / How:
+ *	Implements the binary format j/J field writer.  It parses the
+ *	value, builds mod = 2^(nBytes*8) and half = 2^(nBytes*8-1),
+ *	range-checks against the signed interval [-half, half), and
+ *	for negatives adds mod to form the unsigned two's-complement
+ *	pattern.  It emits big-endian bytes right-aligned and
+ *	zero-padded into pBuf via mp_to_ubin, then reverses them in
+ *	place when little-endian is requested.  Bracketed by
+ *	th8BigintSetup/Teardown.
+ *
+ * Results:
+ *	TH8_OK with nBytes written into pBuf; TH8_ERROR (interpreter
+ *	result set) for a NULL/zero-width field, a non-integer value,
+ *	an out-of-range value ("integer value too large for j/J
+ *	field"), or an out-of-memory / conversion error.
+ *
+ * Side effects:
+ *	Writes nBytes into the caller's pBuf; allocates and frees
+ *	libtommath temporaries via the per-interp allocator; sets the
+ *	interpreter result on error; takes and releases the bigint
+ *	mutex.
  *
  *----------------------------------------------------------------------
  */
@@ -101524,6 +110753,25 @@ done:
  *	bBigEndian, else LSB-first) into a decimal integer string
  *	and set the interp result.
  *
+ * Why / How:
+ *	The inverse decoder: it reads nBytes of two's-complement
+ *	binary (byte-reversing an LSB-first buffer into a scratch copy
+ *	so the core always works MSB-first), reconstructs the
+ *	magnitude with mp_from_ubin, and if the top sign bit is set
+ *	subtracts 2^(nBytes*8) to recover the negative value, then
+ *	renders it with th8BigintToResult.  A zero-width field decodes
+ *	to "0".  Bracketed by th8BigintSetup/Teardown.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the decoded decimal
+ *	integer (or "0" for nBytes == 0); TH8_ERROR (result set) on
+ *	out-of-memory or a libtommath conversion error.
+ *
+ * Side effects:
+ *	Sets the interpreter result; may allocate and free a scratch
+ *	byte buffer plus libtommath temporaries via the per-interp
+ *	allocator; takes and releases the bigint mutex.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -101613,6 +110861,26 @@ done:
  *	  v < 0      -> if |v| is an exact power of 2, fits in
  *	               mp_count_bits(|v|) bits (e.g. -128 = 0x80);
  *	               else ceil((mp_count_bits(|v|) + 1) / 8).
+ *
+ * Why / How:
+ *	Lets the binary formatter pick the smallest j/J field that
+ *	holds a value.  It parses the value, then works from
+ *	mp_count_bits(|v|): zero needs 1 byte; a positive value needs
+ *	one extra sign bit (bits+1); a negative value needs bits when
+ *	|v| is an exact power of two (detected via mp_cnt_lsb ==
+ *	bits-1, e.g. -128 = 0x80) and bits+1 otherwise.  The bit count
+ *	is rounded up to whole bytes.  Bracketed by
+ *	th8BigintSetup/Teardown.
+ *
+ * Results:
+ *	TH8_OK with *pNeeded set to the minimum byte width; TH8_ERROR
+ *	(interpreter result set to an error message) if the string is
+ *	not an integer or on out-of-memory.
+ *
+ * Side effects:
+ *	Writes *pNeeded; allocates and frees libtommath temporaries
+ *	via the per-interp allocator; sets the interpreter result only
+ *	on error; takes and releases the bigint mutex.
  *
  *----------------------------------------------------------------------
  */
@@ -113975,6 +123243,16 @@ typedef struct Th8_KeyStore {
  *	8 known magic bytes at slot 0 against a compile-time
  *	constant before every crypto operation.
  *
+ * Results:
+ *	TH8_OK if the canary bytes are intact; TH8_ERROR if `pKS`
+ *	or its page is NULL, or if the bytes differ from the
+ *	compile-time constant (with an interpreter result message
+ *	reporting possible buffer overflow in the corruption case).
+ *
+ * Side effects:
+ *	On detected corruption, sets the interpreter result; the
+ *	NULL and intact-canary cases change nothing.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -114044,11 +123322,18 @@ th8SlotIsUsed(const Th8_KeyStore *pKS, int i)
  *	is reserved for the canary and indices outside the
  *	bitmap would smash neighbouring fields.
  *
+ * Why / How:
+ *	The bitmap-based allocator keeps all slot bookkeeping
+ *	inside the fixed `pKS->aBitmap` array (no heap
+ *	allocation), so allocation state stays out of pageable
+ *	memory alongside the key store.  Marking a slot is a
+ *	single OR of the `i % 8` bit in byte `i / 8`.
+ *
  * Parameters:
  *	pKS -- key store.
  *	i   -- slot index.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -114073,11 +123358,18 @@ th8SlotSetUsed(Th8_KeyStore *pKS, int i)
  *	sensitive (slot allocation only manages presence, not
  *	key material lifecycle).
  *
+ * Why / How:
+ *	Release side of the bitmap allocator (companion to
+ *	`th8SlotSetUsed`): clears the slot's presence bit with
+ *	a single AND-NOT of the `i % 8` bit in byte `i / 8`,
+ *	keeping slot bookkeeping heap-free and out of pageable
+ *	memory.
+ *
  * Parameters:
  *	pKS -- key store.
  *	i   -- slot index.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -114109,11 +123401,18 @@ th8SlotClearUsed(Th8_KeyStore *pKS, int i)
  *	sensitive material and avoid reading/writing past
  *	`TH8_SECURE_KEY_SIZE` bytes.
  *
+ * Why / How:
+ *	Slots are laid out contiguously in the locked page, so
+ *	the address is simply `pKS->pPage + i *
+ *	TH8_SECURE_KEY_SIZE`.  Returning a direct pointer (no
+ *	copy) lets callers encrypt/decrypt straight from the
+ *	locked page, keeping key bytes off the pageable heap.
+ *
  * Parameters:
  *	pKS -- key store.
  *	i   -- slot index.
  *
- * Returns:
+ * Results:
  *	Pointer into the locked data page.  Never NULL when
  *	`pKS` is initialised.
  *
@@ -114147,9 +123446,13 @@ th8SlotKey(Th8_KeyStore *pKS, int i)
  *	configuration-dependent and the data is still
  *	functionally correct in unlocked form).
  *
+ * Why / How:
  *	Key material must never reach swap or core dumps;
  *	guard pages with no access permissions create a
- *	hardware trap on overflow / underflow.  The mirror
+ *	hardware trap on overflow / underflow.  A single
+ *	`VirtualAlloc` reserves three contiguous pages, the
+ *	outer two are flipped to `PAGE_NOACCESS`, and the
+ *	middle data page is `VirtualLock`ed.  The mirror
  *	POSIX implementation lives below.
  *
  * Parameters:
@@ -114157,7 +123460,7 @@ th8SlotKey(Th8_KeyStore *pKS, int i)
  *		`pKS->nAlloc`, `pKS->pPage`, and
  *		`pKS->nPageSize` are populated.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` if `VirtualAlloc`
  *	fails.
  *
@@ -114211,12 +123514,20 @@ th8SecureAllocPages(Th8_KeyStore *pKS)
  *	Safe to call against a partially-initialised store --
  *	each NULL guard skips its block independently.
  *
+ * Why / How:
+ *	Key bytes must be wiped while the page is still locked
+ *	(pinned in RAM) so the zeroing itself cannot be paged
+ *	to swap, hence the ordered `Th8_SecureZero` ->
+ *	`VirtualUnlock` -> `VirtualFree(MEM_RELEASE)`.  The
+ *	NULL guards make it the safe inverse of a possibly-
+ *	partial `th8SecureAllocPages`.
+ *
  * Parameters:
  *	interp -- live interpreter (forwarded to
  *		`Th8_SecureZero`).
  *	pKS    -- key store.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -114291,12 +123602,21 @@ th8SecureGetPageSize(void)
  *
  *	Mirror of the Win32 implementation above.
  *
+ * Why / How:
+ *	Key material must never reach swap or core dumps.  A
+ *	single `mmap` gives three contiguous, page-aligned
+ *	pages; the outer two become `PROT_NONE` guard pages
+ *	whose access traps in hardware, and the middle data
+ *	page is `mlock`ed (best-effort) so its bytes stay
+ *	resident.  Linux `madvise` hardening further excludes
+ *	the page from core dumps and wipes it on fork.
+ *
  * Parameters:
  *	pKS -- key store; on success `pKS->pRegion`,
  *		`pKS->nRegion`, `pKS->pPage`, and
  *		`pKS->nPageSize` are populated.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` if `mmap` fails.
  *
  * Side effects:
@@ -114370,12 +123690,19 @@ th8SecureAllocPages(Th8_KeyStore *pKS)
  *	Safe to call against a partially-initialised store --
  *	each NULL guard skips its block independently.
  *
+ * Why / How:
+ *	Key bytes are wiped while the page is still `mlock`ed
+ *	(pinned in RAM) so the zeroing cannot be paged to swap,
+ *	hence the ordered `Th8_SecureZero` -> `munlock` ->
+ *	`munmap`.  The NULL guards make it the safe inverse of
+ *	a possibly-partial `th8SecureAllocPages`.
+ *
  * Parameters:
  *	interp -- live interpreter (forwarded to
  *		`Th8_SecureZero`).
  *	pKS    -- key store.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -114415,6 +123742,14 @@ th8SecureFreePages(Th8_Interp *interp, Th8_KeyStore *pKS)
  *	the key is rotated on every write, the counter could safely
  *	restart at 0; we keep incrementing for defense in depth.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes all TH8_SECURE_NONCE_SIZE (12) bytes of the
+ *	caller-provided `aNonce` buffer: the counter little-endian
+ *	in bytes 0..7 and zero in bytes 8..11.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -114450,6 +123785,16 @@ th8SecureDeriveNonce(
  *	an attacker from distinguishing between e.g., a 3-char and
  *	a 4-char password based on ciphertext size alone.
  *
+ * Results:
+ *	The padded length: `nPlain` rounded up to the next
+ *	TH8_SECURE_PAD_BLOCK (64) boundary, always strictly
+ *	greater than `nPlain` (a full block is added when
+ *	`nPlain` is already a multiple, reserving room for the
+ *	mandatory pad-count byte).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -114479,6 +123824,20 @@ th8SecurePadSize(size_t nPlain)
  *	before touching key material.  On success, ownership of
  *	the ciphertext buffer is transferred to pData; the padded
  *	plaintext is securely zeroed regardless of outcome.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR on canary corruption, a
+ *	failed allocation, or any OpenSSL EVP failure.
+ *
+ * Side effects:
+ *	On success, frees any previous `pData->zCipher` and stores
+ *	the freshly-allocated ciphertext in `pData->zCipher` /
+ *	`pData->nCipher`, writes the GCM tag into `pData->aTag`,
+ *	and increments the nonce counter `pData->nNonce` (the
+ *	counter is bumped once encryption is attempted, even on a
+ *	later failure).  Allocates a temporary padded-plaintext
+ *	buffer that is securely zeroed and freed on every path.
+ *	On canary corruption, sets the interpreter result.
  *
  *----------------------------------------------------------------------
  */
@@ -114624,6 +123983,24 @@ done:
  *	Capacity check: the region's usable area (page size minus
  *	canary) MUST be at least pData->nCipher + 1 bytes.  If not,
  *	the function returns TH8_ERROR with a descriptive result.
+ *
+ * Results:
+ *	TH8_OK on success, with `*pzPlain` set to a pointer into
+ *	`pDest`'s data area (just past the canary) and `*pnPlain`
+ *	to the unpadded plaintext length; an empty stored value
+ *	yields TH8_OK with `*pnPlain` == 0.  TH8_ERROR on a NULL
+ *	destination region, canary corruption (key page or
+ *	region), an undersized/over-capacity region, a missing
+ *	region data pointer, or any EVP failure including
+ *	GCM authentication-tag mismatch -- each with an
+ *	interpreter result message.  `*pzPlain` / `*pnPlain` are
+ *	initialised to NULL / 0 at entry and left so on failure.
+ *
+ * Side effects:
+ *	Writes decrypted, padding-stripped, NUL-terminated
+ *	plaintext into `pDest`'s data area (no heap allocation).
+ *	On any failure path, securely zeros that data area.  Sets
+ *	the interpreter result on error.
  *
  *----------------------------------------------------------------------
  */
@@ -114857,6 +124234,18 @@ done:
  *	0 is reserved for the canary; slots 1..127 are available
  *	for secure variables.
  *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR on a NULL interpreter, a
+ *	failed key-store allocation, or a failed locked-page
+ *	allocation.
+ *
+ * Side effects:
+ *	Allocates and zeroes a Th8_KeyStore, allocates the
+ *	guard-paged locked key page, installs the canary in slot 0
+ *	and marks that slot used, and attaches the key store to
+ *	the interpreter (th8SetSecureKeyStore).  Frees the key
+ *	store on the page-allocation failure path.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -114903,6 +124292,15 @@ th8SecureInit(Th8_Interp *interp)
  *	hash.  Each entry's ciphertext is zeroed before freeing to
  *	minimize forensic exposure in freed heap memory.
  *
+ * Results:
+ *	Always TH8_OK (the iteration callback never aborts the
+ *	walk).
+ *
+ * Side effects:
+ *	For a non-NULL entry payload: securely zeros then frees the
+ *	ciphertext, securely zeros then frees the
+ *	Th8_SecureVarData, and clears `pEntry->pData` to NULL.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -114940,6 +124338,16 @@ th8SecureCleanupEntry(Th8_HashEntry *pEntry, void *pCtx)
  *	zeroed, unlocked, and unmapped.  The order matters: key
  *	material is zeroed while the page is still locked (pinned
  *	in RAM) to prevent the zeroing from being paged to swap.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Iterates and frees every secure-variable hash entry
+ *	(th8SecureCleanupEntry), deletes the hash and detaches it
+ *	from the interpreter; securely zeros, unlocks, unmaps, and
+ *	frees the locked key store and detaches it.  A NULL
+ *	interpreter, absent hash, or absent key store is a no-op.
  *
  *----------------------------------------------------------------------
  */
@@ -114986,6 +124394,24 @@ th8SecureFinish(Th8_Interp *interp)
  *	actual data lives in the encrypted metadata hash.  If any
  *	step fails, all partially-allocated resources (key slot,
  *	metadata, ciphertext) are cleaned up before returning.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR (with an interpreter result
+ *	message) on a NULL interpreter, uninitialised secure
+ *	subsystem, a name that already exists, array-element
+ *	syntax in the name, no free key slot / maximum reached, or
+ *	a key-generation, encryption, variable-set, or hash
+ *	allocation failure.
+ *
+ * Side effects:
+ *	On success: consumes one key slot (random key written into
+ *	the locked page, bitmap bit set, `pKS->nUsed` incremented),
+ *	allocates the Th8_SecureVarData metadata and its
+ *	ciphertext, creates the Tcl variable with an empty
+ *	sentinel value, and registers the entry in the per-interp
+ *	secure hash (creating the hash on first use).  Every
+ *	failure path unwinds whatever it had already allocated
+ *	(zeroing key material and freeing metadata/ciphertext).
  *
  *----------------------------------------------------------------------
  */
@@ -115144,6 +124570,18 @@ th8SecureVarCreate(
  *	still contains valid key bytes.  The ciphertext is also
  *	zeroed before freeing to minimize forensic exposure.
  *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR (with an interpreter result
+ *	message) on a NULL interpreter, no secure-var hash, or a
+ *	variable that is not secure.
+ *
+ * Side effects:
+ *	Securely zeros and releases the variable's key slot (bitmap
+ *	bit cleared, `pKS->nUsed` decremented), securely zeros and
+ *	frees its ciphertext and metadata, removes the entry from
+ *	the secure-var hash, and unsets the underlying Tcl
+ *	variable.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -115212,6 +124650,21 @@ th8SecureVarDelete(Th8_Interp *interp, const char *zVar, size_t nVar)
  *	Test whether a variable is a secure (encrypted) variable.
  *	Returns 1 if the variable has secure metadata, 0 otherwise.
  *
+ * Why / How:
+ *	Looks the name up in the per-interpreter secure-var hash;
+ *	a variable is secure iff a live entry with a non-NULL
+ *	payload exists.  The `ALWAYS(pEntry->pData)` guard encodes
+ *	the invariant that present entries always carry metadata
+ *	(th8SecureVarDelete removes entries outright rather than
+ *	leaving NULL-payload tombstones).
+ *
+ * Results:
+ *	1 if the variable is a secure variable; 0 otherwise
+ *	(including a NULL interpreter or no secure-var hash).
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -115247,6 +124700,19 @@ th8IsSecureVar(Th8_Interp *interp, const char *zVar, size_t nVar)
  *	zeroed immediately after copying to the result.  The result
  *	itself is marked "sensitive" so Th8_SetResult will zero it
  *	on the next result change.
+ *
+ * Results:
+ *	TH8_OK with the decrypted value installed as the sensitive
+ *	interpreter result; TH8_ERROR on a NULL interpreter, no
+ *	secure-var hash / entry, missing key store or protected
+ *	result region, or a decryption/authentication failure
+ *	(th8SecureDecrypt sets the message).
+ *
+ * Side effects:
+ *	Clears the prior interpreter result, decrypts the value
+ *	directly into the interpreter's protected result region,
+ *	and finalizes it as the sensitive result
+ *	(th8FinalizeSensitiveResult).
  *
  *----------------------------------------------------------------------
  */
@@ -115328,6 +124794,19 @@ th8SecureGetVar(Th8_Interp *interp, const char *zVar, size_t nVar)
  *	in time reveals nothing about the relationship between the
  *	two values (forward secrecy at the variable level).
  *
+ * Results:
+ *	TH8_OK on success or when the variable is not a secure
+ *	variable (a no-op); TH8_ERROR on a NULL interpreter, a
+ *	missing key store, a corrupt slot index (NEVER guard), or
+ *	a key-generation or encryption failure.
+ *
+ * Side effects:
+ *	For a secure variable, rotates the slot key in place (old
+ *	key securely zeroed, fresh random key written into the same
+ *	slot) and re-encrypts the new value into the variable's
+ *	metadata (ciphertext, tag, nonce updated).  Non-secure
+ *	variables are left untouched.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -115406,6 +124885,18 @@ th8SecureSetVar(
  *	and frees the metadata.  This ensures that deleting a
  *	variable via [unset] properly cleans up all crypto state.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	For a variable with secure metadata: securely zeros and
+ *	releases its key slot (bitmap bit cleared, `pKS->nUsed`
+ *	decremented), securely zeros and frees its ciphertext and
+ *	metadata, and clears `pEntry->pData` to NULL (the hash
+ *	entry itself is left in place, since the caller is already
+ *	tearing down the variable).  A NULL interpreter, absent
+ *	hash, or non-secure variable is a no-op.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -115465,6 +124956,7 @@ th8SecureVarCleanup(Th8_Interp *interp, const char *zVar, size_t nVar)
  *	  * `bEnable = 0` -- zero both fields.  Persistence
  *	    is denied.
  *
+ * Why / How:
  *	Scripts cannot self-enable persistence because the
  *	token is unguessable and a single write through the
  *	script-visible API only affects one of the two
@@ -115482,7 +124974,7 @@ th8SecureVarCleanup(Th8_Interp *interp, const char *zVar, size_t nVar)
  *	interp  -- live interpreter.
  *	bEnable -- 1 to open the gate; 0 to close it.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` on NULL `interp` or
  *	on RNG exhaustion (rare: 100 retries; interpreter
  *	result: "unable to generate persistence token").
@@ -115543,15 +125035,17 @@ Th8_EnableSecurePersist(Th8_Interp *interp, int bEnable)
  *	  Gate open iff `nSecurePersistOk != 0` **AND**
  *	  `nSecurePersistOk == nSecurePersistToken`.
  *
+ * Why / How:
  *	The two-field check is the security property: a
  *	script that manages to overwrite one field through any
  *	mechanism still cannot match the random token in the
- *	other.
+ *	other.  Both conditions must hold, so a partial write
+ *	(or a zeroed pair) leaves the gate closed.
  *
  * Parameters:
  *	interp -- live interpreter (or NULL).
  *
- * Returns:
+ * Results:
  *	1 if the gate is open; 0 otherwise (including NULL
  *	interp).
  *
@@ -115581,6 +125075,16 @@ Th8_IsSecurePersistEnabled(Th8_Interp *interp)
  *	The master key gets the same mlock/guard-page protection as
  *	per-variable keys.  Slot 1 is special-cased (not tracked in
  *	the bitmap).  The key is validated to be exactly 32 bytes.
+ *
+ * Results:
+ *	TH8_OK on success; TH8_ERROR (with an interpreter result
+ *	message) on a NULL interpreter, a key length other than 32
+ *	bytes, a NULL key pointer, an uninitialised secure
+ *	subsystem, or a failed canary check.
+ *
+ * Side effects:
+ *	Copies the 32 key bytes into slot 1 of the locked key page.
+ *	On the error paths, sets the interpreter result.
  *
  *----------------------------------------------------------------------
  */
@@ -115637,6 +125141,14 @@ Th8_SecureSetMasterKey(
  *	until a new master key is set.  The key is zeroed in-place
  *	while the page is still locked (pinned in RAM).
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Securely zeros the 32 key bytes of slot 1 in the locked
+ *	key page.  A NULL interpreter or absent/uninitialised key
+ *	store is a no-op.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -115660,6 +125172,21 @@ Th8_SecureClearMasterKey(Th8_Interp *interp)
  * th8SecureHasMasterKey --
  *
  *	Check if a master key has been set (slot 1 is non-zero).
+ *
+ * Why / How:
+ *	There is no separate "master key present" flag; presence
+ *	is inferred by scanning the 32 bytes of slot 1 for any
+ *	non-zero byte.  An all-zero slot means "no key" -- valid
+ *	because a real 256-bit key is overwhelmingly unlikely to
+ *	be all zeros and Th8_SecureClearMasterKey zeros the slot.
+ *
+ * Results:
+ *	1 if any byte of slot 1 is non-zero (a master key is set);
+ *	0 otherwise, including a NULL interpreter or an
+ *	absent/uninitialised key store.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -115720,6 +125247,15 @@ th8SecureHasMasterKey(Th8_Interp *interp)
  *	persistence.  Called by the public `secure persist`
  *	command path; not exported in the public API.
  *
+ * Why / How:
+ *	Persistence needs a wire format that survives outside the
+ *	locked key page, so the value is re-encrypted under the
+ *	embedder's master key (never the ephemeral per-variable
+ *	key) and framed with the variable name as AAD so a blob
+ *	cannot be replayed under a different name.  The plaintext
+ *	is staged only in the locked protected region, never the
+ *	pageable heap.
+ *
  *	Pipeline (security-critical, order matters):
  *
  *	  1. Gate checks: persistence enabled
@@ -115758,7 +125294,7 @@ th8SecureHasMasterKey(Th8_Interp *interp)
  *	zVar   -- variable name (not necessarily NUL-terminated).
  *	nVar   -- variable-name length.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on successful persist; `TH8_ERROR` on any
  *	gate / lookup / crypto / KV failure (interpreter
  *	result: diagnostic from the failing stage).
@@ -115982,6 +125518,26 @@ done:
  *	6. Strip PKCS#7 padding
  *	7. Create new secure variable with decrypted value
  *	8. Securely zero temporary buffers
+ *
+ * Results:
+ *	TH8_OK when the blob is retrieved, authenticated, and a
+ *	fresh in-memory secure variable is created; TH8_ERROR
+ *	(with an interpreter result message) on a NULL interpreter,
+ *	a closed persistence gate, an unset master key, a missing
+ *	KV entry, a too-short/bad-magic/bad-version/corrupted blob,
+ *	an over-capacity protected region, a GCM authentication
+ *	failure, a plaintext-length mismatch, or a failure creating
+ *	the variable.
+ *
+ * Side effects:
+ *	Builds a "th8:secure:<name>" KV key and reads the blob via
+ *	Th8_KeyValue; copies it to a private heap buffer and clears
+ *	the interpreter result; master-key-decrypts into the
+ *	interpreter's protected region; on success creates a new
+ *	secure variable (th8SecureVarCreate).  Securely zeros and
+ *	frees the blob buffer and KV key, securely zeros the
+ *	protected region's data area, and clears the interpreter
+ *	result on success.
  *
  *----------------------------------------------------------------------
  */
@@ -118324,11 +127880,19 @@ Th8_GetEmbeddedKeyTime(size_t *pnData)
  *	either replaces this object in the link or builds with
  *	`-DTH8_OMIT_KEYRING_STUB` so the strong definition wins.
  *
+ * Why / How:
+ *	Provides a link-time default so the signed-only loader always has a
+ *	Th8_GetEmbeddedKeyring symbol to call even when no keyring was
+ *	generated.  It simply reports an empty keyring: writes 0 through
+ *	pnEntries (when non-NULL) and returns NULL.  A generated strong
+ *	definition supersedes this stub, either by replacing the object or by
+ *	compiling with -DTH8_OMIT_KEYRING_STUB to elide it.
+ *
  * Parameters:
  *	pnEntries -- output pointer for the number of keyring
  *		entries.  May be NULL; if non-NULL the stub writes 0.
  *
- * Returns:
+ * Results:
  *	NULL (no keyring).  An overriding strong definition would
  *	return a pointer to an array of `*pnEntries` entries.
  *
@@ -118458,7 +128022,10 @@ typedef struct {
  *	stale policy, publicKeyToken, or algorithmName values.
  *
  * Results:
- *	None.
+ *	TH8_OK when all seven elements were reset; TH8_ERROR on the
+ *	first allocation failure (the array may be partially reset).
+ *	A TH8_ERROR MUST fail the verification so a partial security
+ *	array is never exposed to the script (TH8K-006/-020).
  *
  * Side effects:
  *	Sets every element of the ::th8_security array variable
@@ -118467,10 +128034,10 @@ typedef struct {
  *----------------------------------------------------------------------
  */
 
-static void
+static int
 th8PolicyResetSecurity(Th8_Interp *interp)
 {
-    Th8_ResetSecurityArray(interp);
+    return Th8_ResetSecurityArray(interp);
 }
 #  endif
 
@@ -119090,8 +128657,11 @@ th8PolicyCheckAnnotations(
 		return TH8_ERROR;
 	    }
 	} else {
+	    /* Default server, DNSSEC-required (1): a policy time check must
+	     * not silently accept an unvalidated answer. */
 	    bHaveRemoteTime =
-	        (th8NtpQuery(interp, NULL, 0, 5000, 0, 0, &nowSec) == TH8_OK);
+	        (th8NtpQuery(interp, NULL, 0, 5000, 0, 0, 1, &nowSec) ==
+	         TH8_OK);
 	}
 
 	/*
@@ -119174,7 +128744,7 @@ th8PolicyCheckAnnotations(
 static int
 th8PolicyFetchKey(
     Th8_Interp *interp,
-    const char *zToken,  /* 16-char hex token (NUL-terminated). */
+    const char *zToken, /* 16-char hex token (NUL-terminated). */
     Th8_RsaKey **ppKey)
 {
     /*
@@ -119289,9 +128859,9 @@ static void
 th8PolicyPopulateSecurity(
     Th8_Interp *interp,
     const Th8_RsaKey *pKey,
-    const char *zToken,  /* 16-char hex (NUL-terminated). */
-    const char *zName,  /* Verified script name. */
-    size_t nName)  /* Name length. */
+    const char *zToken, /* 16-char hex (NUL-terminated). */
+    const char *zName, /* Verified script name. */
+    size_t nName) /* Name length. */
 {
     /*
      * algorithmName: "RSA-<bits>"
@@ -119379,11 +128949,11 @@ th8PolicyPopulateSecurity(
 int
 th8PolicyVerifyData(
     Th8_Interp *interp,
-    const char *zName,  /* File name. */
-    size_t nName,  /* File name length. */
-    const char *zData,  /* Raw file data. */
-    size_t nData,  /* Raw data length. */
-    void *pCtx)   /* Th8_PolicyCtx*. */
+    const char *zName, /* File name. */
+    size_t nName, /* File name length. */
+    const char *zData, /* Raw file data. */
+    size_t nData, /* Raw data length. */
+    void *pCtx) /* Th8_PolicyCtx*. */
 {
     Th8_PolicyCtx *p = (Th8_PolicyCtx *)pCtx;
     Th8_ScriptAnnotations ann;
@@ -119616,7 +129186,17 @@ th8PolicyVerifyData(
      */
 
 #  if defined(TH8_ENABLE_VARIABLES)
-    th8PolicyResetSecurity(interp);
+    if (th8PolicyResetSecurity(interp) != TH8_OK) {
+	/*
+	 * The security array could not be cleanly reset (allocation
+	 * failure).  Reject the eval rather than expose a possibly
+	 * partial security array to the just-verified script
+	 * (TH8K-006/-020).
+	 */
+	Th8_SetResultStatic(
+	    interp, "signed-only: unable to reset security state", TH8_NOLEN);
+	goto error;
+    }
     th8PolicyPopulateSecurity(interp, pKey, zToken, zName, nName);
 
     /*
@@ -119920,7 +129500,7 @@ th8PolicyCallback(
 int
 Th8_InstallSignedPolicy(
     Th8_Interp *interp,
-    void **ppCtx)  /* OUT: opaque context (or NULL). */
+    void **ppCtx) /* OUT: opaque context (or NULL). */
 {
     Th8_PolicyCtx *p;
 
@@ -120007,7 +129587,7 @@ th8PolicyFreeKeyEntry(Th8_HashEntry *pEntry, void *pCtx)
 void
 Th8_RemoveSignedPolicy(
     Th8_Interp *interp,
-    void *pCtx)   /* The Th8_PolicyCtx* from install. */
+    void *pCtx) /* The Th8_PolicyCtx* from install. */
 {
     Th8_PolicyCtx *p = (Th8_PolicyCtx *)pCtx;
 
@@ -120252,7 +129832,7 @@ int
 Th8_EnableSignedPolicy(
     Th8_Interp *interp, /* Interpreter. */
     void **ppCtx, /* Context pointer. */
-    int bEnable)  /* 1=enable, 0=disable. */
+    int bEnable) /* 1=enable, 0=disable. */
 {
     void *pCtx = NULL;
     const unsigned char *zKeyData;
@@ -120360,11 +129940,11 @@ fail:
 
 int
 Th8_EvalFileAndRsaKeyLoad(
-    Th8_Interp *interp,  /* Parent interpreter. */
-    const char *zName,  /* Script file name. */
-    size_t nName,  /* Byte length, or TH8_NOLEN. */
-    void *pCtx,   /* Policy context (for preload). */
-    int bPreload)  /* Non-zero to preload into cache. */
+    Th8_Interp *interp, /* Parent interpreter. */
+    const char *zName, /* Script file name. */
+    size_t nName, /* Byte length, or TH8_NOLEN. */
+    void *pCtx, /* Policy context (for preload). */
+    int bPreload) /* Non-zero to preload into cache. */
 {
     const unsigned char *zData = NULL;
     size_t nData = 0;
@@ -122901,12 +132481,20 @@ th8TestRsaKeyClearPubBlob(
  *
  *	Gated on `TH8_ENABLE_CRYPTOGRAPHY`.
  *
+ * Why / How:
+ *	A minimal two-field setter: after the caller has temporarily
+ *	overwritten a key's public-blob pointer/length to drive an
+ *	error-handling arm, this writes the saved pair straight back into
+ *	`pKey->zPubBlob` and `pKey->nPubBlob` so the key regains its
+ *	well-formed state for subsequent test vectors.  A NULL key is a no-op
+ *	so drivers need not special-case it.
+ *
  * Parameters:
  *	pKey       -- key to mutate (NULL is a no-op).
  *	pSavedBlob -- pointer to restore into `pKey->zPubBlob`.
  *	nSaved     -- length to restore into `pKey->nPubBlob`.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -122923,6 +132511,159 @@ th8TestRsaKeyRestorePubBlob(
     if (!pKey) return;
     pKey->zPubBlob = pSavedBlob;
     pKey->nPubBlob = nSaved;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8RsaSignRawBlock --
+ *
+ *	Produce a raw PKCS#1 v1.5 RSA signature over an arbitrary
+ *	to-be-signed block, WITHOUT hashing it first.  Unlike
+ *	Th8_RsaSign (which always computes a SHA-512 DigestInfo),
+ *	this signs the caller's bytes verbatim: the result is an
+ *	`s` such that EVP_PKEY_verify_recover(s) yields exactly the
+ *	`zBlock` bytes back.
+ *
+ * Why / How:
+ *	Test-only helper (exposed via the internal stubs) used to
+ *	drive the DigestInfo-format guard in Th8_RsaExtractHash --
+ *	`if (recoveredLen != sha512PrefixLen + 64 || Th8_Memcmp(...)
+ *	!= 0)`.  Every real signature carries a well-formed SHA-512
+ *	DigestInfo, so that guard is permanently (F,F) and cannot be
+ *	driven to either error arm by any real load.  Signing a
+ *	block of the wrong LENGTH drives the C1 (T,-) vector, and
+ *	signing a same-length block with a wrong PREFIX drives the
+ *	C2 (F,T) vector; both recover with valid PKCS#1 padding (so
+ *	the earlier "RSA recover failed" arm is not taken) but fail
+ *	the DigestInfo check.  A minimal (n, e, d) private key is
+ *	built via EVP_PKEY_fromdata -- CRT parameters are not needed
+ *	for a one-off test signature -- then EVP_PKEY_sign with
+ *	RSA_PKCS1_PADDING and no digest signs the raw block.
+ *
+ * Results:
+ *	TH8_OK with *ppSig / *pnSig set to the freshly allocated
+ *	signature (caller frees via Th8_Free); TH8_ERROR on a NULL
+ *	argument, a key without private components, or any OpenSSL
+ *	failure, with the interpreter result set.
+ *
+ * Side effects:
+ *	Allocates the returned signature buffer; sets the
+ *	interpreter result on failure.
+ *
+ *----------------------------------------------------------------------
+ */
+
+TH8_INTERNAL int
+th8RsaSignRawBlock(
+    Th8_Interp *interp, /* Interpreter (for allocation / errors). */
+    const Th8_RsaKey *pKey, /* Private key. */
+    const unsigned char *zBlock, /* Raw to-be-signed block. */
+    size_t nBlock, /* Block length in bytes. */
+    unsigned char **ppSig, /* OUT: signature (caller frees). */
+    size_t *pnSig) /* OUT: signature length. */
+{
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *kctx = NULL;
+    EVP_PKEY_CTX *sctx = NULL;
+    OSSL_PARAM_BLD *bld = NULL;
+    OSSL_PARAM *params = NULL;
+    BIGNUM *bn_n = NULL;
+    BIGNUM *bn_e = NULL;
+    BIGNUM *bn_d = NULL;
+    size_t nModulus, nPrivExp;
+    const unsigned char *zModulus, *zPrivExp;
+    unsigned char *zSig = NULL;
+    size_t nSig = 0;
+    int ok = 0;
+
+    if (!interp) return TH8_ERROR;
+    if (!ppSig || !pnSig) {
+	Th8_SetResultStatic(interp, "raw sign: invalid arguments", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+    *ppSig = NULL;
+    *pnSig = 0;
+
+    if (!Th8_RsaKeyHasPrivate(pKey)) {
+	Th8_SetResultStatic(
+	    interp, "raw sign: key has no private components", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+
+    zModulus = Th8_RsaKeyModulus(pKey, &nModulus);
+    zPrivExp = Th8_RsaKeyPrivExp(pKey, &nPrivExp);
+    if (!zModulus || nModulus == 0 || !zPrivExp || nPrivExp == 0) {
+	Th8_SetResultStatic(
+	    interp, "raw sign: incomplete private key", TH8_NOLEN);
+	return TH8_ERROR;
+    }
+
+    bn_n = BN_bin2bn(zModulus, (int)nModulus, NULL);
+    if (!bn_n) goto cleanup;
+    bn_d = BN_bin2bn(zPrivExp, (int)nPrivExp, NULL);
+    if (!bn_d) goto cleanup;
+    bn_e = BN_new();
+    if (!bn_e) goto cleanup;
+    BN_set_word(bn_e, (unsigned long)Th8_RsaKeyPubExp(pKey));
+
+    bld = OSSL_PARAM_BLD_new();
+    if (!bld) goto cleanup;
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, bn_n) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, bn_e) ||
+        !OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_D, bn_d)) {
+	goto cleanup;
+    }
+    params = OSSL_PARAM_BLD_to_param(bld);
+    if (!params) goto cleanup;
+
+    kctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+    if (!kctx) goto cleanup;
+    if (EVP_PKEY_fromdata_init(kctx) != 1 ||
+        EVP_PKEY_fromdata(kctx, &pkey, EVP_PKEY_KEYPAIR, params) != 1) {
+	Th8_SetResultStatic(
+	    interp, "raw sign: private key construction failed", TH8_NOLEN);
+	goto cleanup;
+    }
+
+    sctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (!sctx) goto cleanup;
+    if (EVP_PKEY_sign_init(sctx) != 1 ||
+        EVP_PKEY_CTX_set_rsa_padding(sctx, RSA_PKCS1_PADDING) != 1) {
+	Th8_SetResultStatic(interp, "raw sign: sign init failed", TH8_NOLEN);
+	goto cleanup;
+    }
+
+    if (EVP_PKEY_sign(sctx, NULL, &nSig, zBlock, nBlock) != 1 || nSig == 0) {
+	Th8_SetResultStatic(
+	    interp, "raw sign: cannot determine signature size", TH8_NOLEN);
+	goto cleanup;
+    }
+    zSig = (unsigned char *)TH8_ALLOC(interp, nSig);
+    if (!zSig) goto cleanup;
+    if (EVP_PKEY_sign(sctx, zSig, &nSig, zBlock, nBlock) != 1) {
+	Th8_SetResultStatic(interp, "raw sign: sign failed", TH8_NOLEN);
+	goto cleanup;
+    }
+
+    *ppSig = zSig;
+    *pnSig = nSig;
+    zSig = NULL;
+    ok = 1;
+
+cleanup:
+    if (zSig) Th8_Free(interp, zSig);
+    if (sctx) EVP_PKEY_CTX_free(sctx);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (kctx) EVP_PKEY_CTX_free(kctx);
+    if (params) OSSL_PARAM_free(params);
+    if (bld) OSSL_PARAM_BLD_free(bld);
+    if (bn_d) BN_clear_free(bn_d);
+    if (bn_n) BN_free(bn_n);
+    if (bn_e) BN_free(bn_e);
+
+    return ok ? TH8_OK : TH8_ERROR;
 }
 
 
@@ -122966,25 +132707,27 @@ th8TestRsaKeyRestorePubBlob(
 #else
 /* amalgamation: th8_meta_posix.h already included */
 #line 30 "src/plugins/harpy/th8_time.c"
+/* amalgamation: th8_meta_glibc.h already included */
+#line 31 "src/plugins/harpy/th8_time.c"
 #endif
 
 /* amalgamation: th8_plat.h already included */
-#line 33 "src/plugins/harpy/th8_time.c"
+#line 34 "src/plugins/harpy/th8_time.c"
 #include "th8.h"
 /* amalgamation: th8_int.h already included */
-#line 35 "src/plugins/harpy/th8_time.c"
+#line 36 "src/plugins/harpy/th8_time.c"
 
 #if defined(TH8_ENABLE_CRYPTOGRAPHY)
 
 /* amalgamation: th8_util.h already included */
-#line 39 "src/plugins/harpy/th8_time.c"
+#line 40 "src/plugins/harpy/th8_time.c"
 
 /*
  * Platform socket headers (via meta-headers).
  */
 
 #  if defined(_WIN32)
-   /* <windows.h>, <winsock2.h>, <ws2tcpip.h> via th8_meta_win32.h */
+/* <windows.h>, <winsock2.h>, <ws2tcpip.h> via th8_meta_win32.h */
 typedef SOCKET ntp_socket_t;
 #    define NTP_INVALID_SOCKET   INVALID_SOCKET
 #    define ntp_close            closesocket
@@ -122995,10 +132738,6 @@ typedef int ntp_socket_t;
 #    define NTP_INVALID_SOCKET   (-1)
 #    define ntp_close            close
 #    define ntp_poll(pfd, n, ms) poll((pfd), (n), (ms))
-#  endif
-
-#  if defined(TH8_ENABLE_UNBOUND)
-#    include <unbound.h>
 #  endif
 
 
@@ -123018,6 +132757,7 @@ typedef int ntp_socket_t;
 #  define NTP_DEFAULT_TIMEOUT_MS   3000
 #  define NTP_DEFAULT_MAX_DISAGREE 5 /* seconds */
 #  define NTP_MAX_SERVERS          8
+#  define NTP_MAX_ADDRS            16 /* resolved A+AAAA addresses, one server */
 /*
  * Per-server send/receive attempts.  NTP runs over UDP, so a lost
  * request or reply is expected rather than exceptional; a single shot
@@ -123030,7 +132770,7 @@ typedef int ntp_socket_t;
 #  define NTP_DEFAULT_ATTEMPTS 3
 #  define NTP_MAX_ATTEMPTS     10
 
-static const char *th8NtpDefaultServers[] = {"urn.to", NULL};
+static const char *th8NtpDefaultServers[] = {"time.w.sb", NULL};
 
 
 /*
@@ -123188,10 +132928,23 @@ th8NtpWsaInit(void)
  *	packets via the internal stubs -- no live NTP exchange and no
  *	network flakiness.
  *
+ * Why / How:
+ *	Checks, in order: the packet's version (3 or 4) and mode
+ *	(NTP_MODE_SERVER); the stratum is in the valid 1..15 range
+ *	(rejecting kiss-of-death and out-of-range); the response origin
+ *	timestamp equals the transmit timestamp we sent (the anti-spoof
+ *	check); and the server transmit timestamp is non-zero.  On success it
+ *	converts the NTP-era seconds to Unix epoch by subtracting
+ *	NTP_EPOCH_DELTA.
+ *
  * Results:
  *	TH8_OK with *pEpochSec set when the response is well-formed
  *	and authentic; TH8_ERROR (with a specific interp result)
  *	otherwise.
+ *
+ * Side effects:
+ *	On error, sets the interpreter result to a specific diagnostic
+ *	message.  Performs no I/O.
  *
  *----------------------------------------------------------------------
  */
@@ -123250,11 +133003,173 @@ th8NtpValidateResponse(
 
 
 /*
+ * A resolved NTP server address to try.  IPv4-first ordering (Bug 78) lets a
+ * host with no working IPv6 egress reach a usable address in the first retry
+ * round.  Stack-allocated in arrays of NTP_MAX_ADDRS; owns no heap.
+ */
+struct ntpAddr {
+    int family;
+    int salen;
+    struct sockaddr_storage sa;
+};
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8NtpAddrReachable --
+ *
+ *	Test whether a datagram to this resolved address can be routed
+ *	off the host at all.
+ *
+ * Why / How:
+ *	There is no point trying (and reporting a failure for) an
+ *	address whose family the host cannot route off-link -- an IPv6
+ *	server address on a host with no IPv6 egress, or an IPv4
+ *	address on a v6-only host.  Neither family is assumed
+ *	reachable.  The send would fail with ENETUNREACH and, if it
+ *	were the only surviving address, dead-end the query.  A
+ *	`connect()` on a UDP socket performs a routing-table lookup
+ *	WITHOUT sending any packet, so it is a cheap, purely local
+ *	reachability probe: it fails (ENETUNREACH / EHOSTUNREACH /
+ *	EAFNOSUPPORT) exactly when the host has no route for that
+ *	address's family.  It cannot detect an upstream black hole (a
+ *	route exists but packets are silently dropped, as on some CI
+ *	runners); the round-robin fall-over handles that residual
+ *	case.
+ *
+ * Results:
+ *	1 if the address is routable from this host, 0 otherwise.
+ *
+ * Side effects:
+ *	Opens and closes one UDP socket.  Sends nothing.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8NtpAddrReachable(const struct ntpAddr *a)
+{
+    ntp_socket_t s = socket(a->family, SOCK_DGRAM, IPPROTO_UDP);
+    int ok;
+
+    if (s == NTP_INVALID_SOCKET) return 0;
+    ok = (connect(s, (const struct sockaddr *)&a->sa, a->salen) == 0);
+    ntp_close(s);
+    return ok;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8NtpResolveInsecure --
+ *
+ *	Resolve an NTP server name to a list of socket addresses using
+ *	plain getaddrinfo, WITHOUT DNSSEC validation.
+ *
+ * Why / How:
+ *	Two callers: the non-libunbound build (no local validator), and
+ *	-- on libunbound builds -- a server the caller named explicitly
+ *	via -server.  An explicit server is an informed choice to trust
+ *	an unsigned name (most public NTP servers, e.g. pool.ntp.org,
+ *	are in unsigned zones), so it is resolved here rather than
+ *	through the require-secure validating path; the NTP origin-
+ *	timestamp anti-spoof in th8NtpQueryOne is the response-integrity
+ *	defense.  On glibc the resolver's AD bit is consulted as an
+ *	advisory trace only.  Addresses are appended in getaddrinfo
+ *	order (IPv4 first via AF_UNSPEC), capped at nMax.
+ *
+ * Results:
+ *	TH8_OK with *pnAddrs > 0 on success; TH8_ERROR with the interp
+ *	result set if the name does not resolve.
+ *
+ * Side effects:
+ *	Transient DNS traffic.  No heap retained (getaddrinfo result is
+ *	freed before return).
+ *
+ *----------------------------------------------------------------------
+ */
+static int
+th8NtpResolveInsecure(
+    Th8_Interp *interp,
+    const char *zServer,
+    struct ntpAddr *addrs,
+    int nMax,
+    int *pnAddrs)
+{
+    struct addrinfo hints, *res = NULL, *rp;
+    int nAddrs = 0;
+
+    *pnAddrs = 0;
+
+#  if !defined(_WIN32) && !defined(WIN32) && defined(__GLIBC__)
+    {
+	struct __res_state rs;
+	unsigned char abuf[512];
+	int alen;
+
+	Th8_Memset(interp, &rs, 0, sizeof(rs));
+	if (res_ninit(&rs) == 0) {
+	    rs.options |= RES_USE_EDNS0;
+#    if defined(RES_USE_DNSSEC)
+	    rs.options |= RES_USE_DNSSEC;
+#    endif
+	    alen = res_nquery(
+	        &rs, zServer, 1 /*C_IN*/, 1 /*T_A*/, abuf, sizeof(abuf));
+	    if (alen >= 4 && !((abuf[3] >> 5) & 1)) {
+		TH8_TRACE_ERR(
+		    interp, "NTP DNS: AD bit not set "
+		            "(DNSSEC not validated by resolver)");
+	    }
+	    res_nclose(&rs);
+	}
+    }
+#  endif
+
+    Th8_Memset(interp, &hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    if (getaddrinfo(zServer, "123", &hints, &res) != 0 || !res) {
+	TH8_TRACE_ERR(interp, "getaddrinfo failed for NTP server");
+	Th8_ErrorMessage(
+	    interp, "clock ntp: cannot resolve \"", zServer,
+	    Th8_Strlen(interp, zServer));
+	return TH8_ERROR;
+    }
+    for (rp = res; rp != NULL && nAddrs < nMax; rp = rp->ai_next) {
+	if (rp->ai_addrlen == 0 ||
+	    (size_t)rp->ai_addrlen > sizeof(addrs[nAddrs].sa)) {
+	    continue;
+	}
+	Th8_Memset(interp, &addrs[nAddrs].sa, 0, sizeof(addrs[nAddrs].sa));
+	Th8_Memcpy(interp, &addrs[nAddrs].sa, rp->ai_addr, rp->ai_addrlen);
+	addrs[nAddrs].family = rp->ai_family;
+	addrs[nAddrs].salen = (int)rp->ai_addrlen;
+	nAddrs++;
+    }
+    freeaddrinfo(res);
+
+    if (nAddrs == 0) {
+	Th8_ErrorMessage(
+	    interp, "clock ntp: cannot resolve \"", zServer,
+	    Th8_Strlen(interp, zServer));
+	return TH8_ERROR;
+    }
+    *pnAddrs = nAddrs;
+    return TH8_OK;
+}
+
+
+/*
  *----------------------------------------------------------------------
  *
  * th8NtpQueryOne --
  *
- *	Query a single NTP server.  Opens a UDP socket, sends a
+ *	Query a single NTP server, trying EVERY address it resolves
+ *	to.  Opens a UDP socket, sends a
  *	client request, receives the response with timeout, and
  *	extracts the server's transmit timestamp as Unix epoch
  *	seconds.
@@ -123270,9 +133185,23 @@ th8NtpValidateResponse(
  *	anti-spoof comparison that rejects reflected or replayed
  *	packets.
  *
+ * Parameters:
+ *	bRequireSecure -- when nonzero (a libunbound build only), the
+ *	name MUST resolve through the validating resolver to a
+ *	DNSSEC-secure answer; an insecure/unsigned/bogus answer is
+ *	refused.  When zero, resolution uses plain getaddrinfo
+ *	(th8NtpResolveInsecure).  th8NtpQuery sets this from the
+ *	command's -insecure flag.
+ *
  * Results:
  *	TH8_OK on success with *pEpochSec set.  TH8_ERROR on
  *	network or protocol error.
+ *
+ * Side effects:
+ *	Performs DNS resolution and UDP network I/O (opens, uses, and closes
+ *	a socket).  Sets the interpreter result on error.  Uses only stack
+ *	storage for resolved addresses; allocates no heap that outlives the
+ *	call (any DNS result is freed before returning).
  *
  *----------------------------------------------------------------------
  */
@@ -123283,260 +133212,278 @@ th8NtpQueryOne(
     const char *zServer,
     int timeoutMs,
     int attempts,
+    int bRequireSecure,
     th8_int64_t *pEpochSec)
 {
-    struct addrinfo hints, *res = NULL;
+    /*
+     * Resolved server addresses to try, IPv4 first so a host without working
+     * IPv6 egress reaches a working address in the first retry round (Bug 78).
+     * When bRequireSecure is set they are DNSSEC-VALIDATED (libunbound builds
+     * only); otherwise they come from getaddrinfo (unvalidated -- the NTP
+     * origin-timestamp anti-spoof is then the response-integrity defense).
+     * Stack-only: no heap to free here.
+     */
+    struct ntpAddr addrs[NTP_MAX_ADDRS];
+    int nAddrs = 0;
     ntp_socket_t sock = NTP_INVALID_SOCKET;
     Th8_NtpPacket req, resp;
     th8_int64_t localMs = 0;
     th8_uint64_t t1Sec;
     int rc = TH8_ERROR;
-    int attempt;
+    int attempt, ai;
 
     *pEpochSec = 0;
 
-    /*
-     * DNS resolution with DNSSEC validation.
-     *
-     * When libunbound is available (TH8_ENABLE_UNBOUND),
-     * perform local cryptographic DNSSEC validation using
-     * the IANA root trust anchor.  ub_resolve() returns
-     * result->secure=1 if the domain's DNS records were
-     * validated through the full DNSSEC chain of trust.
-     *
-     * If DNSSEC validation fails (result->bogus), the
-     * resolution is REJECTED -- this is a hard failure,
-     * not a warning.  A bogus DNSSEC result indicates
-     * active tampering or misconfiguration.
-     *
-     * If the domain is unsigned (neither secure nor bogus),
-     * resolution proceeds normally -- DNSSEC is opt-in per
-     * domain.
-     *
-     * When libunbound is not available, fall back to plain
-     * getaddrinfo().  The NTP origin timestamp anti-spoof
-     * mechanism provides a secondary defense.
-     */
-
 #  if defined(TH8_ENABLE_UNBOUND)
-    {
-	struct ub_ctx *ubctx;
-	struct ub_result *ubresult = NULL;
-	int ubrc;
+    if (bRequireSecure) {
+	/*
+     * End-to-end DNSSEC.  Resolve A then AAAA (IPv4 first) through the shared,
+     * hardened validating resolver -- Th8_DnsResolve -> th8UnboundResolve,
+     * which owns the trust-anchor lifecycle (TH8_DNS_ROOT_KEY, the signed
+     * module-adjacent root.key, the system paths, and the RFC 5011 managed
+     * copy) -- and connect ONLY to addresses whose records were
+     * cryptographically validated:
+     *
+     *   - bogus             -> HARD FAIL (active tampering).
+     *   - records + secure  -> use them (the good path).
+     *   - records + !secure -> REFUSE: an insecure/unsigned answer, or one
+     *                          produced with no trust anchor, is a downgrade
+     *                          for an end-to-end-secure NTP query.
+     *   - no records for a type (e.g. no AAAA) -> skip that type.
+     *
+     * pDns is freed on EVERY path via Th8_DnsResolveFree (no leak, no reuse).
+     */
+	{
+	    static const int aTypes[2] = {TH8_DNS_TYPE_A, TH8_DNS_TYPE_AAAA};
+	    int ti;
 
-	ubctx = ub_ctx_create();
-	if (ubctx) {
-	    /*
-	     * Load the root trust anchor.  Try common locations.
-	     * If none found, DNSSEC validation is disabled but
-	     * resolution still works.
-	     */
-	    if (ub_ctx_add_ta_file(ubctx, "/etc/unbound/root.key") != 0 &&
-	        ub_ctx_add_ta_file(ubctx, "/usr/share/dns/root.key") != 0 &&
-	        ub_ctx_add_ta_file(ubctx, "/var/lib/unbound/root.key") != 0 &&
-	        ub_ctx_add_ta_file(
-	            ubctx, "/opt/homebrew/etc/unbound/root.key") != 0) {
-		/*
-		 * No trust anchor found.  DNSSEC validation
-		 * will not be performed, but resolution works.
-		 */
-		TH8_TRACE_ERR(
-		    interp, "NTP: no DNSSEC root trust anchor found");
-	    }
+	    for (ti = 0; ti < 2; ti++) {
+		Th8_DnsResult *pDns = NULL;
+		int i;
 
-	    ubrc = ub_resolve(
-	        ubctx, zServer, 1 /* A record */, 1 /* IN class */,
-	        &ubresult);
+		if (Th8_DnsResolve(
+		        interp, zServer, Th8_Strlen(interp, zServer),
+		        aTypes[ti], &pDns) != TH8_OK ||
+		    pDns == NULL) {
+		    continue; /* no answer for this type -- not fatal */
+		}
 
-	    if (ubrc == 0 && ubresult) {
-		if (ubresult->bogus) {
-		    /*
-		     * DNSSEC validation FAILED.  This indicates
-		     * active DNS tampering or misconfiguration.
-		     * Reject the resolution entirely.
-		     */
+		if (pDns->bogus) {
+		    Th8_DnsResolveFree(interp, pDns);
 		    Th8_SetResultStatic(
 		        interp,
-		        "clock ntp: DNSSEC validation failed "
-		        "(bogus DNS response)",
+		        "clock ntp: DNSSEC validation failed (bogus DNS response)",
 		        TH8_NOLEN);
-		    ub_resolve_free(ubresult);
-		    ub_ctx_delete(ubctx);
 		    return TH8_ERROR;
 		}
-		if (ubresult->secure) {
-		    TH8_TRACE_ERR(interp, "NTP: DNSSEC validated (secure)");
+		if (pDns->nRecord > 0 && !pDns->secure) {
+		    Th8_DnsResolveFree(interp, pDns);
+		    Th8_SetResultStatic(
+		        interp,
+		        "clock ntp: DNS resolution is not DNSSEC-secured "
+		        "(no trust anchor, or the zone is unsigned)",
+		        TH8_NOLEN);
+		    return TH8_ERROR;
 		}
-		/* If neither secure nor bogus: unsigned domain,
-		 * proceed normally. */
+
+		for (i = 0; pDns->pData != NULL && i < pDns->nRecord &&
+		            nAddrs < NTP_MAX_ADDRS;
+		     i++) {
+		    if (pDns->pData[i] == NULL) continue;
+		    Th8_Memset(
+		        interp, &addrs[nAddrs].sa, 0,
+		        sizeof(addrs[nAddrs].sa));
+		    if (aTypes[ti] == TH8_DNS_TYPE_A) {
+			struct sockaddr_in
+			    *s4 = (struct sockaddr_in *)&addrs[nAddrs].sa;
+
+			s4->sin_family = AF_INET;
+			s4->sin_port = htons(123);
+			Th8_Memcpy(interp, &s4->sin_addr, pDns->pData[i], 4);
+			addrs[nAddrs].family = AF_INET;
+			addrs[nAddrs].salen = (int)sizeof(struct sockaddr_in);
+			nAddrs++;
+		    } else {
+			struct sockaddr_in6
+			    *s6 = (struct sockaddr_in6 *)&addrs[nAddrs].sa;
+
+			s6->sin6_family = AF_INET6;
+			s6->sin6_port = htons(123);
+			Th8_Memcpy(
+			    interp, &s6->sin6_addr, pDns->pData[i], 16);
+			addrs[nAddrs].family = AF_INET6;
+			addrs[nAddrs]
+			    .salen = (int)sizeof(struct sockaddr_in6);
+			nAddrs++;
+		    }
+		}
+		Th8_DnsResolveFree(interp, pDns);
 	    }
-	    if (ubresult) ub_resolve_free(ubresult);
-	    ub_ctx_delete(ubctx);
+	}
+
+	if (nAddrs == 0) {
+	    Th8_ErrorMessage(
+	        interp, "clock ntp: cannot securely resolve \"", zServer,
+	        Th8_Strlen(interp, zServer));
+	    return TH8_ERROR;
+	}
+    } else {
+	if (th8NtpResolveInsecure(
+	        interp, zServer, addrs, NTP_MAX_ADDRS, &nAddrs) != TH8_OK) {
+	    return TH8_ERROR;
 	}
     }
-#  elif !defined(_WIN32) && !defined(WIN32) && defined(__GLIBC__)
+#  else
+    (void)bRequireSecure;
+    if (th8NtpResolveInsecure(
+            interp, zServer, addrs, NTP_MAX_ADDRS, &nAddrs) != TH8_OK) {
+	return TH8_ERROR;
+    }
+#  endif
+
     /*
-     * Fallback: no libunbound.  Use res_nquery() with
-     * RES_USE_DNSSEC to check the AD bit from the recursive
-     * resolver.  This is "trust the resolver" validation,
-     * not local cryptographic validation.
+     * Drop any candidate this host cannot route to -- neither IPv4 nor IPv6 is
+     * assumed reachable.  On a v6-only host the IPv4 answers are unroutable;
+     * on a v4-only host the AAAA answers are; trying an unroutable address
+     * only produces ENETUNREACH send failures and, if it were the last
+     * survivor, would dead-end the query.  A local connect() probe (no packet
+     * sent) does a routing-table lookup per address and removes the ones with
+     * no route for their family, keeping the surviving addresses in their
+     * original IPv4-first order.  If this empties the list, the host has no
+     * usable route to the server at all -- fail with a clear message.
      */
     {
-	struct __res_state rs;
-	unsigned char abuf[512];
-	int alen;
+	int nKept = 0;
+	int k;
 
-	Th8_Memset(interp, &rs, 0, sizeof(rs));
-	if (res_ninit(&rs) == 0) {
-	    rs.options |= RES_USE_EDNS0;
-#    if defined(RES_USE_DNSSEC)
-	    rs.options |= RES_USE_DNSSEC;
-#    endif
-	    alen = res_nquery(
-	        &rs, zServer, 1 /*C_IN*/, 1 /*T_A*/, abuf, sizeof(abuf));
-	    if (alen >= 4) {
-		int adBit = (abuf[3] >> 5) & 1;
-
-		if (!adBit) {
-		    TH8_TRACE_ERR(
-		        interp, "NTP DNS: AD bit not set "
-		                "(DNSSEC not validated by resolver)");
-		}
+	for (k = 0; k < nAddrs; k++) {
+	    if (!th8NtpAddrReachable(&addrs[k])) {
+		continue; /* no route for this address's family */
 	    }
-	    res_nclose(&rs);
+	    if (nKept != k) addrs[nKept] = addrs[k];
+	    nKept++;
 	}
+	nAddrs = nKept;
     }
-#  endif /* DNSSEC fallback */
 
-    Th8_Memset(interp, &hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_protocol = IPPROTO_UDP;
-
-    if (getaddrinfo(zServer, "123", &hints, &res) != 0 || !res) {
-	TH8_TRACE_ERR(interp, "getaddrinfo failed for NTP server");
+    if (nAddrs == 0) {
 	Th8_ErrorMessage(
-	    interp, "clock ntp: cannot resolve \"", zServer,
+	    interp, "clock ntp: no reachable address for \"", zServer,
 	    Th8_Strlen(interp, zServer));
 	return TH8_ERROR;
     }
 
     /*
-     * Create UDP socket.
-     */
-
-    sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock == NTP_INVALID_SOCKET) {
-	TH8_TRACE_ERR(interp, "socket creation failed");
-	Th8_SetResultStatic(
-	    interp, "clock ntp: cannot create UDP socket", TH8_NOLEN);
-	goto done;
-    }
-
-    /*
-     * Set receive timeout.
-     */
-
-    {
-#  if defined(_WIN32)
-	DWORD tv = (DWORD)timeoutMs;
-
-	setsockopt(
-	    sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
-#  else
-	struct timeval tv;
-
-	tv.tv_sec = timeoutMs / 1000;
-	tv.tv_usec = (timeoutMs % 1000) * 1000;
-	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#  endif
-    }
-
-    /*
-     * Query loop.  Each attempt builds a FRESH request (a new origin
-     * timestamp) and does exactly one send / receive.  Transient
-     * failures -- a sendto error, a receive timeout (a lost request or
-     * reply), or a short response -- are retried up to `attempts`
-     * times, because NTP runs over UDP and packet loss is expected.  A
-     * response that arrives but fails validation is NOT retried: a bad
-     * stratum or an origin-timestamp mismatch is a misbehaving- or
-     * hostile-server signal, and retrying would only paper over it.
-     * Rebuilding the request each attempt keeps the anti-spoof origin-
-     * timestamp check in th8NtpValidateResponse sound per attempt.
+     * Round-robin query loop.  Try every resolved address, in order, on each
+     * retry round (Bug 78): a transient failure (socket/send error, timeout,
+     * short read) falls over to the NEXT address WITHIN the round, so a
+     * black-holed family is skipped in the first round instead of consuming
+     * the whole retry budget.  NTP is UDP, so loss is expected -- retry up to
+     * `attempts` rounds.  Each send builds a FRESH request (new origin
+     * timestamp), keeping the anti-spoof origin check sound per send.  A
+     * response that ARRIVES is terminal (validate once, never retry -- a bad
+     * stratum or origin mismatch is a hostile-server signal, not loss).
      */
 
     if (attempts < 1) attempts = 1;
 
     for (attempt = 0; attempt < attempts; attempt++) {
-	Th8_Memset(interp, &req, 0, sizeof(req));
-	req.flags = (unsigned char)((NTP_VERSION << 3) | NTP_MODE_CLIENT);
+	for (ai = 0; ai < nAddrs; ai++) {
+	    if (sock != NTP_INVALID_SOCKET) {
+		ntp_close(sock);
+		sock = NTP_INVALID_SOCKET;
+	    }
+	    sock = socket(addrs[ai].family, SOCK_DGRAM, IPPROTO_UDP);
+	    if (sock == NTP_INVALID_SOCKET) continue; /* try next address */
 
-	/* Set T1 (origin timestamp) from local clock. */
-	Th8_GetTimeMs(interp, &localMs);
-	t1Sec = (th8_uint64_t)(localMs / 1000) + NTP_EPOCH_DELTA;
-	th8NtpWriteTs(req.txTs, t1Sec);
+	    /*
+             * Receive timeout: the timeout mechanism on Win32 (no poll), a
+             * backstop to poll() elsewhere.
+             */
+	    {
+#  if defined(_WIN32)
+		DWORD tv = (DWORD)timeoutMs;
 
-	if (sendto(
-	        sock, (const char *)&req, NTP_PACKET_SIZE, 0, res->ai_addr,
-	        (int)res->ai_addrlen) != NTP_PACKET_SIZE) {
-	    TH8_TRACE_ERR(interp, "NTP sendto failed");
-	    Th8_ErrorMessage(
-	        interp, "clock ntp: sendto failed for \"", zServer,
-	        Th8_Strlen(interp, zServer));
-	    continue; /* transient -- retry */
-	}
+		setsockopt(
+		    sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv,
+		    sizeof(tv));
+#  else
+		struct timeval tv;
+
+		tv.tv_sec = timeoutMs / 1000;
+		tv.tv_usec = (timeoutMs % 1000) * 1000;
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#  endif
+	    }
+
+	    /* Build a fresh request (fresh origin timestamp T1). */
+	    Th8_Memset(interp, &req, 0, sizeof(req));
+	    req.flags = (unsigned char)((NTP_VERSION << 3) | NTP_MODE_CLIENT);
+	    Th8_GetTimeMs(interp, &localMs);
+	    t1Sec = (th8_uint64_t)(localMs / 1000) + NTP_EPOCH_DELTA;
+	    th8NtpWriteTs(req.txTs, t1Sec);
+
+	    if (sendto(
+	            sock, (const char *)&req, NTP_PACKET_SIZE, 0,
+	            (struct sockaddr *)&addrs[ai].sa,
+	            addrs[ai].salen) != NTP_PACKET_SIZE) {
+		TH8_TRACE_ERR(interp, "NTP sendto failed");
+		Th8_ErrorMessage(
+		    interp, "clock ntp: sendto failed for \"", zServer,
+		    Th8_Strlen(interp, zServer));
+		continue; /* transient -- try next address */
+	    }
 
 #  if !defined(_WIN32)
-	{
-	    struct pollfd pfd;
+	    {
+		struct pollfd pfd;
 
-	    pfd.fd = sock;
-	    pfd.events = POLLIN;
-	    if (ntp_poll(&pfd, 1, timeoutMs) <= 0) {
-		Th8_ErrorMessage(
-		    interp, "clock ntp: timeout from \"", zServer,
-		    Th8_Strlen(interp, zServer));
-		continue; /* lost packet -- retry */
+		pfd.fd = sock;
+		pfd.events = POLLIN;
+		if (ntp_poll(&pfd, 1, timeoutMs) <= 0) {
+		    Th8_ErrorMessage(
+		        interp, "clock ntp: timeout from \"", zServer,
+		        Th8_Strlen(interp, zServer));
+		    continue; /* lost packet -- try next address */
+		}
 	    }
-	}
 #  endif
 
-	Th8_Memset(interp, &resp, 0, sizeof(resp));
-	{
-	    int nRecv = (int)
-	        recvfrom(sock, (char *)&resp, NTP_PACKET_SIZE, 0, NULL, NULL);
+	    Th8_Memset(interp, &resp, 0, sizeof(resp));
+	    {
+		int nRecv = (int)recvfrom(
+		    sock, (char *)&resp, NTP_PACKET_SIZE, 0, NULL, NULL);
 
-	    if (nRecv < NTP_PACKET_SIZE) {
-		TH8_TRACE_ERR(interp, "NTP recvfrom failed");
-		Th8_ErrorMessage(
-		    interp, "clock ntp: incomplete response from \"", zServer,
-		    Th8_Strlen(interp, zServer));
-		continue; /* transient -- retry */
+		if (nRecv < NTP_PACKET_SIZE) {
+		    TH8_TRACE_ERR(interp, "NTP recvfrom failed");
+		    Th8_ErrorMessage(
+		        interp, "clock ntp: incomplete response from \"",
+		        zServer, Th8_Strlen(interp, zServer));
+		    continue; /* transient -- try next address */
+		}
 	    }
+
+	    /*
+             * A full response arrived.  Validation is TERMINAL -- whether it
+             * succeeds or rejects, the result is never retried (a bad stratum
+             * or origin-timestamp mismatch is a hostile-server signal).
+             * th8NtpValidateResponse is factored out so it can be MC/DC-driven
+             * with crafted packets via the internal stubs without a live NTP
+             * exchange.
+             */
+
+	    rc = th8NtpValidateResponse(interp, &resp, &req, pEpochSec);
+	    goto done;
 	}
-
-	/*
-	 * A full response arrived.  Validate and derive epoch seconds.
-	 * Validation is TERMINAL -- whether it succeeds or rejects, the
-	 * result is never retried (see the loop-header comment).  The
-	 * protocol-validation logic is factored into
-	 * th8NtpValidateResponse so it can be MC/DC-driven directly with
-	 * crafted packets (via the internal stubs) without a live NTP
-	 * exchange.
-	 */
-
-	rc = th8NtpValidateResponse(interp, &resp, &req, pEpochSec);
-	goto done;
     }
 
     /*
-     * Every attempt failed transiently; rc is still TH8_ERROR and the
-     * interp result holds the last attempt's diagnostic.
+     * Every attempt against every resolved address failed transiently; rc is
+     * still TH8_ERROR and the interp result holds the last diagnostic.
      */
 
 done:
     if (sock != NTP_INVALID_SOCKET) ntp_close(sock);
-    if (res) freeaddrinfo(res);
     return rc;
 }
 
@@ -123602,6 +133549,13 @@ th8NtpSortTimes(th8_int64_t *a, int n)
  *	time and elapsed local-clock time, catching local clock
  *	rollback ("time-travel") attacks.
  *
+ * Parameters:
+ *	bRequireSecure -- passed through to every th8NtpQueryOne leg
+ *	(see there).  The command layer sets it to !(-insecure): secure
+ *	is the default for every server, including one named explicitly
+ *	via -server; -insecure is the per-query opt-out for reaching an
+ *	NTP host in an unsigned DNS zone.
+ *
  * Results:
  *	TH8_OK with *pEpochSec set to the consensus time.
  *	TH8_ERROR if quorum is not met, servers disagree, or
@@ -123623,6 +133577,7 @@ th8NtpQuery(
     int timeoutMs,
     int maxDisagreeSec,
     int attempts,
+    int bRequireSecure,
     th8_int64_t *pEpochSec)
 {
     th8_int64_t aTimes[NTP_MAX_SERVERS];
@@ -123660,8 +133615,9 @@ th8NtpQuery(
     for (i = 0; i < nServers; i++) {
 	th8_int64_t t = 0;
 
-	if (th8NtpQueryOne(interp, azServers[i], timeoutMs, attempts, &t) ==
-	    TH8_OK) {
+	if (th8NtpQueryOne(
+	        interp, azServers[i], timeoutMs, attempts, bRequireSecure,
+	        &t) == TH8_OK) {
 	    aTimes[nGood++] = t;
 	}
     }
@@ -123671,11 +133627,23 @@ th8NtpQuery(
 #  endif
 
     /*
-     * Quorum check: at least (nServers+1)/2 must respond.
-     * For a single server, 1 response is required.
+     * Quorum check: at least (nServers+1)/2 servers must respond.  For a
+     * single server, 1 response is required.
+     *
+     * When NO server produced a usable response (nGood == 0), th8NtpQueryOne
+     * has already set a SPECIFIC diagnostic for the last server tried -- a
+     * DNSSEC-resolution failure, a "not DNSSEC-secured" refusal, a socket
+     * timeout, a "cannot securely resolve", and so on.  PRESERVE it:
+     * overwriting with a generic message would hide the real cause (e.g. a
+     * signed name that resolves to hosts which do not answer NTP).  The
+     * generic "insufficient responses" message is reserved for a true quorum
+     * shortfall -- some servers DID respond, but not a majority.
      */
 
-    if (nGood < (nServers + 1) / 2 || nGood == 0) {
+    if (nGood == 0) {
+	return TH8_ERROR; /* interp result holds the last server's diagnostic */
+    }
+    if (nGood < (nServers + 1) / 2) {
 	Th8_SetResultStatic(
 	    interp, "clock ntp: insufficient server responses", TH8_NOLEN);
 	return TH8_ERROR;
@@ -123918,6 +133886,108 @@ th8HttpsTimeVerifySignature(
     }
 
     return TH8_OK;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8VerifyAnchorSig --
+ *
+ *	Verify that a DNS trust-anchor file's raw bytes are covered by a
+ *	valid TH8 detached signature (its companion ".b64sig"), produced by
+ *	one of the compiled-in trusted keys.  Used to authenticate a
+ *	TH8-DOMAIN anchor -- the bundled module-adjacent root.key, or a
+ *	TH8_DNS_ROOT_KEY file -- BEFORE it is handed to libunbound.
+ *
+ * Why / How:
+ *	A bundled anchor ships next to the binary, a softer tamper target
+ *	than the privileged system anchor paths, so its integrity is pinned
+ *	to TH8's signing key rather than to filesystem permissions alone.
+ *	The CALLER reads both files RAW (not through the signed-only policy,
+ *	so there is no recursion) and passes the bytes here.  We decode the
+ *	detached signature with Th8_HarpySigLoad and try Th8_RsaVerify
+ *	against each trusted embedded key in turn -- keyRoot (production)
+ *	and, when built in, keyTest (ENABLE_TEST_KEY).  A signature made by
+ *	one key never verifies under another, so trying both is correct and
+ *	avoids a token-to-key lookup.
+ *
+ * Results:
+ *	TH8_OK iff a trusted key validates the signature over the anchor
+ *	bytes; TH8_ERROR otherwise (unparseable signature, no trusted key
+ *	available, or failed verification).  Does NOT set the interp result.
+ *
+ * Side effects:
+ *	Allocates and securely-zeroes-then-frees temporary buffers for the
+ *	decoded signature, the key token, and each loaded RSA key.  Does not
+ *	free the caller-owned zAnchor / zSig buffers.
+ *
+ *----------------------------------------------------------------------
+ */
+
+int
+th8VerifyAnchorSig(
+    Th8_Interp *interp,
+    const char *zAnchor, /* Raw anchor-file bytes. */
+    size_t nAnchor,
+    const char *zSig, /* Raw ".b64sig" file bytes. */
+    size_t nSig)
+{
+    unsigned char *pSig = NULL;
+    size_t nSigBytes = 0;
+    char *zId = NULL;
+    int rc = TH8_ERROR;
+    int ki;
+
+    if (!zAnchor || nAnchor == 0 || !zSig || nSig == 0) return TH8_ERROR;
+
+    if (Th8_HarpySigLoad(interp, zSig, nSig, &pSig, &nSigBytes, &zId) !=
+            TH8_OK ||
+        pSig == NULL || nSigBytes == 0) {
+	goto cleanup;
+    }
+
+    /*
+     * Try each trusted embedded key: the production keyRoot, and -- only
+     * in a TH8_ENABLE_TEST_KEY build -- the test key.  Th8_GetEmbeddedKeyTest
+     * and the test-key data are compiled out entirely in a production
+     * (crypto-without-test-key) build, so its branch is guarded here with
+     * the same macro rather than relying on the symbol being linkable
+     * (Bug 82: an unconditional call broke every crypto/no-test-key build,
+     * e.g. the Ladybird embedding).  In such a build ki == 1 yields no key
+     * and is skipped, so only keyRoot is trusted -- the intended behaviour.
+     */
+    for (ki = 0; ki < 2 && rc != TH8_OK; ki++) {
+	const unsigned char *zKey;
+	size_t nKey = 0;
+	Th8_RsaKey *pKey = NULL;
+
+	if (ki == 0) {
+	    zKey = Th8_GetEmbeddedKeyRoot(&nKey);
+	} else {
+#  if defined(TH8_ENABLE_TEST_KEY)
+	    zKey = Th8_GetEmbeddedKeyTest(&nKey);
+#  else
+	    zKey = NULL;
+#  endif
+	}
+	if (zKey == NULL || nKey == 0) continue;
+	if (Th8_RsaKeyLoad(interp, zKey, nKey, &pKey) != TH8_OK) continue;
+	if (Th8_RsaVerify(
+	        interp, pKey, (const unsigned char *)zAnchor, nAnchor, pSig,
+	        nSigBytes) == TH8_OK) {
+	    rc = TH8_OK;
+	}
+	Th8_RsaKeyFree(interp, pKey);
+    }
+
+cleanup:
+    if (pSig) {
+	Th8_Memset(interp, pSig, 0, nSigBytes);
+	Th8_Free(interp, pSig);
+    }
+    if (zId) Th8_Free(interp, zId);
+    return rc;
 }
 
 
@@ -124264,6 +134334,25 @@ oom:
  *
  *	clock ntp ?-server HOST? ?-timeout MS? ?-attempts N?
  *
+ * Why / How:
+ *	Parses the -server, -timeout, -attempts, and -insecure options from
+ *	argv[2..], collecting up to eight server names, then delegates to
+ *	th8NtpQuery to perform the actual authenticated NTP exchange.  By
+ *	default it requires the server name to resolve via a DNSSEC-secure
+ *	lookup; -insecure clears that requirement for this query so an
+ *	unsigned public server (e.g. pool.ntp.org) can be reached, relying on
+ *	the NTP origin-timestamp anti-spoof check for integrity.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the verified Unix epoch
+ *	seconds as a wide integer; TH8_ERROR (with an interpreter result
+ *	message) on a bad option, a missing option value, a malformed
+ *	numeric argument, or a failed NTP query.
+ *
+ * Side effects:
+ *	Performs network I/O to the NTP server(s).  Sets the interpreter
+ *	result (either the epoch value or an error message).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -124279,6 +134368,7 @@ th8HarpyClockNtpCommand(
     int nServers = 0;
     int timeoutMs = 0;
     int attempts = 0; /* 0 -> NTP_DEFAULT_ATTEMPTS; 1 disables retries */
+    int bInsecure = 0; /* -insecure -> skip the require-DNSSEC-secure check */
     int i;
     th8_int64_t epochSec;
     int rc;
@@ -124290,7 +134380,7 @@ th8HarpyClockNtpCommand(
 	    if (i + 1 >= argc) {
 		return Th8_WrongNumArgs(
 		    interp, "clock ntp ?-server host? ?-timeout ms? "
-		            "?-attempts n?");
+		            "?-attempts n? ?-insecure?");
 	    }
 	    i++;
 	    if (nServers < 8) {
@@ -124301,7 +134391,7 @@ th8HarpyClockNtpCommand(
 	    if (i + 1 >= argc) {
 		return Th8_WrongNumArgs(
 		    interp, "clock ntp ?-server host? ?-timeout ms? "
-		            "?-attempts n?");
+		            "?-attempts n? ?-insecure?");
 	    }
 	    i++;
 	    {
@@ -124318,7 +134408,7 @@ th8HarpyClockNtpCommand(
 	    if (i + 1 >= argc) {
 		return Th8_WrongNumArgs(
 		    interp, "clock ntp ?-server host? ?-timeout ms? "
-		            "?-attempts n?");
+		            "?-attempts n? ?-insecure?");
 	    }
 	    i++;
 	    {
@@ -124329,6 +134419,17 @@ th8HarpyClockNtpCommand(
 		}
 		attempts = (int)v;
 	    }
+	} else if (
+	    argl[i] == 9 &&
+	    Th8_Memcmp(interp, argv[i], "-insecure", 9) == 0) {
+	    /*
+	     * Opt out of the require-DNSSEC-secure check for THIS query.
+	     * Needed to reach an NTP server in an unsigned DNS zone (most
+	     * public servers, e.g. pool.ntp.org) on a validating build; the
+	     * NTP origin-timestamp anti-spoof remains the response-integrity
+	     * defense.  A no-op on builds without a local validator.
+	     */
+	    bInsecure = 1;
 	} else {
 	    Th8_ErrorMessage(
 	        interp, "clock ntp: unknown option \"", argv[i], argl[i]);
@@ -124338,7 +134439,7 @@ th8HarpyClockNtpCommand(
 
     rc = th8NtpQuery(
         interp, nServers > 0 ? azServers : NULL, nServers, timeoutMs, 0,
-        attempts, &epochSec);
+        attempts, !bInsecure, &epochSec);
     if (rc != TH8_OK) return rc;
 
     return Th8_SetResultWideInt(interp, epochSec);
@@ -124354,6 +134455,21 @@ th8HarpyClockNtpCommand(
  *	Used as a subcommand of [clock] via the timekeeping plugin.
  *
  *	clock https ?URL?
+ *
+ * Why / How:
+ *	Accepts an optional URL operand (defaulting inside th8HttpsTimeQuery
+ *	when omitted) and delegates to th8HttpsTimeQuery, which performs the
+ *	TLS request and extracts the server's authenticated time from the
+ *	HTTP Date response header.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the reported Unix epoch
+ *	seconds as a wide integer; TH8_ERROR (with an interpreter result
+ *	message) on too many arguments or a failed HTTPS query.
+ *
+ * Side effects:
+ *	Performs network (TLS) I/O to the HTTPS time server.  Sets the
+ *	interpreter result (either the epoch value or an error message).
  *
  *----------------------------------------------------------------------
  */
@@ -124406,7 +134522,7 @@ typedef struct {
     int bLegacy;
     int bCompact;
     th8_int64_t key;
-    int iArg;  /* Index of first non-option argument. */
+    int iArg; /* Index of first non-option argument. */
 } Th8_FlagsOpts;
 
 
@@ -124418,6 +134534,26 @@ typedef struct {
  *	Parse the shared -option flags from argv[2..] and populate
  *	the Th8_FlagsOpts struct.  Sets pOpts->iArg to the index of
  *	the first operand after options.
+ *
+ * Why / How:
+ *	Zero-initializes *pOpts, then walks argv from index 2 while the next
+ *	argument begins with '-', setting the matching boolean field for each
+ *	recognized flag (-complex, -space, -sort, -all, -strict, -legacy,
+ *	-compact).  The -key option consumes the following argument as its
+ *	value, parsing a 0x-prefixed token by hand into an unsigned
+ *	accumulator (to avoid signed-shift-overflow UB, Bug 46) and otherwise
+ *	via Th8_ToWideInt.  A "--" argument ends option parsing.  Finally it
+ *	enforces that a non-default key is only allowed in -complex mode.
+ *
+ * Results:
+ *	TH8_OK with *pOpts populated and pOpts->iArg pointing at the first
+ *	operand; TH8_ERROR (with an interpreter result message) on an unknown
+ *	option, a -key without a value, an invalid hex key, a non-numeric
+ *	key, or a non-default key used without -complex.
+ *
+ * Side effects:
+ *	Overwrites the caller's Th8_FlagsOpts.  Sets the interpreter result
+ *	on error.
  *
  *----------------------------------------------------------------------
  */
@@ -124533,7 +134669,22 @@ th8FlagsParseOpts(
  *
  * flags_have_command --
  *
- *	flags have ?options? flagString haveFlags
+ *	Implements `flags have ?options? flagString haveFlags`: test
+ *	whether an attribute-flag string contains the requested flags.
+ *
+ * Why / How:
+ *	Parses the shared options via th8FlagsParseOpts, requires exactly two
+ *	operands, parses flagString into an Th8_AfMap, then reports the result
+ *	of Th8_AttrFlagsHave for haveFlags under the -all and -strict
+ *	modifiers.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the boolean (0/1) outcome of
+ *	the membership test; TH8_ERROR (with an interpreter result message) on
+ *	an option error, wrong operand count, or a flag-parse failure.
+ *
+ * Side effects:
+ *	Sets the interpreter result (boolean outcome or error message).
  *
  *----------------------------------------------------------------------
  */
@@ -124578,7 +134729,24 @@ flags_have_command(
  *
  * flags_change_command --
  *
- *	flags change ?options? flagString changeSpec
+ *	Implements `flags change ?options? flagString changeSpec`: apply a
+ *	set of changes to an attribute-flag string and return the result.
+ *
+ * Why / How:
+ *	Parses the shared options, requires exactly two operands, parses
+ *	flagString into an Th8_AfMap, applies changeSpec via
+ *	Th8_AttrFlagsChange (using the parsed key), then reformats the map to
+ *	a string with Th8_AttrFlagsFormat under the -legacy/-compact/-space/
+ *	-sort modifiers.
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the reformatted flag string;
+ *	TH8_ERROR (with an interpreter result message) on an option error,
+ *	wrong operand count, or a parse/change/format failure.
+ *
+ * Side effects:
+ *	Allocates and frees a temporary output buffer.  Sets the interpreter
+ *	result (formatted flags or error message).
  *
  *----------------------------------------------------------------------
  */
@@ -124632,7 +134800,26 @@ flags_change_command(
  *
  * flags_show_command --
  *
- *	flags show ?options? flagString
+ *	Implements `flags show ?options? flagString`: expand an
+ *	attribute-flag string into a key/flags list, one entry per key.
+ *
+ * Why / How:
+ *	Parses the shared options, requires a single operand, and parses
+ *	flagString into an Th8_AfMap.  It locates the global (key == 0) entry
+ *	first so it is emitted before the keyed entries, then iterates the map
+ *	building a Tcl list whose elements alternate the decimal key (formatted
+ *	by hand into a stack buffer) and the bare flag string for that key
+ *	(produced by Th8_AttrFlagsFormat on a one-entry map with the key
+ *	zeroed so the key is not repeated inside the flags).
+ *
+ * Results:
+ *	TH8_OK with the interpreter result set to the {key flags ...} list;
+ *	TH8_ERROR (with an interpreter result message) on an option error,
+ *	wrong operand count, or a parse/format failure.
+ *
+ * Side effects:
+ *	Allocates and frees temporary output buffers.  Sets the interpreter
+ *	result (the list or an error message).
  *
  *----------------------------------------------------------------------
  */
@@ -124692,7 +134879,7 @@ flags_show_command(
 
 	Th8_Memset(interp, &one, 0, sizeof(one));
 	one.a[0] = map.a[idx];
-	one.a[0].key = 0;   /* Emit bare flags; key is output separately. */
+	one.a[0].key = 0; /* Emit bare flags; key is output separately. */
 	one.n = 1;
 
 	rc = Th8_AttrFlagsFormat(interp, &one, 0, 1, 0, 1, &zVal, &nVal);
@@ -124731,9 +134918,10 @@ flags_show_command(
 /*
  *----------------------------------------------------------------------
  *
- * flags_command --
+ * th8FlagsSub --
  *
- *	Ensemble dispatcher for the [flags] command.
+ *	Catalogue of `flags` sub-commands, installed into the `flags` ensemble
+ *	command's per-interpreter sub-command hash at registration (TH8K-025).
  *
  *----------------------------------------------------------------------
  */
@@ -124746,51 +134934,6 @@ static const Th8_SubCommand th8FlagsSub[] =
 
 const Th8_SubCommand *th8_flags_aSub;
 
-/*
- *----------------------------------------------------------------------
- *
- * flags_command --
- *
- *	Implements the script-visible `[flags ...]` ensemble
- *	used by the Harpy plugin to query and mutate the
- *	signed-script attribute flags (`change`, `have`,
- *	`show`).  Thin dispatcher into `th8FlagsSub` via
- *	`Th8_CallSubCommand`.
- *
- *	The published `th8_flags_aSub` pointer lets other
- *	parts of the plugin (e.g. introspection helpers
- *	enumerating attribute names) traverse the same table
- *	without re-defining it.
- *
- * Parameters:
- *	interp -- live interpreter.
- *	ctx    -- command context (forwarded).
- *	argc   -- argument count.
- *	argv   -- argument vector.
- *	argl   -- argument byte-length vector.
- *
- * Returns:
- *	The selected subcommand's return code, or `TH8_ERROR`
- *	with a diagnostic if the subcommand name is unknown.
- *
- * Side effects:
- *	Whatever the dispatched subcommand performs (the
- *	`change` subcommand mutates the per-interp
- *	attribute-flag state).
- *
- *----------------------------------------------------------------------
- */
-static int
-flags_command(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl)
-{
-    return Th8_CallSubCommand(interp, ctx, argc, argv, argl, th8FlagsSub);
-}
-
 
 #if defined(TH8_ENABLE_CRYPTOGRAPHY)
 /*
@@ -124800,6 +134943,19 @@ flags_command(
  *
  *	Retrieve the signed-only policy context from the interp's
  *	policy callback.  Returns NULL if no policy is installed.
+ *
+ * Why / How:
+ *	Calls Th8_GetPolicyCallback requesting only the context pointer (the
+ *	callback function pointer is ignored) and returns it.  The harpy
+ *	command uses this context to look up signing keys and enforce that a
+ *	signed-only policy is actually installed.
+ *
+ * Results:
+ *	The policy context pointer, or NULL if no policy callback is installed
+ *	on the interpreter.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -124831,6 +134987,27 @@ th8HarpyGetPolicyCtx(Th8_Interp *interp)
  *	"verify" parses the signature text, looks up the key by token,
  *	and verifies the signature.  Returns "ok" on success, raises
  *	an error on failure.
+ *
+ * Why / How:
+ *	First fetches the signed-only policy context (th8HarpyGetPolicyCtx)
+ *	and fails if none is installed, since key lookup requires it.  For
+ *	"sign" it finds the key by token, requires a private key, signs the
+ *	script bytes with Th8_RsaSign, base64-encodes the signature, and
+ *	assembles a .b64sig text (comment header carrying the token plus the
+ *	wrapped base64 body).  For "verify" it parses the .b64sig text with
+ *	Th8_HarpySigLoad, checks that any embedded token matches the requested
+ *	token, looks up the key, and calls Th8_RsaVerify.
+ *
+ * Results:
+ *	TH8_OK -- for "sign" with the interpreter result set to the .b64sig
+ *	text; for "verify" with the result set to "ok".  TH8_ERROR (with an
+ *	interpreter result message) on wrong argument count, missing policy,
+ *	unknown subcommand, key-not-found, missing private key, token
+ *	mismatch, or a signing/verification failure.
+ *
+ * Side effects:
+ *	Allocates and frees signature and output buffers.  Sets the
+ *	interpreter result (signature text, "ok", or an error message).
  *
  *----------------------------------------------------------------------
  */
@@ -125052,7 +135229,7 @@ oom:
  */
 
 static Th8_CommandEntry th8HarpyCommands[] = {
-    {1, 0, "flags", flags_command},
+    {1, 0, "flags", 0}, /* pure ensemble (TH8K-025) */
 #if defined(TH8_ENABLE_CRYPTOGRAPHY)
     {1, 0, "harpy", harpy_command},
 #endif
@@ -125189,6 +135366,23 @@ th8HarpyGetCommands(Th8_CommandEntry *pCommand, int *pnCommand)
  *	value.  Used by th8CurlGetData to set CURLOPT_TIMEOUT_MS and
  *	CURLOPT_CONNECTTIMEOUT_MS on each curl handle.
  *
+ * Why / How:
+ *	Lets a script tune the network timeout without a dedicated command.
+ *	It reads ::th8_timeout via Th8_GetVar; if the variable is unset it
+ *	keeps the 30 s default.  Otherwise it parses the value with
+ *	Th8_ToWideInt and accepts it only when it is a positive value that
+ *	fits in a 32-bit long (1..0x7FFFFFFF), guarding both non-positive
+ *	timeouts and overflow.  It always clears the interpreter result it
+ *	borrowed before returning.
+ *
+ * Results:
+ *	The timeout in milliseconds: the parsed ::th8_timeout value when valid
+ *	and in range, otherwise 30000.
+ *
+ * Side effects:
+ *	Reads the ::th8_timeout variable and clears the interpreter result
+ *	(which Th8_GetVar had set) before returning.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -125196,6 +135390,9 @@ static long
 th8CurlTimeoutMs(Th8_Interp *interp)
 {
     long nMs = 30000L;
+#  if defined(TH8_ENABLE_VARIABLES)
+    /* The ::th8_timeout override is a variable; without the variable
+     * subsystem there is no way to read it, so the default stands. */
     size_t nVal = 0;
     const char *zVal;
     th8_int64_t parsed = 0;
@@ -125209,6 +135406,9 @@ th8CurlTimeoutMs(Th8_Interp *interp)
     nMs = (long)parsed;
 done:
     Th8_ClearResult(interp);
+#  else
+    (void)interp;
+#  endif
     return nMs;
 }
 
@@ -125233,11 +135433,18 @@ done:
  *	are intrinsic-true at runtime so the MC/DC analysis
  *	stays focused on the per-character scheme prefix.
  *
+ * Why / How:
+ *	A security allowlist: rather than parse the URI, it rejects anything
+ *	shorter than 8 bytes and then matches the literal `"https://"` or
+ *	`"http://"` byte prefix character by character, returning 1 only on a
+ *	match.  This keeps libcurl from being steered into `file:`, `ftp:`,
+ *	and other schemes by a hostile or buggy script.
+ *
  * Parameters:
  *	zUri -- URI bytes (not necessarily NUL-terminated).
  *	nUri -- URI length.
  *
- * Returns:
+ * Results:
  *	1 if the URI starts with `"http://"` or `"https://"`;
  *	0 otherwise.
  *
@@ -125318,13 +135525,24 @@ typedef struct {
  *	defending against pathological libcurl invocations
  *	that would otherwise wrap to a small allocation.
  *
+ * Why / How:
+ *	libcurl streams a response in chunks and calls this callback for each;
+ *	the helper accumulates them into one contiguous, NUL-terminated buffer
+ *	in TH8-tracked memory.  It first computes the incoming byte count and
+ *	the required capacity (data + existing + 1) with the overflow-safe
+ *	macros, then grows the buffer geometrically (double, floor 4096) via
+ *	Th8_AttemptRealloc, copies the bytes with Th8_Memcpy, and NUL-
+ *	terminates.  Any overflow or allocation failure returns 0, the signal
+ *	libcurl treats as a fatal write error, so the transfer aborts instead
+ *	of silently truncating.
+ *
  * Parameters:
  *	ptr      -- libcurl-supplied data block.
  *	size     -- bytes per element (libcurl always sets 1).
  *	nmemb    -- number of elements.
  *	userdata -- `CurlWriteCtx *` accumulator.
  *
- * Returns:
+ * Results:
  *	Number of bytes consumed (== `size * nmemb`) on
  *	success; 0 on overflow / OOM.
  *
@@ -125786,7 +136004,7 @@ th8CurlGetData(
  */
 
 static Th8_Platform th8CurlPlatformData = {
-    5, /* nVersion */
+    1, /* nVersion */
     0, 0, 0, 0, /* xInitialize, xFinalize, xPreDeleteInterp, xDeleteInterp */
 
     /* Memory */
@@ -125841,8 +136059,11 @@ static Th8_Platform th8CurlPlatformData = {
     /* DNS */
     0, 0, /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -125998,8 +136219,6 @@ typedef struct Th8_UnboundResultImpl {
  *	     legitimate unsigned answer.
  *	  *  `harden-below-nxdomain: yes` -- if a name is
  *	     NXDOMAIN, every subdomain is too (RFC 8020).
- *	  *  `harden-referral-path: yes` -- validate every
- *	     nameserver in the delegation chain.
  *	  *  `harden-algo-downgrade: yes` -- refuse to fall back
  *	     to a weaker DNSSEC algorithm when stronger options
  *	     are advertised.
@@ -126013,8 +136232,6 @@ typedef struct Th8_UnboundResultImpl {
  *	     some buggy authoritative implementations.
  *	  *  `aggressive-nsec: yes` -- use cached NSEC records
  *	     to synthesize NXDOMAIN responses (RFC 8198).
- *	  *  `use-caps-for-id: yes` -- 0x20-bit case
- *	     randomization on outbound queries (anti-spoofing).
  *	  *  `do-not-query-localhost: yes` -- explicit default;
  *	     defends against a hostile loopback DNS proxy.
  *	  *  `prefetch: no` -- one-shot embedded use does not
@@ -126044,11 +136261,52 @@ typedef struct Th8_UnboundResultImpl {
  *	     query through the user's chosen upstream resolver,
  *	     which we cannot trust.
  *	  *  `ub_ctx_set_fwd` -- no forwarders.  Same reason.
+ *	  *  `harden-referral-path: yes` -- deliberately OMITTED.
+ *	     It is an experimental, non-RFC option that fires
+ *	     extra infrastructure queries to validate every
+ *	     nameserver on the delegation chain.  libunbound's own
+ *	     documentation warns it "could lead to performance
+ *	     problems because of the extra query load" and that it
+ *	     needs a larger `outgoing-range` / more threads to work
+ *	     reliably.  In a one-shot embedded `ub_ctx` (default
+ *	     small outgoing-range, single lookup) it makes ordinary
+ *	     recursion SERVFAIL -- e.g. `time.w.sb` resolves
+ *	     `secure` without it and returns rcode 2 with it (Bug
+ *	     79).  It is NOT load-bearing for DNSSEC validation: the
+ *	     validator still requires a `secure` answer, and the
+ *	     answer/glue records are still hardened by
+ *	     `harden-glue`, `harden-dnssec-stripped`, and
+ *	     `harden-algo-downgrade`.
+ *	  *  `use-caps-for-id: yes` (DNS 0x20 case randomisation) --
+ *	     deliberately OMITTED.  It is an anti-spoofing measure
+ *	     for the recursion path, but many authoritative servers
+ *	     (Cloudflare and other CDNs prominent among them) do NOT
+ *	     preserve query-name case, so unbound rejects their
+ *	     case-folded replies and the lookup SERVFAILs.  Measured
+ *	     ~40% intermittent failures resolving `time.w.sb` (a
+ *	     Cloudflare-hosted name) with it on, 0% with it off (Bug
+ *	     79).  It is not load-bearing here: DNSSEC validation is
+ *	     the actual anti-spoof (a forged answer fails signature
+ *	     validation and is rejected as bogus), and unbound still
+ *	     randomises source port and transaction ID.  Trading a
+ *	     redundant off-path-spoofing hardener for reliable
+ *	     resolution against a major DNS provider is the correct
+ *	     call for a validating stub.
+ *
+ * Why / How:
+ *	First disables libunbound's own stderr logging via
+ *	ub_ctx_debugout(ctx, NULL) -- an embedded library must not spew to
+ *	the host's stderr, and validation status is reported through the
+ *	resolve result instead.  It then applies a fixed table of hardening
+ *	and behavior options (validator module, glue/NSEC/algo-downgrade
+ *	hardening, qname minimisation, cache TTL bounds, EDNS buffer size,
+ *	etc.) with ub_ctx_set_option.  A failure to set any single option is
+ *	non-fatal: it is traced and the remaining options are still applied.
  *
  * Parameters:
  *	ubctx -- live libunbound context.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -126069,13 +136327,11 @@ th8UnboundHardenCtx(struct ub_ctx *ubctx)
         {"harden-glue:", "yes"},
         {"harden-dnssec-stripped:", "yes"},
         {"harden-below-nxdomain:", "yes"},
-        {"harden-referral-path:", "yes"},
         {"harden-algo-downgrade:", "yes"},
         {"harden-large-queries:", "yes"},
         {"harden-short-bufsize:", "yes"},
         {"qname-minimisation:", "yes"},
         {"aggressive-nsec:", "yes"},
-        {"use-caps-for-id:", "yes"},
         {"do-not-query-localhost:", "yes"},
         {"prefetch:", "no"},
         {"unwanted-reply-threshold:", "10000000"},
@@ -126151,6 +136407,17 @@ th8UnboundHardenCtx(struct ub_ctx *ubctx)
  *	across context teardowns; the RFC 5011 hold-down is
  *	wall-clock 30 days regardless of TH8 resolution cadence.
  *
+ * Why / How:
+ *	Resolves the managed-anchor path through pOps->xGetManagedAnchorPath.
+ *	If that file is already readable, it registers it directly with
+ *	ub_ctx_add_ta_autr and is done.  Otherwise it performs the first-run
+ *	bootstrap: it requires a source static anchor (zSrcStatic), creates
+ *	the parent directory (xEnsureParentDir), copies the static anchor into
+ *	the managed location (xCopyFileContents), and registers the copy with
+ *	ub_ctx_add_ta_autr.  Any missing step returns 0 so the caller can fall
+ *	back to static-only mode.  Auto-roll (RFC 5011) state lives on disk,
+ *	so it survives the per-resolution context lifetime.
+ *
  * Parameters:
  *	ubctx       -- live libunbound context (already hardened).
  *	pOps        -- platform operations vtable (non-NULL).
@@ -126159,7 +136426,7 @@ th8UnboundHardenCtx(struct ub_ctx *ubctx)
  *		output of `pOps->xFindStaticAnchorPath`).  May
  *		be NULL when the managed copy already exists.
  *
- * Returns:
+ * Results:
  *	1 if auto-roll tracking was successfully configured.
  *	0 if the managed copy could not be located / created
  *	or libunbound refused the file.
@@ -126191,6 +136458,74 @@ th8UnboundSetupManagedAnchor(
     if (!pOps->xCopyFileContents(zSrcStatic, zManaged)) return 0;
     return ub_ctx_add_ta_autr(ubctx, zManaged) == 0;
 }
+
+#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
+/*
+ *----------------------------------------------------------------------
+ *
+ * th8UnboundVerifyTh8Anchor --
+ *
+ *	Return 1 iff the trust-anchor file `zPath` is covered by a valid TH8
+ *	detached signature in the companion `zPath + ".b64sig"`.  Used to
+ *	authenticate a TH8-DOMAIN anchor -- the bundled module-adjacent
+ *	root.key, or a TH8_DNS_ROOT_KEY file -- before it is handed to
+ *	libunbound.
+ *
+ * Why / How:
+ *	Both files are read RAW via pOps->xReadFile (never through the
+ *	signed-only script policy, so no recursion), into fixed stack
+ *	buffers -- anchors and their signatures are small (a few KB), and a
+ *	file that does not fit is refused rather than truncated.  The bytes
+ *	are handed to th8VerifyAnchorSig, which checks the detached
+ *	signature against the compiled-in trusted keys.  Returns 0 (untrusted)
+ *	whenever no raw reader is available, either file is missing/oversize,
+ *	or verification fails.
+ *
+ * Results:
+ *	1 if the anchor file is covered by a valid TH8 detached signature;
+ *	0 otherwise (no raw reader, a missing/empty/oversize anchor or
+ *	signature file, or a failed signature check).
+ *
+ * Side effects:
+ *	Reads two files.  Secure-zeroes its stack buffers before returning.
+ *
+ *----------------------------------------------------------------------
+ */
+static int
+th8UnboundVerifyTh8Anchor(
+    const Th8_UnboundOps *pOps,
+    struct Th8_Interp *interp,
+    const char *zPath)
+{
+    char anchorBuf[8192];
+    char sigBuf[8192];
+    char zSigPath[4096];
+    size_t nAnchor = 0;
+    size_t nSig = 0;
+    size_t nPath;
+    int rc = 0;
+
+    if (!pOps->xReadFile) return 0;
+    nPath = Th8_Strlen(interp, zPath);
+    if (nPath + 8 > sizeof(zSigPath)) return 0; /* zPath + ".b64sig" + NUL */
+    if (!pOps->xReadFile(zPath, anchorBuf, sizeof(anchorBuf), &nAnchor) ||
+        nAnchor == 0) {
+	return 0;
+    }
+    Th8_Memcpy(interp, zSigPath, zPath, nPath);
+    Th8_Memcpy(interp, zSigPath + nPath, ".b64sig", 8); /* 7 chars + NUL */
+    if (pOps->xReadFile(zSigPath, sigBuf, sizeof(sigBuf), &nSig) &&
+        nSig > 0) {
+	rc =
+	    (th8VerifyAnchorSig(interp, anchorBuf, nAnchor, sigBuf, nSig) ==
+	     TH8_OK);
+    }
+    Th8_Memset(interp, anchorBuf, 0, sizeof(anchorBuf));
+    Th8_Memset(interp, sigBuf, 0, sizeof(sigBuf));
+    return rc;
+}
+#  endif /* TH8_ENABLE_CRYPTOGRAPHY */
+
 
 /*
  *----------------------------------------------------------------------
@@ -126232,6 +136567,17 @@ th8UnboundSetupManagedAnchor(
  *	     `ub_result.len` is `int *`; `Th8_DnsResult.pLen`
  *	     is `const size_t *`).
  *
+ * Why / How:
+ *	This is the single shared implementation so the POSIX and Win32 DNS
+ *	callbacks need not duplicate the libunbound protocol.  It runs the
+ *	numbered pipeline above: validate/copy the name, create and harden a
+ *	fresh per-resolution context, select a trust anchor by the ordered
+ *	fall-through (env override -> managed auto-roll copy -> static -> no
+ *	validation), resolve synchronously with ub_resolve, and repackage the
+ *	libunbound result -- including converting its int length array to the
+ *	size_t array the TH8 result type exposes -- into a heap
+ *	Th8_UnboundResultImpl owned by the caller.
+ *
  * Parameters:
  *	interp   -- live interpreter (used for `Th8_AttemptMalloc`).
  *	pOps     -- platform operations vtable (non-NULL).
@@ -126241,7 +136587,7 @@ th8UnboundSetupManagedAnchor(
  *	ppResult -- output: filled with the result pointer on
  *		success; set to NULL on failure.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` with `*ppResult` non-NULL on success.
  *	`TH8_ERROR` on bad arguments, libunbound failure, or
  *	allocation failure.
@@ -126284,25 +136630,101 @@ th8UnboundResolve(
     /* Trust-anchor selection.  See the function-level comment
      * above for the search-order rationale. */
     {
+	int bHaveTa = 0;
 	char *zEnv = Th8_GetEnv(interp, "TH8_DNS_ROOT_KEY");
 	if (zEnv && *zEnv) {
-	    /* Operator override: static-only, embedder owns lifecycle. */
-	    (void)(ub_ctx_add_ta_file(ubctx, zEnv) == 0);
+	    /*
+             * Operator override (TH8-domain).  An attacker who can set the
+             * environment must not be able to point us at an unsigned or
+             * hostile anchor, so the file must carry a valid TH8 signature
+             * (zEnv + ".b64sig"), verified here BEFORE use.  A missing or bad
+             * signature => do NOT use it: bHaveTa stays 0 and we drop to the
+             * insecure mode (d) below, where the caller's require-secure check
+             * fails closed.  (Without cryptography compiled in there is no
+             * signing to verify against, so the file is used as-is.)
+             */
+#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
+	    if (th8UnboundVerifyTh8Anchor(pOps, interp, zEnv)) {
+		bHaveTa = (ub_ctx_add_ta_file(ubctx, zEnv) == 0);
+	    } else {
+		TH8_TRACE_ERR(
+		    NULL, "TH8_DNS_ROOT_KEY anchor has no valid TH8 "
+		          "signature; ignoring it");
+	    }
+#  else
+	    bHaveTa = (ub_ctx_add_ta_file(ubctx, zEnv) == 0);
+#  endif
 	    Th8_Free(interp, zEnv);
 	} else {
 	    char zSrc[4096];
 	    int bHaveSrc = pOps->xFindStaticAnchorPath(zSrc, sizeof(zSrc));
+
 	    if (zEnv) Th8_Free(interp, zEnv);
-	    /* Try the bootstrap-then-auto-roll managed copy.  Pass
-	     * `zSrc` so a first-run bootstrap has a source to copy
-	     * from; later runs ignore it (the managed copy already
-	     * exists). */
-	    if (!th8UnboundSetupManagedAnchor(
-	            ubctx, pOps, bHaveSrc ? zSrc : NULL) &&
-	        bHaveSrc) {
-		/* Managed-mode setup failed but we have a static
-		 * source -- fall back to static-only mode. */
-		(void)(ub_ctx_add_ta_file(ubctx, zSrc) == 0);
+#  if defined(TH8_ENABLE_CRYPTOGRAPHY)
+	    /*
+             * If the static search returned the TH8-BUNDLED, module-adjacent
+             * anchor, it is TH8-domain and must be signature-verified before
+             * we trust it: it ships next to the binary, a softer tamper target
+             * than the privileged OS anchor paths (which are trusted as-is by
+             * the OS permission model).  A bundled anchor with no valid
+             * signature is REFUSED (fail closed), never silently downgraded.
+             */
+	    if (bHaveSrc && pOps->xGetModuleAnchorPath) {
+		char zMod[4096];
+		size_t nSrc = Th8_Strlen(interp, zSrc);
+
+		if (pOps->xGetModuleAnchorPath(zMod, sizeof(zMod)) &&
+		    Th8_Strlen(interp, zMod) == nSrc &&
+		    Th8_Memcmp(interp, zSrc, zMod, nSrc) == 0 &&
+		    !th8UnboundVerifyTh8Anchor(pOps, interp, zSrc)) {
+		    TH8_TRACE_ERR(
+		        NULL, "bundled root.key has no valid TH8 "
+		              "signature; ignoring it");
+		    bHaveSrc = 0;
+		}
+	    }
+#  endif
+	    /* Try the bootstrap-then-auto-roll managed copy.  Pass zSrc so a
+             * first-run bootstrap has a source to copy from; later runs ignore
+             * it (the managed copy already exists). */
+	    bHaveTa = th8UnboundSetupManagedAnchor(
+	        ubctx, pOps, bHaveSrc ? zSrc : NULL);
+	    if (!bHaveTa && bHaveSrc) {
+		/* Managed-mode setup failed but we have a static source --
+                 * fall back to static-only mode. */
+		bHaveTa = (ub_ctx_add_ta_file(ubctx, zSrc) == 0);
+	    }
+	}
+
+	/* Mode (d): no trust anchor could be configured on this host (no
+	 * TH8_DNS_ROOT_KEY, no managed copy, no readable system root.key).
+	 * Disable the validator module so libunbound performs INSECURE
+	 * resolution (bogus always reads 0) instead of initializing the
+	 * validator against its compiled-in default trust-anchor path -- which
+	 * fails when that path (e.g. /etc/unbound/root.key) does not exist,
+	 * aborts the resolve, AND spews the failure to stderr despite
+	 * ub_ctx_debugout(NULL) because it is a module-init (not query) error.
+	 * The harden pass set module-config to "validator iterator"; override
+	 * it to "iterator" here so the validator never initializes. */
+	if (!bHaveTa) {
+	    static volatile int bWarnedInsecure = 0;
+
+	    if (ub_ctx_set_option(ubctx, "module-config:", "iterator") != 0) {
+		TH8_TRACE_ERR(NULL, "module-config:");
+	    }
+	    /* Surface the security downgrade ONCE per process through the
+	     * platform trace hook (xEmitTrace) -- not raw stderr, which an
+	     * embedded library must not touch.  Th8_EmitTrace is a no-op when
+	     * the embedder installed no trace callback, so this stays silent
+	     * unless the host opted in.  The CAS 0->1 lets only the first
+	     * resolver that hits mode (d) emit the line. */
+	    if (Th8_IntCmpXchg(NULL, &bWarnedInsecure, 1, 0) == 0) {
+		Th8_EmitTrace(
+		    interp,
+		    "th8_unbound: no DNSSEC trust anchor available; DNS "
+		    "resolution is INSECURE (bogus always 0). Set "
+		    "TH8_DNS_ROOT_KEY, or install the DNS root key (e.g. "
+		    "unbound-anchor), to enable validation.\n");
 	    }
 	}
     }
@@ -126329,6 +136751,13 @@ th8UnboundResolve(
 	pImpl->pub.nRecord = n;
     }
     pImpl->pub.bogus = ubr->bogus ? 1 : 0;
+    /* `secure` is 1 ONLY when libunbound cryptographically validated the
+     * answer (signed + verified).  In insecure mode (no trust anchor -> the
+     * validator is disabled, mode (d) above) or for an unsigned domain, both
+     * secure and bogus read 0 -- callers that require end-to-end authenticity
+     * (e.g. clock ntp against the DNSSEC-signed default server) must demand
+     * secure, not merely !bogus. */
+    pImpl->pub.secure = ubr->secure ? 1 : 0;
     pImpl->pub.pData = (const unsigned char **)ubr->data;
     pImpl->pub.pLen = NULL; /* See note below. */
     pImpl->ubctx = ubctx;
@@ -126377,12 +136806,19 @@ th8UnboundResolve(
  *	005 sec. 5b so the MC/DC C-pairs of each guard are
  *	individually reachable.
  *
+ * Why / How:
+ *	The inverse of th8UnboundResolve, casting the public Th8_DnsResult
+ *	back to its Th8_UnboundResultImpl wrapper and releasing each owned
+ *	resource in order -- the parallel length array, the libunbound result,
+ *	the libunbound context, and finally the wrapper itself.  A NULL interp
+ *	or result is a no-op so callers need not guard the call.
+ *
  * Parameters:
  *	interp  -- live interpreter (used for `Th8_Free`).
  *	pResult -- result returned by `th8UnboundResolve`, or
  *		NULL.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -126492,6 +136928,25 @@ th8UnboundResolveFree(
  *	1 = every call).  We pass malloc_default_zone(), not NULL:
  *	NULL checks ALL zones, but TH8's libc allocator lives in the
  *	default (initial) zone.
+ *
+ * Why / How:
+ *	On the first call it resolves the sampling interval once from the
+ *	TH8_HEAP_CHECK_EVERY environment variable (falling back to the
+ *	compile-time default) and caches it in a static.  A static call
+ *	counter then selects every Nth call for an actual
+ *	malloc_zone_check of the default zone; the cheap counter test
+ *	skips the O(heap) scan on the other calls.  A failed check is
+ *	treated as unrecoverable heap corruption, so it reports the
+ *	operation and call number to stderr and abort()s.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Reads the TH8_HEAP_CHECK_EVERY environment variable once;
+ *	advances a static counter; on the sampled calls scans the default
+ *	malloc zone and, if corruption is detected, writes to stderr and
+ *	calls abort().
  *
  *----------------------------------------------------------------------
  */
@@ -126660,12 +137115,17 @@ th8LibcFree(Th8_Interp *interp, void *pCtx, void *p)
  *	`malloc_size(p)`.  NULL pointer reports 0 (consistent
  *	with the BSD / Win32 variants below).
  *
+ * Why / How:
+ *	This is the macOS variant, selected at compile time.  It
+ *	delegates to Apple's malloc_size(), guarding NULL up front so a
+ *	NULL block reports 0 rather than being passed to the OS routine.
+ *
  * Parameters:
  *	interp -- ignored.
  *	pCtx   -- ignored.
  *	p      -- allocation, or NULL.
  *
- * Returns:
+ * Results:
  *	Allocation size in bytes, or 0 for NULL.
  *
  * Side effects:
@@ -126693,12 +137153,17 @@ th8LibcMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  *	system `malloc`.  Routes through glibc /
  *	BSD `malloc_usable_size(p)`.  NULL pointer reports 0.
  *
+ * Why / How:
+ *	This is the Linux / BSD variant, selected at compile time.  It
+ *	delegates to malloc_usable_size(), guarding NULL up front so a
+ *	NULL block reports 0 rather than being passed to the OS routine.
+ *
  * Parameters:
  *	interp -- ignored.
  *	pCtx   -- ignored.
  *	p      -- allocation, or NULL.
  *
- * Returns:
+ * Results:
  *	Allocation size in bytes, or 0 for NULL.
  *
  * Side effects:
@@ -126725,12 +137190,17 @@ th8LibcMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  *	system `malloc`.  Routes through MSVC's `_msize(p)`.
  *	NULL pointer reports 0.
  *
+ * Why / How:
+ *	This is the Win32 / MSVC variant, selected at compile time.  It
+ *	delegates to _msize(), guarding NULL up front so a NULL block
+ *	reports 0 rather than being passed to the CRT routine.
+ *
  * Parameters:
  *	interp -- ignored.
  *	pCtx   -- ignored.
  *	p      -- allocation, or NULL.
  *
- * Returns:
+ * Results:
  *	Allocation size in bytes, or 0 for NULL.
  *
  * Side effects:
@@ -127381,7 +137851,7 @@ th8LibcVsnprintf(
  *
  * Why / How:
  *	Implements the Th8_Platform.xInput callback.  Reads up to
- *	4096 bytes from the given channel (defaulting to stdin) using
+ *	TH8_IO_BUFSIZE bytes from the given channel (defaulting to stdin) using
  *	fgets, then allocates a copy via Th8_AttemptMalloc so the
  *	caller owns the buffer.
  *
@@ -127403,7 +137873,7 @@ th8LibcInput(
     size_t *pnOut,
     void *pChannel) /* Channel (unused). */
 {
-    char zBuf[4096];
+    char zBuf[TH8_IO_BUFSIZE];
     char *zResult;
     size_t n;
 
@@ -127547,7 +138017,7 @@ Th8_GetLibcPlatform(void)
     static int bInit = 0;
 
     if (!bInit) {
-	sLibc.nVersion = 5;
+	sLibc.nVersion = 1;
 
 	/* Memory allocation */
 	sLibc.xMalloc = th8LibcMalloc;
@@ -127577,9 +138047,11 @@ Th8_GetLibcPlatform(void)
 	/* Math */
 	sLibc.xMathFunc = th8LibcMathFunc;
 
-	/* nVersion 5 adds xStackBackTrace, but that is a compiler-runtime
-	 * facility (not ANSI C), so it lives in th8_unwind.c and is supplied
-	 * by merging th8GetUnwindPlatform(); libc leaves the slot NULL. */
+	/* xStackBackTrace is a compiler-runtime facility (not ANSI C), so it
+	 * lives in th8_unwind.c and is supplied by merging
+	 * th8GetUnwindPlatform(); libc leaves the slot NULL.  Likewise the
+	 * threading slots (xIntCmpXchg, xIntCmpXchg64, ...) are supplied by
+	 * the OS layer and left NULL here (zero-initialized). */
 
 	bInit = 1;
     }
@@ -127900,6 +138372,7 @@ th8PosixStrrchr(const char *s, int c)
 }
 
 /* Forward declarations (defined after base path section). */
+static int th8PosixDeriveBaseFromModule(const char *);
 static const char *th8PosixGetBasePath(void);
 int th8PosixIsPathUnderBase(const char *zPath);
 
@@ -127980,7 +138453,7 @@ th8PosixGetData(
     char **pzOut,
     size_t *pnOut)
 {
-    char zPathBuf[1024];
+    char zPathBuf[TH8_PATH_STACK];
     char *zPath;
     int fd;
     struct stat st;
@@ -128139,7 +138612,7 @@ th8PosixDataExists(
     size_t nName,
     int *pAttrs) /* OUT: file type attrs (may be NULL). */
 {
-    char zPathBuf[1024];
+    char zPathBuf[TH8_PATH_STACK];
     char *zPath;
     struct stat lst;
     int rc;
@@ -128271,8 +138744,8 @@ th8PosixLoad(
     const char *zColon;
     size_t nLib;
     size_t nSym;
-    char zLibBuf[1024];
-    char zSymBuf[256];
+    char zLibBuf[TH8_LOAD_LIB_MAX];
+    char zSymBuf[TH8_LOAD_SYM_MAX];
     char *zLib;
     char *zSym;
     void *hLib;
@@ -128762,7 +139235,7 @@ th8PosixCallUnloadProc(
     const char *zProc;
     size_t nProc;
     size_t nSym;
-    char zSymBuf[256];
+    char zSymBuf[TH8_LOAD_SYM_MAX];
     char *zSym;
     Th8_UnloadProc xUnloadFn;
     size_t i;
@@ -128833,6 +139306,16 @@ th8PosixCallUnloadProc(
  *	failure) emit a diagnostic into the interpreter result
  *	via `Th8_ErrorMessage` / `TH8_TRACE_ERR`.
  *
+ * Why / How:
+ *	The reference-counted handle cache lets multiple `load`
+ *	callers share one `dlopen`'d image; `xUnload` must drop
+ *	exactly one reference per call (via `th8PosixFindHandle`
+ *	/ `th8PosixReleaseHandle`) so the library is only
+ *	`dlclose`'d once nothing references it.  The `_Unload`
+ *	symbol lookup mirrors Tcl's `load`/`unload` convention so
+ *	extensions get a teardown hook symmetric with their init
+ *	entry point.
+ *
  * Parameters:
  *	interp -- live interpreter (receives diagnostics).
  *	pCtx   -- platform context (ignored).
@@ -128845,7 +139328,7 @@ th8PosixCallUnloadProc(
  *	bClose -- 1 to `dlclose` once refs reach zero;
  *		0 to keep the handle cached.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success.
  *	`TH8_ERROR` on bad arguments or look-up failure
  *	(interpreter result: diagnostic).
@@ -128872,7 +139355,7 @@ th8PosixUnload(
     const char *zColon = 0;
     size_t nPrefix;
     size_t nSym;
-    char zSymBuf[256];
+    char zSymBuf[TH8_LOAD_SYM_MAX];
     char *zSym;
     Th8_UnloadProc xUnloadFn;
     size_t i;
@@ -129122,7 +139605,7 @@ th8PosixMemset(Th8_Interp *interp, void *pCtx, void *dst, int c, size_t n)
 
 #  if defined(TH8_ENABLE_UNBOUND)
 /* amalgamation: th8_unbound.h already included */
-#line 1526 "src/th8_posix.c"
+#line 1537 "src/th8_posix.c"
 
 /*
  *----------------------------------------------------------------------
@@ -129142,12 +139625,21 @@ th8PosixMemset(Th8_Interp *interp, void *pCtx, void *dst, int c, size_t n)
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	`dladdr` maps an in-process address back to the shared
+ *	object that contains it, so resolving the address of this
+ *	very function yields the path of the TH8 image regardless
+ *	of the name it was loaded under.  Deriving the anchor
+ *	location from that path (rather than a compiled-in
+ *	install prefix) lets a relocated or side-by-side TH8
+ *	install find its own co-located trust anchor.
+ *
  * Parameters:
  *	zBuf -- output buffer; receives the NUL-terminated path
  *		on success.
  *	nBuf -- size of `zBuf` in bytes.
  *
- * Returns:
+ * Results:
  *	1 on success; 0 if `dladdr` failed, the resolved path
  *	contained no `/` (which cannot happen on POSIX), or the
  *	composed path would exceed `nBuf`.
@@ -129200,10 +139692,18 @@ th8PosixGetModuleAnchorPath(char *zBuf, size_t nBuf)
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	`access(2)` with `R_OK` is the direct POSIX way to ask
+ *	"could I open this for reading right now" without
+ *	actually opening it, and (per the note above) it is
+ *	evaluated against the real UID, which is the correct
+ *	permission set to test when the trust-anchor search may
+ *	run from a privileged process.
+ *
  * Parameters:
  *	zPath -- NUL-terminated path to test.
  *
- * Returns:
+ * Results:
  *	1 if readable; 0 otherwise (including any errno set
  *	by `access`).
  *
@@ -129248,12 +139748,22 @@ th8PosixPathReadable(const char *zPath)
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	No single location is guaranteed to hold a root key
+ *	across POSIX distributions, so the function tries a
+ *	fixed priority list of every convention this build knows
+ *	about and returns the first one that both exists on disk
+ *	and is readable by the current user, checked via
+ *	`th8PosixPathReadable` so a stale or permission-denied
+ *	candidate is silently skipped rather than causing a
+ *	downstream `ub_ctx_add_ta_file` failure.
+ *
  * Parameters:
  *	zBuf -- output buffer; receives the NUL-terminated
  *		anchor path on success.
  *	nBuf -- size of `zBuf` in bytes.
  *
- * Returns:
+ * Results:
  *	1 if a readable static anchor was found; 0 if none of
  *	the candidates existed.
  *
@@ -129309,12 +139819,21 @@ th8PosixFindStaticAnchorPath(char *zBuf, size_t nBuf)
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	The managed anchor is mutable, per-user state (it is
+ *	rewritten as RFC 5011 key rollovers are tracked), so it
+ *	cannot live next to the read-only, possibly
+ *	system-owned static anchor; XDG_DATA_HOME (falling back
+ *	to the conventional `~/.local/share`) is the standard
+ *	POSIX location for exactly this kind of per-user
+ *	persistent application data.
+ *
  * Parameters:
  *	zBuf -- output buffer; receives the NUL-terminated path
  *		on success.
  *	nBuf -- size of `zBuf` in bytes.
  *
- * Returns:
+ * Results:
  *	1 on success; 0 if no per-user directory is available
  *	(no `HOME`, no `XDG_DATA_HOME`) or the composed path
  *	would exceed `nBuf`.
@@ -129373,12 +139892,21 @@ th8PosixGetManagedAnchorPath(char *zBuf, size_t nBuf)
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	`mkdir` only creates one level at a time and fails if an
+ *	intermediate component is missing, so the path is walked
+ *	left to right, temporarily NUL-terminating at each `/`
+ *	to `mkdir` that prefix before restoring the slash and
+ *	continuing -- the same technique as the shell's
+ *	`mkdir -p`, done in-place on a scratch copy so the
+ *	caller's `zPath` is never mutated.
+ *
  * Parameters:
  *	zPath -- NUL-terminated path whose parent directories
  *		should be created.  The basename of `zPath` is
  *		ignored (only directory components are created).
  *
- * Returns:
+ * Results:
  *	1 on success (every parent exists, was newly created,
  *	or already existed); 0 on `mkdir` failure other than
  *	`EEXIST`, or on `zPath` being too long for the scratch
@@ -129392,7 +139920,7 @@ th8PosixGetManagedAnchorPath(char *zBuf, size_t nBuf)
 static int
 th8PosixEnsureParentDir(const char *zPath)
 {
-    char zScratch[4096];
+    char zScratch[TH8_PATH_MAX];
     size_t n = th8PosixStrlen(zPath);
     size_t i;
 
@@ -129435,12 +139963,22 @@ th8PosixEnsureParentDir(const char *zPath)
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	A plain byte-copy loop (not a hardlink or rename) is
+ *	used so the bootstrap never modifies or removes the
+ *	vendor-supplied static anchor, and the destination is
+ *	opened with `O_CREAT | O_TRUNC` plus an explicit
+ *	`fchmod(0600)` -- rather than relying on `open`'s mode
+ *	argument alone -- because the umask could otherwise
+ *	widen the on-disk permissions of this per-user secret
+ *	file.
+ *
  * Parameters:
  *	zSrc -- NUL-terminated source path (readable).
  *	zDst -- NUL-terminated destination path (will be
  *		created or replaced).
  *
- * Returns:
+ * Results:
  *	1 on success; 0 on any `open` / `read` / `write` /
  *	`fchmod` failure.
  *
@@ -129455,7 +139993,7 @@ th8PosixCopyFileContents(const char *zSrc, const char *zDst)
 {
     int fdSrc = -1;
     int fdDst = -1;
-    char zBuf[8192];
+    char zBuf[TH8_COPY_BUFSIZE];
     ssize_t nRead;
     int bOk = 0;
 
@@ -129490,6 +140028,85 @@ done:
 /*
  *----------------------------------------------------------------------
  *
+ * th8PosixReadFile --
+ *
+ *	Read up to `nBuf` bytes of `zPath` into the caller-provided buffer
+ *	`zBuf`, setting `*pnRead` to the byte count.  A RAW read (open(2) +
+ *	read(2)) that never touches the signed-only script policy: the
+ *	shared unbound driver uses it to read a trust anchor and its
+ *	`.b64sig` for signature verification, and routing through the policy
+ *	would recurse.
+ *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
+ *	Signature verification requires the exact byte content
+ *	of the file that was signed; a read that silently
+ *	truncated at `nBuf` would let a corrupted or maliciously
+ *	oversized anchor pass as if it were the smaller, valid
+ *	one.  A one-byte probe read after filling the buffer
+ *	exactly (see the "Buffer exactly full" comment below)
+ *	distinguishes a file that fits perfectly from one that is
+ *	larger than `nBuf`, so oversize files are rejected rather
+ *	than silently truncated.
+ *
+ * Parameters:
+ *	zPath  -- NUL-terminated source path.
+ *	zBuf   -- caller buffer (not NUL-terminated by this routine).
+ *	nBuf   -- capacity of zBuf.
+ *	pnRead -- OUT: bytes read (set to 0 on failure).
+ *
+ * Results:
+ *	1 on success; 0 on open/read failure OR if the file does not fit in
+ *	nBuf (no partial read -- a truncated anchor or signature must never
+ *	reach verification).
+ *
+ * Side effects:
+ *	Reads from the filesystem.
+ *
+ *----------------------------------------------------------------------
+ */
+static int
+th8PosixReadFile(const char *zPath, char *zBuf, size_t nBuf, size_t *pnRead)
+{
+    int fd;
+    size_t nTotal = 0;
+
+    if (pnRead) *pnRead = 0;
+    if (!zPath || !zBuf || nBuf == 0) return 0;
+    fd = open(zPath, O_RDONLY);
+    if (fd < 0) return 0;
+    for (;;) {
+	ssize_t n = read(fd, zBuf + nTotal, nBuf - nTotal);
+	if (n < 0) {
+	    if (errno == EINTR) continue;
+	    close(fd);
+	    return 0;
+	}
+	if (n == 0) break; /* EOF */
+	nTotal += (size_t)n;
+	if (nTotal == nBuf) {
+	    /* Buffer exactly full: distinguish "fits exactly" from "more to
+             * come" (file too large) with a one-byte probe. */
+	    char probe;
+	    ssize_t more = read(fd, &probe, 1);
+
+	    close(fd);
+	    if (more == 0) {
+		if (pnRead) *pnRead = nTotal;
+		return 1;
+	    }
+	    return 0; /* more data (or error) -- refuse the oversize file */
+	}
+    }
+    close(fd);
+    if (pnRead) *pnRead = nTotal;
+    return 1;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8PosixUnboundOps --
  *
  *	Static `Th8_UnboundOps` instance handed to every call
@@ -129502,9 +140119,13 @@ done:
  *----------------------------------------------------------------------
  */
 static const Th8_UnboundOps th8PosixUnboundOps = {
-    th8PosixFindStaticAnchorPath, th8PosixGetManagedAnchorPath,
-    th8PosixPathReadable,         th8PosixEnsureParentDir,
+    th8PosixFindStaticAnchorPath,
+    th8PosixGetManagedAnchorPath,
+    th8PosixPathReadable,
+    th8PosixEnsureParentDir,
     th8PosixCopyFileContents,
+    th8PosixGetModuleAnchorPath,
+    th8PosixReadFile,
 };
 
 /*
@@ -129522,6 +140143,14 @@ static const Th8_UnboundOps th8PosixUnboundOps = {
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	Keeping the platform callback a one-line forwarder lets
+ *	the substantial DNSSEC-validation logic in
+ *	`th8_unbound.c` be written once and shared by every
+ *	platform, with only the small, genuinely OS-specific
+ *	pieces (trust-anchor paths, file permissions) supplied
+ *	here through the `Th8_UnboundOps` vtable.
+ *
  * Parameters:
  *	interp   -- live interpreter (used for allocation in
  *		the shared driver).
@@ -129533,7 +140162,7 @@ static const Th8_UnboundOps th8PosixUnboundOps = {
  *	ppResult -- output: result pointer on success;
  *		NULL on failure.
  *
- * Returns:
+ * Results:
  *	Whatever `th8UnboundResolve` returns: `TH8_OK` on
  *	success; `TH8_ERROR` on any failure.
  *
@@ -129570,13 +140199,19 @@ th8PosixDnsResolve(
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
+ * Why / How:
+ *	The result's memory layout and ownership rules are
+ *	defined entirely by the shared `th8_unbound.c` driver
+ *	that allocated it, so freeing it is likewise forwarded
+ *	rather than duplicated per platform.
+ *
  * Parameters:
  *	interp  -- live interpreter (used for `Th8_Free`).
  *	pCtx    -- unused platform context.
  *	pResult -- result returned by `th8PosixDnsResolve`,
  *		or NULL.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -130034,7 +140669,25 @@ th8PosixGetLastError(Th8_Interp *interp, void *pCtx)
  *
  * th8PosixSetLastError --
  *
- *	See th8PosixGetLastError above.
+ *	Implements the Th8_Platform.xSetLastError callback.  Set
+ *	the calling thread's `errno` to `nErr`.  See
+ *	`th8PosixGetLastError` above.
+ *
+ * Why / How:
+ *	Callers that need to force a specific "last error" state
+ *	(for example, restoring `errno` after a diagnostic probe,
+ *	or seeding it before a callback that reports errors via
+ *	the platform's last-error mechanism) go through this
+ *	wrapper so the interpreter never references the POSIX
+ *	`errno` macro directly; the Win32 platform file supplies
+ *	the matching `SetLastError` wrapper for the same
+ *	callback slot.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Sets the calling thread's `errno` to `nErr`.
  *
  *----------------------------------------------------------------------
  */
@@ -130098,8 +140751,8 @@ th8PosixGetRealPath(
     char *zBuf,
     size_t nBuf)
 {
-    char zCopy[4096];
-    char zResolved[4096];
+    char zCopy[TH8_PATH_MAX];
+    char zResolved[TH8_PATH_MAX];
 
     (void)interp;
     (void)pCtx;
@@ -130134,7 +140787,7 @@ th8PosixGetRealPath(
      * relative, manually prepend the current working directory.
      */
     if (zCopy[0] != '/') {
-	char zCwd[4096];
+	char zCwd[TH8_PATH_MAX];
 
 	if (getcwd(zCwd, sizeof(zCwd))) {
 	    size_t nCwd = th8PosixStrlen(zCwd);
@@ -130189,7 +140842,7 @@ th8PosixGetRootPath(
     char *zBuf,
     size_t nBuf)
 {
-    char zCopy[4096];
+    char zCopy[TH8_PATH_MAX];
 
     (void)interp;
     (void)pCtx;
@@ -130265,8 +140918,8 @@ th8PosixSameFile(
     const char *zName2,
     size_t nName2)
 {
-    char zCopy1[4096];
-    char zCopy2[4096];
+    char zCopy1[TH8_PATH_MAX];
+    char zCopy2[TH8_PATH_MAX];
     struct stat st1;
     struct stat st2;
 
@@ -130404,7 +141057,7 @@ th8PosixDeleteTemporaryData(
     const char *zPath,
     size_t nPath)
 {
-    char zBuf[4096];
+    char zBuf[TH8_PATH_MAX];
 
     (void)interp;
     (void)pCtx;
@@ -130554,7 +141207,7 @@ th8PosixChannelControl(
 	return TH8_OK;
 
     case TH8_CHANCTL_OPEN: {
-	char zPath[4096];
+	char zPath[TH8_PATH_MAX];
 	int flags;
 	int newFd;
 
@@ -130606,7 +141259,7 @@ th8PosixChannelControl(
  *	redirected input channel.  Byte-by-byte reading is necessary
  *	because POSIX read(2) on a pipe/terminal does not have a
  *	"read until newline" mode -- we must detect the newline
- *	ourselves.  A 4096-byte stack buffer avoids allocation for
+ *	ourselves.  A TH8_IO_BUFSIZE-byte stack buffer avoids allocation for
  *	the read loop; the final result is allocated to its exact
  *	size via Th8_AttemptMalloc so the caller can free it.
  *	EINTR is retried; EOF returns TH8_ERROR to signal end of
@@ -130631,7 +141284,7 @@ th8PosixInput(
     size_t *pnOut,
     void *pChannel) /* POSIX fd (or NULL for stdin). */
 {
-    char zBuf[4096];
+    char zBuf[TH8_IO_BUFSIZE];
     char *zResult;
     size_t nRead = 0;
     int fd;
@@ -131405,6 +142058,46 @@ th8PosixIntCmpXchg(
 /*
  *----------------------------------------------------------------------
  *
+ * th8PosixIntCmpXchg64 --
+ *
+ *	64-bit atomic compare-and-swap.  Implements the Th8_Platform
+ *	xIntCmpXchg64 callback.
+ *
+ * Why / How:
+ *	The 64-bit sibling of th8PosixIntCmpXchg.  Used to read and
+ *	publish the interpreter's owning-thread id (a 64-bit value that
+ *	does not fit the 32-bit xIntCmpXchg).  Uses the GCC/Clang
+ *	built-in __sync_val_compare_and_swap, which is 64-bit-capable on
+ *	all POSIX targets TH8 supports and implies a full memory
+ *	barrier.  Returns the previous value of *pTarget so the caller
+ *	can detect whether it won the race.
+ *
+ * Results:
+ *	The value of *pTarget before the swap attempt.
+ *
+ * Side effects:
+ *	Atomically replaces *pTarget with iExchange if *pTarget equals
+ *	iComparand.  Implies a full memory barrier.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static th8_uint64_t
+th8PosixIntCmpXchg64(
+    Th8_Interp *interp,
+    void *pCtx,
+    volatile th8_uint64_t *pTarget,
+    th8_uint64_t iExchange,
+    th8_uint64_t iComparand)
+{
+    (void)interp;
+    (void)pCtx;
+    return __sync_val_compare_and_swap(pTarget, iComparand, iExchange);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8PosixMemBarrier --
  *
  *	Implements the Th8_Platform.xMemBarrier callback.  Issue a
@@ -131489,11 +142182,21 @@ typedef struct th8PosixEvent {
  *	contract; no error is emitted into the interpreter
  *	result.
  *
+ * Why / How:
+ *	A mutex + condition variable + flag is the standard POSIX
+ *	building block for a manual-reset event: the mutex
+ *	serializes reads/writes of `signaled`, and the condition
+ *	variable lets `xEventWait` block without busy-polling
+ *	until `xEventSet` broadcasts.  Returning an opaque `void *`
+ *	(rather than exposing the struct) keeps the platform
+ *	callback signature identical between POSIX and Win32,
+ *	where the equivalent handle is a kernel `HANDLE`.
+ *
  * Parameters:
  *	interp -- live interpreter (unused beyond the contract).
  *	pCtx   -- platform context (ignored).
  *
- * Returns:
+ * Results:
  *	Non-NULL opaque handle on success; NULL on allocation
  *	or pthread init failure.
  *
@@ -131539,13 +142242,20 @@ th8PosixEventCreate(Th8_Interp *interp, void *pCtx)
  *	succeed" guard.  Matched pair with
  *	`th8Win32EventDestroy`.
  *
+ * Why / How:
+ *	The pthread cond/mutex objects must be destroyed before
+ *	the memory backing them is freed (destroying first, then
+ *	freeing, mirrors the reverse order of `EventCreate`'s
+ *	init calls) so no live synchronisation primitive is ever
+ *	left pointing into freed memory.
+ *
  * Parameters:
  *	interp -- ignored.
  *	pCtx   -- platform context (ignored).
  *	pEvent -- handle returned by `th8PosixEventCreate`, or
  *		NULL.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -131579,12 +142289,19 @@ th8PosixEventDestroy(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	apply -- every `Wait` blocked on this event resumes.
  *	Matched pair with `th8Win32EventSet`.
  *
+ * Why / How:
+ *	`signaled` is mutated only while holding `e->lock` so a
+ *	concurrent `xEventWait` cannot observe a torn update, and
+ *	`pthread_cond_broadcast` (rather than `_signal`) is used
+ *	because manual-reset semantics require waking every
+ *	waiter, not just one.
+ *
  * Parameters:
  *	interp -- ignored.
  *	pCtx   -- platform context (ignored).
  *	pEvent -- handle, or NULL (no-op on NULL).
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -131618,12 +142335,18 @@ th8PosixEventSet(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	notified (resetting an event has nothing to wake).
  *	Matched pair with `th8Win32EventReset`.
  *
+ * Why / How:
+ *	`signaled` is cleared under `e->lock` for the same
+ *	reason `EventSet` sets it under the lock: any thread
+ *	concurrently entering `xEventWait` must see either the
+ *	fully-set or fully-cleared state, never a partial update.
+ *
  * Parameters:
  *	interp -- ignored.
  *	pCtx   -- platform context (ignored).
  *	pEvent -- handle, or NULL (no-op on NULL).
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -131667,6 +142390,19 @@ th8PosixEventReset(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	semantics are desired.  Matched pair with
  *	`th8Win32EventWait`.
  *
+ * Why / How:
+ *	`pthread_cond_wait` / `pthread_cond_timedwait` can wake
+ *	spuriously or on `EINTR` without `signaled` having
+ *	changed, so every wait is wrapped in a `while (!signaled)`
+ *	re-check loop; a distinct `-1` ("early-wake, re-poll")
+ *	result lets the infinite- and bounded-wait branches break
+ *	out of that loop early (e.g. so a caller can re-evaluate
+ *	other pending work) instead of spinning inside this call
+ *	until the real timeout.  The bounded-wait deadline is
+ *	computed once from `gettimeofday` plus `nTimeoutMs`
+ *	because `pthread_cond_timedwait` takes an absolute
+ *	deadline, not a relative duration.
+ *
  * Parameters:
  *	interp      -- ignored.
  *	pCtx        -- platform context (ignored).
@@ -131674,10 +142410,12 @@ th8PosixEventReset(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	nTimeoutMs  -- timeout in milliseconds; negative for
  *		infinite, zero for poll, positive for bounded.
  *
- * Returns:
- *	0 if the event was signaled before the timeout;
- *	1 otherwise (including NULL `pEvent` and
- *	pthread errors).
+ * Results:
+ *	0 if the event was observed signaled; 1 if the timeout
+ *	elapsed, `pEvent` was NULL, or an unrecoverable pthread
+ *	error occurred; -1 on a spurious/early wake with the
+ *	event still unsignaled, meaning the caller should re-poll
+ *	rather than treat this as a timeout.
  *
  * Side effects:
  *	Acquires and releases `e->lock`; may block on
@@ -132090,7 +142828,7 @@ th8PosixUnlock(void)
  * dladdr-based detection.
  */
 
-static char zBasePath[4096];
+static char zBasePath[TH8_PATH_MAX];
 static int bInitialized = 0;
 
 
@@ -132128,7 +142866,7 @@ static int bInitialized = 0;
 int
 Th8_SetBasePath(const char *zPath, size_t nPath)
 {
-    char resolved[4096];
+    char resolved[TH8_PATH_MAX];
 
     if (!zPath) {
 	TH8_TRACE_ERR(NULL, "NULL path");
@@ -132155,7 +142893,7 @@ Th8_SetBasePath(const char *zPath, size_t nPath)
      */
 
     if (nPath == 1 && zPath[0] == '.') {
-	char cwd[4096];
+	char cwd[TH8_PATH_MAX];
 
 	if (!getcwd(cwd, sizeof(cwd))) {
 	    TH8_TRACE_ERR(NULL, "getcwd failed");
@@ -132172,7 +142910,7 @@ Th8_SetBasePath(const char *zPath, size_t nPath)
 	    memcpy(zBasePath, cwd, nCwd + 1);
 	}
     } else {
-	char rp[4096];
+	char rp[TH8_PATH_MAX];
 
 	if (realpath(resolved, rp)) {
 	    size_t nRp = th8PosixStrlen(rp);
@@ -132239,6 +142977,88 @@ Th8_GetBasePath(void)
 /*
  *----------------------------------------------------------------------
  *
+ * th8PosixDeriveBaseFromModule --
+ *
+ *	Reduce the absolute path of a TH8 module file to the sandbox base
+ *	directory and cache it in the file-scope zBasePath buffer.
+ *
+ * Why / How:
+ *	th8PosixGetBasePath locates a TH8 module two ways -- dladdr(3) on
+ *	dynamic builds and /proc/self/exe on fully-static builds -- but
+ *	both need the SAME reduction to turn a module path into the base:
+ *	canonicalize with realpath(3), strip the trailing filename, and if
+ *	the containing directory is named "bin"/"bin-afl"/"bin-static"/"lib"
+ *	step out to its parent.  Keeping the reduction in one place
+ *	guarantees the sandbox root is computed identically however the
+ *	module path was obtained (e.g. <base>/bin/th8sh and
+ *	<base>/lib/libth8.so both reduce to <base>).
+ *
+ * Results:
+ *	1 and sets zBasePath on success; 0 and leaves zBasePath unchanged on
+ *	failure (unresolvable path or oversized result).
+ *
+ * Side effects:
+ *	On success, writes the file-scope zBasePath buffer.  Callers must
+ *	hold th8PosixMutex (this touches shared zBasePath).
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+th8PosixDeriveBaseFromModule(const char *zModulePath)
+{
+    char resolved[TH8_PATH_MAX];
+    char *slash;
+
+    if (!zModulePath) {
+	return 0;
+    }
+    if (!realpath(zModulePath, resolved)) {
+	return 0;
+    }
+
+    /*
+     * Strip the filename to get the directory.
+     */
+
+    slash = th8PosixStrrchr(resolved, '/');
+    if (!slash || slash == resolved) {
+	return 0;
+    }
+    *slash = '\0';
+
+    /*
+     * If the directory is named "bin", "bin-afl", "bin-static", or
+     * "lib", the module resides in a subdirectory of the base -- use
+     * the parent directory instead.
+     */
+
+    {
+	char *tail = th8PosixStrrchr(resolved, '/');
+
+	if (tail && (th8PosixStrcmp(tail + 1, "bin") == 0 ||
+	             th8PosixStrcmp(tail + 1, "bin-afl") == 0 ||
+	             th8PosixStrcmp(tail + 1, "bin-static") == 0 ||
+	             th8PosixStrcmp(tail + 1, "lib") == 0)) {
+	    *tail = '\0';
+	}
+    }
+
+    {
+	size_t nResolved = th8PosixStrlen(resolved);
+
+	if (nResolved >= sizeof(zBasePath)) {
+	    return 0;
+	}
+	memcpy(zBasePath, resolved, nResolved + 1);
+    }
+    return zBasePath[0] ? 1 : 0;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8PosixGetBasePath --
  *
  *	Return the base path for the TH8 library.  The base path is
@@ -132252,7 +143072,9 @@ Th8_GetBasePath(void)
  *	All sandbox checks ultimately call this function to obtain
  *	the base path.  Uses dladdr(3) with the address of this
  *	function itself as the probe to find the path of the TH8
- *	shared library.  A union is used for the function-to-object
+ *	shared library, or -- when dladdr fails in a fully-static
+ *	binary -- /proc/self/exe.  A union is used for the
+ *	function-to-object
  *	pointer cast to avoid undefined behavior under strict ISO C
  *	(POSIX guarantees the cast works but the C standard does
  *	not).  The resulting path is resolved via realpath(3), then
@@ -132268,85 +143090,74 @@ Th8_GetBasePath(void)
  *	base path could not be determined.
  *
  * Side effects:
- *	On first call, calls dladdr and realpath.  Acquires and
- *	releases the platform mutex.
+ *	On first call, calls dladdr (or reads /proc/self/exe on a
+ *	static build) and realpath.  Acquires and releases the
+ *	platform mutex.
  *
  *----------------------------------------------------------------------
  */
+
 
 static const char *
 th8PosixGetBasePath(void)
 {
     th8PosixLock();
     if (!bInitialized) {
-	Dl_info info;
-	char resolved[4096];
-
 	bInitialized = 1;
 	zBasePath[0] = '\0';
 
 	/*
-	 * Use dladdr to find the path of the TH8 library itself.
-	 * We pass the address of this function as the probe.
-	 * The union avoids a function-to-object pointer cast that
-	 * is technically undefined in strict ISO C (but guaranteed
-	 * by POSIX).
-	 */
+         * Primary (dynamic builds): use dladdr to find the path of the
+         * TH8 shared library, probing the address of this function.
+         * The union avoids a function-to-object pointer cast that is
+         * technically undefined in strict ISO C (but guaranteed by
+         * POSIX).
+         */
 
 	{
+	    Dl_info info;
 	    union {
 		void *p;
 		const char *(*f)(void);
 	    } uAddr;
+
 	    uAddr.f = th8PosixGetBasePath;
 	    if (dladdr(uAddr.p, &info) && info.dli_fname) {
-		if (realpath(info.dli_fname, resolved)) {
-		    /*
-		     * Strip the filename to get the directory.
-		     */
-
-		    char *slash = th8PosixStrrchr(resolved, '/');
-
-		    if (slash && slash != resolved) {
-			*slash = '\0';
-
-			/*
-			 * If the directory is named "bin" or "lib",
-			 * the library resides in a subdirectory of
-			 * the base -- use the parent instead.
-			 */
-
-			{
-			    char *tail = th8PosixStrrchr(resolved, '/');
-
-			    if (tail &&
-			        (th8PosixStrcmp(tail + 1, "bin") == 0 ||
-			         th8PosixStrcmp(tail + 1, "bin-afl") == 0 ||
-			         th8PosixStrcmp(tail + 1, "bin-static") ==
-			             0 ||
-			         th8PosixStrcmp(tail + 1, "lib") == 0)) {
-				*tail = '\0';
-			    }
-			}
-
-			{
-			    size_t nResolved = th8PosixStrlen(resolved);
-			    if (nResolved < sizeof(zBasePath)) {
-				memcpy(zBasePath, resolved, nResolved + 1);
-			    }
-			}
-		    }
-		}
+		(void)th8PosixDeriveBaseFromModule(info.dli_fname);
 	    }
 	}
 
+#  if defined(__linux__)
 	/*
-	 * No fallback.  If dladdr failed, leave zBasePath empty
-	 * so that subsequent attempts to use it fail gracefully.
-	 */
+         * Fallback (fully-static builds): dladdr cannot resolve a module
+         * in a statically linked executable -- there is no dynamic
+         * linker and no shared-object metadata -- so it leaves zBasePath
+         * empty.  /proc/self/exe is a kernel-maintained symlink to the
+         * running executable that works for static AND dynamic binaries
+         * via a plain readlink(2), with no dynamic linker involved.  The
+         * static shell lives in <base>/bin-static/, which the reduction
+         * strips back to <base>.
+         */
 
 	if (!zBasePath[0]) {
-	    TH8_TRACE_ERR(NULL, "dladdr failed");
+	    char exePath[TH8_PATH_MAX];
+	    ssize_t nExe =
+	        readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+
+	    if (nExe > 0) {
+		exePath[nExe] = '\0';
+		(void)th8PosixDeriveBaseFromModule(exePath);
+	    }
+	}
+#  endif
+
+	/*
+         * No further fallback.  If detection failed, leave zBasePath
+         * empty so subsequent attempts to use it fail gracefully.
+         */
+
+	if (!zBasePath[0]) {
+	    TH8_TRACE_ERR(NULL, "base path detection failed");
 	}
     }
     th8PosixUnlock();
@@ -132480,7 +143291,7 @@ th8PosixIsPathUnderBase(const char *zPath)
 {
     const char *zBase;
     size_t nBase;
-    char resolved[4096];
+    char resolved[TH8_PATH_MAX];
 
     /* Bug 26: zPath is from caller -- caller could pass NULL. */
     if (!zPath || !zPath[0]) return 0;
@@ -132514,12 +143325,12 @@ th8PosixIsPathUnderBase(const char *zPath)
      * information about the filesystem outside the sandbox.
      */
     {
-	char cwd[4096];
-	const char *seg[256];
-	size_t segLen[256];
+	char cwd[TH8_PATH_MAX];
+	const char *seg[TH8_CWD_SEG_MAX];
+	size_t segLen[TH8_CWD_SEG_MAX];
 	int depth = 0;
 	const char *p;
-	char norm[4096];
+	char norm[TH8_PATH_MAX];
 	size_t nNorm;
 	int i;
 
@@ -132534,7 +143345,7 @@ th8PosixIsPathUnderBase(const char *zPath)
 
 	    while (*p && *p != '/')
 		p++;
-	    if (depth < 256) {
+	    if (depth < TH8_CWD_SEG_MAX) {
 		seg[depth] = s;
 		segLen[depth] = (size_t)(p - s);
 		depth++;
@@ -132556,7 +143367,7 @@ th8PosixIsPathUnderBase(const char *zPath)
 		/* current directory -- skip */
 	    } else if (n == 2 && s[0] == '.' && s[1] == '.') {
 		if (depth > 0) depth--;
-	    } else if (n > 0 && depth < 256) {
+	    } else if (n > 0 && depth < TH8_CWD_SEG_MAX) {
 		seg[depth] = s;
 		segLen[depth] = n;
 		depth++;
@@ -132623,7 +143434,7 @@ th8PosixGetCwd(
 {
     const char *zBase;
     size_t nBase;
-    char zCwd[4096];
+    char zCwd[TH8_PATH_MAX];
     int rel;
 
     (void)pCtx;
@@ -132638,7 +143449,7 @@ th8PosixGetCwd(
      */
 
     {
-	char zRaw[4096];
+	char zRaw[TH8_PATH_MAX];
 
 	if (!getcwd(zRaw, sizeof(zRaw))) {
 	    TH8_TRACE_ERR(NULL, "getcwd failed");
@@ -132732,8 +143543,8 @@ th8PosixSetCwd(
 {
     const char *zBase;
     size_t nBase;
-    char resolved[4096];
-    char zCopy[4096];
+    char resolved[TH8_PATH_MAX];
+    char zCopy[TH8_PATH_MAX];
     int rel;
 
     (void)interp;
@@ -132821,7 +143632,7 @@ th8PosixSetCwd(
  *	splits the combined path into components, applying "." (skip)
  *	and ".." (pop) rules.  The result is always an absolute path
  *	starting with "/" with no "." or ".." segments, suitable for
- *	prefix comparison against the base path.  Up to 512 path
+ *	prefix comparison against the base path.  Up to TH8_PATH_SEG_MAX path
  *	components are supported; deeper paths are rejected.
  *
  * Results:
@@ -132841,7 +143652,7 @@ th8PosixResolveAbsolute(
     size_t nPath) /* Length, or (size_t)-1. */
 {
     char *zCopy;
-    char resolved[4096];
+    char resolved[TH8_PATH_MAX];
 
     if (!zPath) return NULL;
 
@@ -132877,8 +143688,8 @@ th8PosixResolveAbsolute(
 
     {
 	char *zAbs;
-	const char *comp[512];
-	size_t compLen[512];
+	const char *comp[TH8_PATH_SEG_MAX];
+	size_t compLen[TH8_PATH_SEG_MAX];
 	int depth = 0;
 	const char *p;
 	char *zOut;
@@ -132886,8 +143697,8 @@ th8PosixResolveAbsolute(
 	int i;
 
 	if (zCopy[0] != '/') {
-	    char cwdRaw[4096];
-	    char cwd[4096];
+	    char cwdRaw[TH8_PATH_MAX];
+	    char cwd[TH8_PATH_MAX];
 
 	    if (!getcwd(cwdRaw, sizeof(cwdRaw))) {
 		TH8_TRACE_ERR(NULL, "getcwd failed");
@@ -132961,7 +143772,7 @@ th8PosixResolveAbsolute(
 		/* current dir -- no-op */
 	    } else if (len == 2 && start[0] == '.' && start[1] == '.') {
 		if (depth > 0) depth--;
-	    } else if (depth < 512) {
+	    } else if (depth < TH8_PATH_SEG_MAX) {
 		comp[depth] = start;
 		compLen[depth] = len;
 		depth++;
@@ -133182,8 +143993,8 @@ th8PosixGetExePath(
     Th8_Interp *interp, /* Interpreter for Th8_AttemptMalloc. */
     void *pCtx) /* Platform context (unused). */
 {
-    char buf[4096];
-    char resolved[4096];
+    char buf[TH8_PATH_MAX];
+    char resolved[TH8_PATH_MAX];
     char *zResult = 0;
 
     (void)pCtx;
@@ -133322,7 +144133,7 @@ th8PosixGetExePath(
  */
 
 static Th8_Platform th8PosixPlatformData = {
-    5, /* nVersion */
+    1, /* nVersion */
     th8PosixInitialize, /* xInitialize */
     th8PosixFinalize, /* xFinalize */
 
@@ -133471,13 +144282,16 @@ static Th8_Platform th8PosixPlatformData = {
     0,    /* xDnsResolveFree */
 #  endif
 
-    /* Diagnostics (nVersion 5) -- xStackBackTrace is deliberately left
+    /* Diagnostics -- xStackBackTrace is deliberately left
        NULL here.  It is supplied by the compiler-runtime th8_unwind layer
        (_Unwind_Backtrace), merged after the OS layers.  _Unwind_Backtrace is
        a compiler-runtime facility (not POSIX), so it lives in th8_unwind.c;
        the only POSIX-adjacent alternative (backtrace() in <execinfo.h>) is
        glibc-only and not musl-safe, so POSIX adds no native override. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    th8PosixIntCmpXchg64, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -133899,7 +144713,7 @@ th8MacOSMemset(Th8_Interp *interp, void *pCtx, void *dst, int c, size_t n)
 
 
 static Th8_Platform th8MacOSPlatformData = {
-    5,    /* nVersion */
+    1,    /* nVersion */
     th8MacOSInitialize,  /* xInitialize */
     th8MacOSFinalize,  /* xFinalize */
 
@@ -134028,12 +144842,15 @@ static Th8_Platform th8MacOSPlatformData = {
     /* DNS (provided by POSIX merge when TH8_ENABLE_UNBOUND) */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- xStackBackTrace is deliberately left
+    /* Diagnostics -- xStackBackTrace is deliberately left
        NULL here.  It is supplied by the compiler-runtime th8_unwind layer
        (_Unwind_Backtrace), merged after the OS layers.  It works uniformly
        on Apple targets; macOS's native backtrace() (<execinfo.h>) would be
        functionally equivalent but redundant, so no override is added here. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -134155,15 +144972,13 @@ static os_log_t th8IosLogHandle = NULL;
  *	`os_log_create` cost in iOS apps that never trigger a
  *	trace.
  *
+ * Why / How:
  *	Apple's documentation states that `os_log_t` handles
  *	are intentionally leaked process-wide; there is no
  *	matching destroy step, which is why this file owns no
  *	teardown function.
  *
- * Parameters:
- *	(none)
- *
- * Returns:
+ * Results:
  *	A non-NULL `os_log_t` for the TH8 subsystem.
  *
  * Side effects:
@@ -134199,6 +145014,15 @@ th8IosGetLog(void)
  *
  *	Format string is "%{public}s" so the message text isn't redacted
  *	by Apple's privacy-preserving logging defaults.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Writes zMsg to the unified logging system at OS_LOG_TYPE_DEBUG
+ *	severity via `th8IosGetLog` (which may create the process-global
+ *	log handle on first use).  Produces no output when zMsg is NULL
+ *	or empty.
  *
  *----------------------------------------------------------------------
  */
@@ -134239,6 +145063,15 @@ th8IosEmitTrace(Th8_Interp *interp, void *pCtx, const char *zMsg)
  *	Messages longer than 1023 bytes are truncated; the truncation
  *	ASCII marker "..." is appended in that case so callers can
  *	see when they've exceeded the cap.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Emits either a fixed "no message" string (zMsg NULL) or the
+ *	NUL-terminated, possibly-truncated copy of zMsg to the unified
+ *	logging system at OS_LOG_TYPE_FAULT severity via `th8IosGetLog`
+ *	(which may create the process-global log handle on first use).
  *
  *----------------------------------------------------------------------
  */
@@ -134287,6 +145120,14 @@ th8IosPanic(Th8_Interp *interp, void *pCtx, const char *zMsg, size_t nMsg)
  *	be reachable but is not the recommended path.  Cannot fail in
  *	a way that matters at this scale, so we always return TH8_OK.
  *
+ * Results:
+ *	TH8_OK on success, including the nByte == 0 no-op case;
+ *	TH8_ERROR if pBuf is NULL while nByte is nonzero.
+ *
+ * Side effects:
+ *	Fills the first nByte bytes of *pBuf with random data drawn
+ *	from arc4random_buf.  No effect when nByte is 0.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -134313,7 +145154,7 @@ th8IosRandomBytes(Th8_Interp *interp, void *pCtx, void *pBuf, size_t nByte)
  */
 
 static Th8_Platform th8IosPlatformData = {
-    5,    /* nVersion */
+    1,    /* nVersion */
     0,    /* xInitialize  (macOS provides) */
     0,    /* xFinalize    (macOS provides) */
 
@@ -134434,8 +145275,11 @@ static Th8_Platform th8IosPlatformData = {
     /* DNS (libunbound not available on iOS) */
     0, 0,   /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -134451,10 +145295,19 @@ static Th8_Platform th8IosPlatformData = {
  *	with Th8_GetMacOSPlatform(), Th8_GetPosixPlatform(), and
  *	Th8_GetLibcPlatform() before passing to Th8_CreateInterp.
  *
+ * Why / How:
  *	The macOS layer must be merged before the POSIX layer so the
  *	private malloc zone wins over POSIX's NULL slots; both must
  *	come after the iOS layer so iOS's xPanic / xEmitTrace /
  *	xRandomBytes win over the lower layers.
+ *
+ * Results:
+ *	A pointer to the process-wide static th8IosPlatformData table.
+ *	Never NULL; the pointer remains valid for the life of the
+ *	process.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -134559,6 +145412,14 @@ Th8_GetIosPlatform(void)
  *	default in production builds, which is the right behaviour
  *	for trace-level messages.
  *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Emits zMsg to logcat via __android_log_print at
+ *	ANDROID_LOG_DEBUG severity.  Does nothing if zMsg is NULL or
+ *	the empty string.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -134593,6 +145454,17 @@ th8AndroidEmitTrace(Th8_Interp *interp, void *pCtx, const char *zMsg)
  *	truncation marker if the message is over 1023 bytes -- logcat
  *	itself imposes a per-line cap around 4 KiB but our buffer cap
  *	keeps stack usage bounded.
+ *
+ * Results:
+ *	None.
+ *
+ * Side effects:
+ *	Emits a message to logcat via __android_log_print at
+ *	ANDROID_LOG_FATAL severity: either a fixed "panic (no message)"
+ *	string if zMsg is NULL, or "panic: " followed by up to 1020
+ *	bytes of zMsg (with a "..." truncation marker appended when
+ *	nMsg exceeds the stack buffer).  Does not call abort() or
+ *	otherwise terminate the process.
  *
  *----------------------------------------------------------------------
  */
@@ -134643,6 +145515,13 @@ th8AndroidPanic(Th8_Interp *interp, void *pCtx, const char *zMsg, size_t nMsg)
  *	this slot NULL.  Filling it on Android gives TH8's allocation
  *	accounting the same precision it has on macOS.
  *
+ * Results:
+ *	The usable size, in bytes, of the allocation at p as reported
+ *	by malloc_usable_size(); 0 if p is NULL.
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -134677,6 +145556,16 @@ th8AndroidMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  *	When a partial read happens (which is rare but spec-permitted
  *	for buffers > 256 bytes), the loop continues until the buffer
  *	is filled or an error other than EINTR occurs.
+ *
+ * Results:
+ *	TH8_OK on success (pBuf fully filled, or nByte is 0); TH8_ERROR
+ *	if pBuf is NULL and nByte is nonzero, or if getrandom() fails
+ *	with an error other than EINTR, or returns 0 (EOF-like
+ *	condition that should never happen for this source).
+ *
+ * Side effects:
+ *	Fills pBuf with nByte random bytes obtained from the kernel via
+ *	the getrandom(2) syscall; may retry internally on EINTR.
  *
  *----------------------------------------------------------------------
  */
@@ -134720,7 +145609,7 @@ th8AndroidRandomBytes(
  */
 
 static Th8_Platform th8AndroidPlatformData = {
-    5,    /* nVersion */
+    1,    /* nVersion */
     0,    /* xInitialize */
     0,    /* xFinalize */
 
@@ -134843,8 +145732,11 @@ static Th8_Platform th8AndroidPlatformData = {
     /* DNS (libunbound provided by POSIX merge when enabled) */
     0, 0,   /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -134861,6 +145753,23 @@ static Th8_Platform th8AndroidPlatformData = {
  *	before passing to Th8_CreateInterp.  Do NOT merge with
  *	Th8_GetMacOSPlatform() -- the Apple malloc zone APIs are not
  *	available on Bionic.
+ *
+ * Why / How:
+ *	th8AndroidPlatformData is a static, file-scope table that fills
+ *	in only the slots where Bionic diverges from plain POSIX/libc
+ *	(xEmitTrace, xPanic, xMemorySize, and, on API 28+, xRandomBytes);
+ *	every other slot is left 0 (NULL) so that a subsequent
+ *	Th8_MergePlatform() call with the POSIX and libc platforms
+ *	supplies it.  Returning the address of a static table (rather
+ *	than a heap-allocated copy) means callers must copy it before
+ *	mutating it in place, as shown in the file-header Usage example.
+ *
+ * Results:
+ *	A pointer to the static th8AndroidPlatformData table; never
+ *	NULL.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -135775,7 +146684,7 @@ th8Win32IsPathUnderBase(const char *zPath)
  * Why / How:
  *	Uses native Win32 file I/O (CreateFileA with narrow paths).
  *	The path is first NUL-terminated into a stack buffer (or a
- *	heap buffer for paths longer than 1024 bytes), then validated
+ *	heap buffer for paths longer than TH8_PATH_STACK bytes), then validated
  *	against the base-path sandbox via th8Win32IsPathUnderBase.
  *	The file is opened via CreateFileA, sized via GetFileSize,
  *	then read in a single ReadFile call.  A 256 MB cap prevents
@@ -135801,7 +146710,7 @@ th8Win32GetData(
     char **pzOut,
     size_t *pnOut)
 {
-    char zPathBuf[1024];
+    char zPathBuf[TH8_PATH_STACK];
     char *zPath;
     HANDLE hFile;
     DWORD nSize;
@@ -135919,7 +146828,7 @@ th8Win32DataExists(
     size_t nName,
     int *pAttrs) /* OUT: file type attrs (may be NULL). */
 {
-    char zPathBuf[1024];
+    char zPathBuf[TH8_PATH_STACK];
     char *zPath;
     DWORD attr;
 
@@ -136035,7 +146944,7 @@ th8Win32VerifyAuthenticode(
      * Convert the UTF-8 path to UTF-16 for WinVerifyTrust.
      */
 
-    WCHAR wPathBuf[1024];
+    WCHAR wPathBuf[TH8_PATH_STACK];
     WCHAR *wPath;
     WCHAR *wAlloc = NULL;
 
@@ -136183,8 +147092,8 @@ th8Win32Load(
     const char *zColon;
     size_t nLib;
     size_t nSym;
-    char zLibBuf[1024];
-    char zSymBuf[256];
+    char zLibBuf[TH8_LOAD_LIB_MAX];
+    char zSymBuf[TH8_LOAD_SYM_MAX];
     char *zLib;
     char *zSym;
     HMODULE hLib;
@@ -136727,7 +147636,7 @@ th8Win32CallUnloadProc(
     const char *zProc;
     size_t nProc;
     size_t nSym;
-    char zSymBuf[256];
+    char zSymBuf[TH8_LOAD_SYM_MAX];
     char *zSym;
     Th8_Win32UnloadProc xUnloadFn;
     size_t i;
@@ -136873,7 +147782,7 @@ th8Win32Unload(
     const char *zColon = 0;
     size_t nPrefix;
     size_t nSym;
-    char zSymBuf[256];
+    char zSymBuf[TH8_LOAD_SYM_MAX];
     char *zSym;
     Th8_Win32UnloadProc xUnloadFn;
     size_t i;
@@ -137026,7 +147935,7 @@ th8Win32WriteHandle(Th8_Interp *interp, HANDLE h, const char *z, size_t n)
 	 * is always sufficient.
 	 */
 
-	UTF16 wBuf[4096];
+	UTF16 wBuf[TH8_IO_BUFSIZE];
 	UTF16 *wAlloc = NULL;
 	UTF16 *wData;
 	const UTF8 *pSrc;
@@ -137149,11 +148058,12 @@ th8Win32Input(
 	 * ReadConsoleW returns a full line including \r\n.
 	 */
 
-	WCHAR wBuf[4096];
+	WCHAR wBuf[TH8_IO_BUFSIZE];
 	DWORD nWchars = 0;
 	const UTF16 *pSrc;
 	UTF8 *pDst;
-	UTF8 zUtf8[4096 * 3]; /* worst case: 3 UTF-8 bytes per BMP char */
+	UTF8 zUtf8
+	    [TH8_IO_BUFSIZE * 3]; /* worst case: 3 UTF-8 bytes per BMP char */
 	ConversionResult cr;
 	size_t nUtf8;
 
@@ -137199,7 +148109,7 @@ th8Win32Input(
 	 * valid UTF-8.
 	 */
 
-	char zBuf[4096];
+	char zBuf[TH8_IO_BUFSIZE];
 	DWORD nTotal = 0;
 
 	while (nTotal < sizeof(zBuf) - 1) {
@@ -137263,7 +148173,7 @@ th8Win32Input(
 static int
 th8Win32Output(
     Th8_Interp *interp, /* Interpreter (unused). */
-    void *pCtx,  /* Platform's pCtx (unused). */
+    void *pCtx, /* Platform's pCtx (unused). */
     const char *z,
     size_t n,
     void *pChannel)
@@ -137308,7 +148218,7 @@ th8Win32Output(
 static int
 th8Win32OutputError(
     Th8_Interp *interp, /* Interpreter (unused). */
-    void *pCtx,  /* Platform's pCtx (unused). */
+    void *pCtx, /* Platform's pCtx (unused). */
     const char *z,
     size_t n,
     void *pChannel)
@@ -137470,7 +148380,7 @@ th8Win32RandomBytes(Th8_Interp *interp, void *pCtx, void *pBuf, size_t nByte)
     hLib = LoadLibraryA("advapi32.dll");
     if (hLib) {
 	pFunc = (RtlGenRandomFunc)
-	    GetProcAddress(hLib, "SystemFunction036");  /* RtlGenRandom */
+	    GetProcAddress(hLib, "SystemFunction036"); /* RtlGenRandom */
 	if (pFunc) {
 	    if (pFunc(pBuf, (ULONG)nByte)) {
 		FreeLibrary(hLib);
@@ -137801,7 +148711,7 @@ th8Win32GetStackBounds(
     pStackHigh = (char *)mbi.BaseAddress + mbi.RegionSize;
     while (VirtualQuery((LPCVOID)pStackHigh, &mbi, sizeof(mbi)) != 0) {
 	if (mbi.AllocationBase != (PVOID)pStackLow) {
-	    break;  /* Different allocation -- done. */
+	    break; /* Different allocation -- done. */
 	}
 	pStackHigh = (char *)mbi.BaseAddress + mbi.RegionSize;
     }
@@ -138049,6 +148959,44 @@ th8Win32IntCmpXchg(
 /*
  *----------------------------------------------------------------------
  *
+ * th8Win32IntCmpXchg64 --
+ *
+ *	64-bit atomic compare-and-swap.  Implements the Th8_Platform
+ *	xIntCmpXchg64 callback.
+ *
+ * Why / How:
+ *	The 64-bit sibling of th8Win32IntCmpXchg.  Wraps the Win32
+ *	InterlockedCompareExchange64 intrinsic, which is wide enough to
+ *	hold a thread id (the 32-bit xIntCmpXchg is not).  Used to read
+ *	and publish the interpreter's owning-thread id.  Returns the
+ *	original value of *pTarget before the operation.
+ *
+ * Results:
+ *	The previous value of *pTarget.
+ *
+ * Side effects:
+ *	May atomically modify *pTarget.  Implies a full memory barrier.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static th8_uint64_t
+th8Win32IntCmpXchg64(
+    Th8_Interp *interp,
+    void *pCtx,
+    volatile th8_uint64_t *pTarget,
+    th8_uint64_t iExchange,
+    th8_uint64_t iComparand)
+{
+    (void)interp;
+    (void)pCtx;
+    return (th8_uint64_t)InterlockedCompareExchange64(
+        (volatile LONG64 *)pTarget, (LONG64)iExchange, (LONG64)iComparand);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8Win32MemBarrier --
  *
  *	Issue a full memory barrier (fence).  Implements the
@@ -138086,19 +149034,17 @@ th8Win32MemBarrier(Th8_Interp *interp, void *pCtx)
  *
  *	Create a Win32 manual-reset event handle for the
  *	per-interp event queue.  Mirror of
- *	`th8PosixEventCreate`.  Wraps `CreateEventW` with:
- *	  *  manual-reset = TRUE (signaled state persists
- *	     until an explicit `ResetEvent`, so concurrent
- *	     producers can signal-coalesce safely without
- *	     losing wakeups),
- *	  *  initial state = FALSE (unsignaled),
- *	  *  no security attributes / name.
+ *	`th8PosixEventCreate`.  The `interp` and `pCtx`
+ *	parameters are ignored.
  *
- * Parameters:
- *	interp -- ignored.
- *	pCtx   -- platform context (ignored).
+ * Why / How:
+ *	Wraps `CreateEventW` with manual-reset = TRUE (signaled
+ *	state persists until an explicit `ResetEvent`, so
+ *	concurrent producers can signal-coalesce safely without
+ *	losing wakeups), initial state = FALSE (unsignaled), and
+ *	no security attributes or name.
  *
- * Returns:
+ * Results:
  *	Non-NULL HANDLE on success; NULL on failure
  *	(`GetLastError` available to the caller).
  *
@@ -138122,15 +149068,17 @@ th8Win32EventCreate(Th8_Interp *interp, void *pCtx)
  *
  *	Close a Win32 manual-reset event handle returned by
  *	`th8Win32EventCreate`.  NULL `pEvent` is a no-op.
- *	Mirror of `th8PosixEventDestroy`.
+ *	Mirror of `th8PosixEventDestroy`.  The `interp` and
+ *	`pCtx` parameters are ignored.
  *
- * Parameters:
- *	interp -- ignored.
- *	pCtx   -- platform context (ignored).
- *	pEvent -- HANDLE returned by `th8Win32EventCreate`, or
- *		NULL.
+ * Why / How:
+ *	Delegates directly to `CloseHandle`; Win32 kernel objects
+ *	are reference-counted so closing the handle releases
+ *	TH8's reference without any further teardown -- unlike
+ *	`th8PosixEventDestroy`, there is no separate mutex/cond
+ *	pair to tear down.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -138155,14 +149103,17 @@ th8Win32EventDestroy(Th8_Interp *interp, void *pCtx, void *pEvent)
  *
  *	Transition the manual-reset event to the signaled
  *	state via `SetEvent`.  Idempotent.  NULL `pEvent` is a
- *	no-op.  Mirror of `th8PosixEventSet`.
+ *	no-op.  Mirror of `th8PosixEventSet`.  The `interp` and
+ *	`pCtx` parameters are ignored.
  *
- * Parameters:
- *	interp -- ignored.
- *	pCtx   -- platform context (ignored).
- *	pEvent -- HANDLE, or NULL.
+ * Why / How:
+ *	Setting an already-signaled manual-reset event is a
+ *	no-op at the OS level, so no extra synchronization is
+ *	needed to make repeated `SetEvent` calls from multiple
+ *	producer threads safe; the event simply stays signaled
+ *	until a subsequent `th8Win32EventReset`.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -138190,14 +149141,17 @@ th8Win32EventSet(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	events do not auto-reset on `Wait`; callers must
  *	explicitly reset them when one-shot semantics are
  *	desired.  NULL `pEvent` is a no-op.  Mirror of
- *	`th8PosixEventReset`.
+ *	`th8PosixEventReset`.  The `interp` and `pCtx`
+ *	parameters are ignored.
  *
- * Parameters:
- *	interp -- ignored.
- *	pCtx   -- platform context (ignored).
- *	pEvent -- HANDLE, or NULL.
+ * Why / How:
+ *	`ResetEvent` simply clears the OS-maintained signaled
+ *	flag; because manual-reset events never auto-clear per
+ *	waiter, the dispatcher calls this right after waking
+ *	from `th8Win32EventWait` to avoid a spurious immediate
+ *	re-wake on the next poll.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -138229,7 +149183,8 @@ th8Win32EventReset(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	`th8Win32EventWait` returns `-1` so the caller re-polls
  *	(the APC body has already run).  Mirror of
  *	`th8PosixEventWait` (which uses `pthread_kill`
- *	signal-interruption to achieve the same effect).
+ *	signal-interruption to achieve the same effect).  The
+ *	`interp` and `pCtx` parameters are ignored.
  *
  *	Timeout encoding: negative means `INFINITE`; zero is a
  *	poll; positive is the millisecond bound.  NULL
@@ -138237,14 +149192,15 @@ th8Win32EventReset(Th8_Interp *interp, void *pCtx, void *pEvent)
  *	timeout (1) to preserve the calling-thread invariants
  *	the dispatcher expects on error paths.
  *
- * Parameters:
- *	interp     -- ignored.
- *	pCtx       -- platform context (ignored).
- *	pEvent     -- HANDLE, or NULL.
- *	nTimeoutMs -- timeout in milliseconds; negative for
- *		infinite, zero for poll, positive for bounded.
+ * Why / How:
+ *	The dispatcher needs to tell an APC-driven wake (where
+ *	the APC body has already run and it must re-poll) apart
+ *	from an ordinary timeout; folding `WAIT_FAILED` into the
+ *	timeout return preserves that same "keep going" behavior
+ *	on the rare OS-level failure instead of introducing a
+ *	fourth outcome every caller would have to special-case.
  *
- * Returns:
+ * Results:
  *	0  -- event was signaled before the timeout.
  *	1  -- timeout reached, or `WAIT_FAILED`, or NULL event.
  *	-1 -- alertable wake (`WAIT_IO_COMPLETION`); APC ran.
@@ -138568,7 +149524,7 @@ Th8_GetBasePath(void)
 static char *
 th8Win32GetCwd(
     Th8_Interp *interp, /* Interpreter (for Th8_AttemptMalloc). */
-    void *pCtx)   /* Host context (unused). */
+    void *pCtx) /* Host context (unused). */
 {
     const char *zBase;
     size_t nBase;
@@ -138642,7 +149598,7 @@ th8Win32GetCwd(
 
     TH8_TRACE_ERR(NULL, "current path is foreign");
     TH8_TRACE_ERR(NULL, zCwd);
-    return NULL;  /* foreign directory */
+    return NULL; /* foreign directory */
 }
 
 
@@ -138677,9 +149633,9 @@ th8Win32GetCwd(
 static char *
 th8Win32NormalizePath(
     Th8_Interp *interp, /* Interpreter (for Th8_AttemptMalloc). */
-    void *pCtx,   /* Host context (unused). */
-    const char *zPath,  /* Path to normalize. */
-    size_t nPath)  /* Length, or (size_t)-1. */
+    void *pCtx, /* Host context (unused). */
+    const char *zPath, /* Path to normalize. */
+    size_t nPath) /* Length, or (size_t)-1. */
 {
     const char *zBase;
     size_t nBase;
@@ -138799,7 +149755,7 @@ th8Win32NormalizePath(
 static int
 th8Win32SetCwd(
     Th8_Interp *interp, /* Interpreter. */
-    void *pCtx,   /* Host context (unused). */
+    void *pCtx, /* Host context (unused). */
     const char *zPath,
     size_t nPath)
 {
@@ -138864,7 +149820,7 @@ th8Win32SetCwd(
 
     TH8_TRACE_ERR(NULL, "new path is foreign");
     TH8_TRACE_ERR(NULL, zFull);
-    return TH8_ERROR;  /* rejected: foreign directory */
+    return TH8_ERROR; /* rejected: foreign directory */
 }
 
 
@@ -138901,7 +149857,7 @@ th8Win32SetCwd(
 static char *
 th8Win32GetExePath(
     Th8_Interp *interp, /* Interpreter for Th8_AttemptMalloc. */
-    void *pCtx)   /* Platform context (unused). */
+    void *pCtx) /* Platform context (unused). */
 {
     char zModule[MAX_PATH];
     char zResolved[MAX_PATH];
@@ -139101,8 +150057,8 @@ th8Win32GetHostName(Th8_Interp *interp, void *pCtx, char *zBuf, size_t nBuf)
 static char *
 th8Win32GetEnv(Th8_Interp *interp, void *pCtx, const char *zName)
 {
-    WCHAR wName[256];
-    WCHAR wVal[4096];
+    WCHAR wName[TH8_ENV_STACK];
+    WCHAR wVal[TH8_PATH_MAX];
     DWORD n;
     int nWide;
     int nUtf8;
@@ -139123,8 +150079,8 @@ th8Win32GetEnv(Th8_Interp *interp, void *pCtx, const char *zName)
      * Query the environment variable (UTF-16).
      */
     n = GetEnvironmentVariableW(wName, wVal, sizeof(wVal) / sizeof(WCHAR));
-    if (n == 0) return NULL;  /* not set or error */
-    if (n >= sizeof(wVal) / sizeof(WCHAR)) return NULL;  /* too long */
+    if (n == 0) return NULL; /* not set or error */
+    if (n >= sizeof(wVal) / sizeof(WCHAR)) return NULL; /* too long */
 
     /*
      * Convert the UTF-16 value to UTF-8.
@@ -139584,7 +150540,7 @@ th8Win32GetInput(Th8_Interp *interp, void *pCtx, void **pChannel)
     (void)interp;
     (void)pCtx;
     *pChannel = th8Win32InputChannel;
-    return 0;  /* TH8_OK */
+    return 0; /* TH8_OK */
 }
 
 /*
@@ -139616,7 +150572,7 @@ th8Win32SetInput(Th8_Interp *interp, void *pCtx, void *pChannel)
     (void)interp;
     (void)pCtx;
     th8Win32InputChannel = pChannel;
-    return 0;  /* TH8_OK */
+    return 0; /* TH8_OK */
 }
 
 /*
@@ -139646,7 +150602,7 @@ th8Win32GetOutput(Th8_Interp *interp, void *pCtx, void **pChannel)
     (void)interp;
     (void)pCtx;
     *pChannel = th8Win32OutputChannel;
-    return 0;  /* TH8_OK */
+    return 0; /* TH8_OK */
 }
 
 /*
@@ -139678,7 +150634,7 @@ th8Win32SetOutput(Th8_Interp *interp, void *pCtx, void *pChannel)
     (void)interp;
     (void)pCtx;
     th8Win32OutputChannel = pChannel;
-    return 0;  /* TH8_OK */
+    return 0; /* TH8_OK */
 }
 
 /*
@@ -139708,7 +150664,7 @@ th8Win32GetErrorOutput(Th8_Interp *interp, void *pCtx, void **pChannel)
     (void)interp;
     (void)pCtx;
     *pChannel = th8Win32ErrorChannel;
-    return 0;  /* TH8_OK */
+    return 0; /* TH8_OK */
 }
 
 /*
@@ -139740,7 +150696,7 @@ th8Win32SetErrorOutput(Th8_Interp *interp, void *pCtx, void *pChannel)
     (void)interp;
     (void)pCtx;
     th8Win32ErrorChannel = pChannel;
-    return 0;  /* TH8_OK */
+    return 0; /* TH8_OK */
 }
 
 
@@ -139779,7 +150735,7 @@ th8Win32GetRealPath(
     char *zBuf,
     size_t nBuf)
 {
-    char zCopy[4096];
+    char zCopy[TH8_PATH_MAX];
     DWORD n;
 
     (void)interp;
@@ -139834,7 +150790,7 @@ th8Win32GetRootPath(
     char *zBuf,
     size_t nBuf)
 {
-    char zCopy[4096];
+    char zCopy[TH8_PATH_MAX];
 
     (void)interp;
     (void)pCtx;
@@ -139906,8 +150862,8 @@ th8Win32SameFile(
     const char *zName2,
     size_t nName2)
 {
-    char zCopy1[4096];
-    char zCopy2[4096];
+    char zCopy1[TH8_PATH_MAX];
+    char zCopy2[TH8_PATH_MAX];
     HANDLE h1;
     HANDLE h2;
     BY_HANDLE_FILE_INFORMATION info1;
@@ -139973,8 +150929,17 @@ th8Win32SameFile(
  *	Compose the path to a candidate trust anchor co-located
  *	with the currently-loaded TH8 module (`th8.dll`, or the
  *	host EXE for a statically-linked build): the directory
- *	containing the image, plus `\\root.key`.
+ *	containing the image, plus `\\root.key`.  `zBuf` receives
+ *	the NUL-terminated path on success and must be at least
+ *	`nBuf` bytes.
  *
+ *	Does NOT check whether the file actually exists --
+ *	callers use the returned path with `ub_ctx_add_ta_file`
+ *	or `th8Win32PathReadable` to determine that.
+ *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
  *	Uses `GetModuleHandleExA` with
  *	`GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` on this
  *	function's own address so detection works regardless of
@@ -139983,18 +150948,7 @@ th8Win32SameFile(
  *	`UNCHANGED_REFCOUNT` ensures the probe does not pin the
  *	module against unload.
  *
- *	Does NOT check whether the file actually exists --
- *	callers use the returned path with `ub_ctx_add_ta_file`
- *	or `th8Win32PathReadable` to determine that.
- *
- *	Gated on `TH8_ENABLE_UNBOUND`.
- *
- * Parameters:
- *	zBuf -- output buffer; receives the NUL-terminated path
- *		on success.
- *	nBuf -- size of `zBuf` in bytes.
- *
- * Returns:
+ * Results:
  *	1 on success; 0 if `GetModuleHandleExA` failed,
  *	`GetModuleFileNameA` returned an error or full-buffer
  *	truncation indicator, the resolved path contained no
@@ -140047,18 +151001,16 @@ th8Win32GetModuleAnchorPath(char *zBuf, size_t nBuf)
  *	probe and avoids the side-effect of bumping the file's
  *	last-access timestamp.
  *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
  *	Returns 0 for directories, broken reparse points, or any
  *	other case where `GetFileAttributesA` reports
  *	`INVALID_FILE_ATTRIBUTES` or sets the `FILE_ATTRIBUTE_DIRECTORY`
  *	bit.  ACL-denied paths also return 0 (good -- the
  *	subsequent `CreateFileA` would have failed anyway).
  *
- *	Gated on `TH8_ENABLE_UNBOUND`.
- *
- * Parameters:
- *	zPath -- NUL-terminated path to test.
- *
- * Returns:
+ * Results:
  *	1 if `zPath` is an existing readable file; 0 otherwise.
  *
  * Side effects:
@@ -140085,6 +151037,9 @@ th8Win32PathReadable(const char *zPath)
  *	when `zRelPath` is NULL) and write the resulting path
  *	into `zBuf`.  Returns 1 on success.
  *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
  *	Used by `th8Win32GetManagedAnchorPath` to compose
  *	candidate `%APPDATA%`-relative paths, and by
  *	`th8Win32FindStaticAnchorPath` (via wrapper) to compose
@@ -140096,17 +151051,7 @@ th8Win32PathReadable(const char *zPath)
  *	check whether the resulting file exists; callers
  *	pair it with `th8Win32PathReadable`.
  *
- *	Gated on `TH8_ENABLE_UNBOUND`.
- *
- * Parameters:
- *	zBuf     -- output buffer.
- *	nBuf     -- size of `zBuf` in bytes.
- *	zEnvName -- environment-variable name to read.
- *	zRelPath -- relative-path suffix to append after the
- *		env-var value (e.g. `"\\Unbound\\root.key"`),
- *		or NULL to use the env-var value verbatim.
- *
- * Returns:
+ * Results:
  *	1 on success; 0 if the env var is unset or empty, or
  *	the composed path would exceed `nBuf`.
  *
@@ -140155,8 +151100,13 @@ th8Win32TryComposeEnvPath(
  *
  *	Each candidate is screened by `th8Win32PathReadable`
  *	before being returned, so the function never returns a
- *	path that the caller would fail to open.
+ *	path that the caller would fail to open.  `zBuf`
+ *	receives the NUL-terminated anchor path on success and
+ *	must be at least `nBuf` bytes.
  *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
  *	The module-directory candidate wins over every
  *	system-wide / user-wide path because an anchor sitting
  *	next to the library was clearly intended for that
@@ -140167,14 +151117,7 @@ th8Win32TryComposeEnvPath(
  *	Used as the SOURCE for the bootstrap-then-auto-roll
  *	flow in `th8Win32SetupManagedAnchor`.
  *
- *	Gated on `TH8_ENABLE_UNBOUND`.
- *
- * Parameters:
- *	zBuf -- output buffer; receives the NUL-terminated
- *		anchor path on success.
- *	nBuf -- size of `zBuf` in bytes.
- *
- * Returns:
+ * Results:
  *	1 if a readable static anchor was found; 0 if none of
  *	the candidates existed.
  *
@@ -140230,8 +151173,12 @@ th8Win32FindStaticAnchorPath(char *zBuf, size_t nBuf)
  *	of the trust anchor.  This is the file libunbound's
  *	`ub_ctx_add_ta_autr` reads on every resolve and writes
  *	state-machine updates to as the RFC 5011 hold-down
- *	timer advances.
+ *	timer advances.  `zBuf` receives the NUL-terminated path
+ *	on success and must be at least `nBuf` bytes.
  *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
  *	Directory selection follows the Windows per-user
  *	roaming-profile convention: `%APPDATA%\\TH8\\root.key`.
  *	`%APPDATA%` is set on every interactive logon (and on
@@ -140245,14 +151192,7 @@ th8Win32FindStaticAnchorPath(char *zBuf, size_t nBuf)
  *	function fails -- there is no usable per-user location
  *	and the caller must fall back to static-anchor mode.
  *
- *	Gated on `TH8_ENABLE_UNBOUND`.
- *
- * Parameters:
- *	zBuf -- output buffer; receives the NUL-terminated path
- *		on success.
- *	nBuf -- size of `zBuf` in bytes.
- *
- * Returns:
+ * Results:
  *	1 on success; 0 if `%APPDATA%` is unset or the composed
  *	path would exceed `nBuf`.
  *
@@ -140274,31 +151214,27 @@ th8Win32GetManagedAnchorPath(char *zBuf, size_t nBuf)
  *
  * th8Win32EnsureParentDir --
  *
- *	Ensure every parent directory of `zPath` exists.  Each
- *	intermediate component is created via `CreateDirectoryA`
- *	with `lpSecurityAttributes = NULL` so the new directory
- *	inherits the parent's ACL -- on the `%APPDATA%` chain
- *	this means the user-only ACL is propagated automatically
- *	and the managed copy is not exposed to other local users.
- *
- *	`ERROR_ALREADY_EXISTS` is benign (the directory exists);
- *	any other failure is fatal.
- *
- *	Equivalent to `mkdir -p $(dirname zPath)`.  Mutates a
- *	private copy of `zPath` rather than `zPath` itself so
- *	the caller's buffer is unchanged.
- *
- *	Accepts both `\\` and `/` as path separators so callers
- *	don't have to normalise.
+ *	Ensure every parent directory of `zPath` exists.  The
+ *	basename of `zPath` is ignored -- only its parent
+ *	components are created.  Equivalent to
+ *	`mkdir -p $(dirname zPath)`.
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
- * Parameters:
- *	zPath -- NUL-terminated path whose parent directories
- *		should be created.  The basename of `zPath` is
- *		ignored.
+ * Why / How:
+ *	Each intermediate component is created via
+ *	`CreateDirectoryA` with `lpSecurityAttributes = NULL` so
+ *	the new directory inherits the parent's ACL -- on the
+ *	`%APPDATA%` chain this means the user-only ACL is
+ *	propagated automatically and the managed copy is not
+ *	exposed to other local users.  `ERROR_ALREADY_EXISTS` is
+ *	benign (the directory exists); any other failure is
+ *	fatal.  Mutates a private copy of `zPath` rather than
+ *	`zPath` itself so the caller's buffer is unchanged.
+ *	Accepts both `\\` and `/` as path separators so callers
+ *	don't have to normalise.
  *
- * Returns:
+ * Results:
  *	1 on success; 0 on `CreateDirectoryA` failure other than
  *	`ERROR_ALREADY_EXISTS`, or on `zPath` being too long
  *	for the scratch buffer.
@@ -140344,6 +151280,9 @@ th8Win32EnsureParentDir(const char *zPath)
  *	managed copy from a vendor-supplied static anchor on
  *	the first run after install.
  *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
  *	Routed through `CopyFileA(..., FAIL_IF_EXISTS = FALSE)`,
  *	which is atomic relative to other readers (the
  *	destination becomes visible only after the full payload
@@ -140359,14 +151298,7 @@ th8Win32EnsureParentDir(const char *zPath)
  *	to parse a truncated trust-anchor file and the next
  *	resolve would silently lose validation).
  *
- *	Gated on `TH8_ENABLE_UNBOUND`.
- *
- * Parameters:
- *	zSrc -- NUL-terminated source path (readable).
- *	zDst -- NUL-terminated destination path (will be
- *		created or replaced).
- *
- * Returns:
+ * Results:
  *	1 on success; 0 if `CopyFileA` failed.
  *
  * Side effects:
@@ -140386,6 +151318,65 @@ th8Win32CopyFileContents(const char *zSrc, const char *zDst)
 /*
  *----------------------------------------------------------------------
  *
+ * th8Win32ReadFile --
+ *
+ *	Read up to `nBuf` bytes of `zPath` into the caller-provided buffer
+ *	`zBuf`, setting `*pnRead` to the byte count (0 on failure).  A RAW
+ *	read (CreateFileA + ReadFile) that never touches the signed-only
+ *	script policy: the shared unbound driver uses it to read a trust
+ *	anchor and its `.b64sig` for signature verification, and routing
+ *	through the policy would recurse.
+ *
+ *	Gated on `TH8_ENABLE_UNBOUND`.
+ *
+ * Why / How:
+ *	Opens with `CreateFileA` / `GENERIC_READ` / `FILE_SHARE_READ`,
+ *	queries the file size via `GetFileSize`, and refuses to proceed if
+ *	the size exceeds `nBuf` -- there is no partial-read fallback
+ *	because a truncated anchor or signature file must never reach the
+ *	verification step.  `*pnRead` is zeroed up front so a caller who
+ *	ignores the return value still observes zero bytes on failure.
+ *
+ * Results:
+ *	1 on success; 0 on open/read failure OR if the file does not fit in
+ *	nBuf (no partial read -- a truncated anchor or signature must never
+ *	reach verification).
+ *
+ * Side effects:
+ *	Reads from the filesystem.
+ *
+ *----------------------------------------------------------------------
+ */
+static int
+th8Win32ReadFile(const char *zPath, char *zBuf, size_t nBuf, size_t *pnRead)
+{
+    HANDLE h;
+    DWORD nSize;
+    DWORD nRead = 0;
+
+    if (pnRead) *pnRead = 0;
+    if (!zPath || !zBuf || nBuf == 0) return 0;
+    h = CreateFileA(
+        zPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    nSize = GetFileSize(h, NULL);
+    if (nSize == INVALID_FILE_SIZE || (size_t)nSize > nBuf) {
+	CloseHandle(h);
+	return 0; /* error, or too large -- no partial read */
+    }
+    if (!ReadFile(h, zBuf, nSize, &nRead, NULL) || nRead != nSize) {
+	CloseHandle(h);
+	return 0;
+    }
+    CloseHandle(h);
+    if (pnRead) *pnRead = (size_t)nRead;
+    return 1;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
  * th8Win32UnboundOps --
  *
  *	Static `Th8_UnboundOps` instance handed to every call
@@ -140398,9 +151389,13 @@ th8Win32CopyFileContents(const char *zSrc, const char *zDst)
  *----------------------------------------------------------------------
  */
 static const Th8_UnboundOps th8Win32UnboundOps = {
-    th8Win32FindStaticAnchorPath, th8Win32GetManagedAnchorPath,
-    th8Win32PathReadable,         th8Win32EnsureParentDir,
+    th8Win32FindStaticAnchorPath,
+    th8Win32GetManagedAnchorPath,
+    th8Win32PathReadable,
+    th8Win32EnsureParentDir,
     th8Win32CopyFileContents,
+    th8Win32GetModuleAnchorPath,
+    th8Win32ReadFile,
 };
 
 /*
@@ -140415,21 +151410,21 @@ static const Th8_UnboundOps th8Win32UnboundOps = {
  *	in `src/th8_unbound.c`.  This function exists only to
  *	bind the platform-callback signature to the shared
  *	driver and to supply the Win32 `Th8_UnboundOps` vtable.
+ *	`zName`/`nName` name the host to resolve, `eType` is the
+ *	libunbound `LDNS_RR_TYPE_*` record type, and `*ppResult`
+ *	receives the result pointer on success (NULL on failure).
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
- * Parameters:
- *	interp   -- live interpreter (used for allocation in
- *		the shared driver).
- *	pCtx     -- unused platform context.
- *	zName    -- hostname.
- *	nName    -- hostname length.
- *	eType    -- DNS record type (libunbound
- *		`LDNS_RR_TYPE_*`).
- *	ppResult -- output: result pointer on success;
- *		NULL on failure.
+ * Why / How:
+ *	Forwards `interp`, `zName`, `nName`, `eType`, and
+ *	`ppResult` directly to `th8UnboundResolve`, passing
+ *	`th8Win32UnboundOps` (the Win32 implementations of the
+ *	anchor-path and file-I/O primitives defined above) as
+ *	the platform-ops vtable; `pCtx` is unused because the
+ *	shared driver carries no Win32-specific context.
  *
- * Returns:
+ * Results:
  *	Whatever `th8UnboundResolve` returns: `TH8_OK` on
  *	success; `TH8_ERROR` on any failure.
  *
@@ -140462,17 +151457,18 @@ th8Win32DnsResolve(
  *	side adapter that forwards to the shared
  *	`th8UnboundResolveFree`.  The teardown logic does not
  *	depend on any Win32-specific behaviour, so no vtable
- *	is needed here.
+ *	is needed here.  `pResult` is the value returned by
+ *	`th8Win32DnsResolve`, or NULL.
  *
  *	Gated on `TH8_ENABLE_UNBOUND`.
  *
- * Parameters:
- *	interp  -- live interpreter (used for `Th8_Free`).
- *	pCtx    -- unused platform context.
- *	pResult -- result returned by `th8Win32DnsResolve`,
- *		or NULL.
+ * Why / How:
+ *	Simply calls `th8UnboundResolveFree(interp, pResult)`;
+ *	`pCtx` is unused since freeing a `Th8_DnsResult`
+ *	requires only the interpreter's allocator, not any
+ *	platform-ops vtable.
  *
- * Returns:
+ * Results:
  *	None.
  *
  * Side effects:
@@ -140493,26 +151489,26 @@ th8Win32DnsResolveFree(Th8_Interp *interp, void *pCtx, Th8_DnsResult *pResult)
 
 
 static Th8_Platform th8Win32PlatformData = {
-    5,   /* nVersion */
+    1, /* nVersion */
 
     /* Lifecycle */
-    th8Win32Initialize,  /* xInitialize */
-    th8Win32Finalize,  /* xFinalize */
+    th8Win32Initialize, /* xInitialize */
+    th8Win32Finalize, /* xFinalize */
     th8Win32PreDeleteInterp, /* xPreDeleteInterp */
     th8Win32DeleteInterp, /* xDeleteInterp */
 
     /* Memory -- Win32 HeapAlloc (private heap) */
     th8Win32Malloc, /* xMalloc */
     th8Win32Realloc, /* xRealloc */
-    th8Win32Free,  /* xFree */
+    th8Win32Free, /* xFree */
     th8Win32MemorySize, /* xMemorySize */
-    0,   /* xNeedMemory */
+    0, /* xNeedMemory */
 
     /* Byte operations (xMemcpy, xMemmove provided by th8_libc.c) */
-    0,   /* xMemcpy */
-    0,   /* xMemmove */
+    0, /* xMemcpy */
+    0, /* xMemmove */
     th8Win32Memset, /* xMemset */
-    0,   /* xMemcmp */
+    0, /* xMemcmp */
 
     /* String / utility (provided by th8_libc.c via merge) */
     0, 0, 0, 0, 0, 0, /* xStrlen .. xVsnprintf */
@@ -140612,6 +151608,9 @@ static Th8_Platform th8Win32PlatformData = {
        compiler-runtime no-op fallback. */
     th8Win32StackBackTrace, /* xStackBackTrace */
 
+    /* 64-bit atomics */
+    th8Win32IntCmpXchg64, /* xIntCmpXchg64 */
+
     /* Host context */
     0 /* pCtx */
 };
@@ -140702,6 +151701,26 @@ Th8_GetWin32Platform(void)
  *	provides GetProgramExecutableName() which works on all
  *	supported platforms (Linux, macOS, Windows, BSDs).
  *
+ * Why / How:
+ *	Implements the Th8_Platform.xGetExePath callback.  Unlike
+ *	th8_posix.c, which needs a different mechanism per OS
+ *	(readlink("/proc/self/exe") on Linux, _NSGetExecutablePath
+ *	on macOS, a sysctl on FreeBSD), Cosmopolitan's libc hides
+ *	all of that behind one call that works identically across
+ *	every supported OS from the same Actually Portable
+ *	Executable.  The string it returns is owned by Cosmopolitan,
+ *	so it is copied into a freshly TH8_ALLOC_STR-allocated
+ *	buffer sized to strlen(zPath) before being handed back, so
+ *	the caller can free it independently.
+ *
+ * Results:
+ *	Newly allocated, NUL-terminated string holding the
+ *	executable path, or NULL if GetProgramExecutableName()
+ *	returns NULL/empty or the allocation fails.
+ *
+ * Side effects:
+ *	Allocates memory via TH8_ALLOC_STR.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -140731,8 +151750,27 @@ th8CosmopolitanGetExePath(Th8_Interp *interp, void *pCtx)
  * th8CosmopolitanMemset --
  *
  *	Secure zeroing via explicit_bzero (Cosmopolitan provides
- *	this on all platforms).  Falls back to volatile write for
- *	non-zero fills.
+ *	this on all platforms).  Falls back to the standard C
+ *	library memset for non-zero fills.
+ *
+ * Why / How:
+ *	Implements the Th8_Platform.xMemset callback.  Cryptographic
+ *	key material and other secrets must be erased in a way the
+ *	optimizer cannot discard as a dead store.  Cosmopolitan
+ *	provides explicit_bzero uniformly on every supported OS, so
+ *	(unlike th8_posix.c, which must pick among explicit_bzero,
+ *	bzero, and a volatile-pointer loop depending on the target)
+ *	this callback can always route zero-fills through
+ *	explicit_bzero.  Non-zero fills have no secure-erase
+ *	requirement, so they fall back to the plain C library
+ *	memset.
+ *
+ * Results:
+ *	Returns dst (matching memset semantics).
+ *
+ * Side effects:
+ *	Writes n bytes to dst.  The zero-fill path is guaranteed not
+ *	to be optimized away.
  *
  *----------------------------------------------------------------------
  */
@@ -140763,6 +151801,19 @@ th8CosmopolitanMemset(
  *	Return the usable size of an allocated block.  Cosmopolitan
  *	provides malloc_usable_size on all platforms.
  *
+ * Why / How:
+ *	Implements the Th8_Platform.xMemorySize callback.  th8_libc.c
+ *	must pick among malloc_size, malloc_usable_size, or _msize
+ *	depending on the target OS; Cosmopolitan's libc exposes
+ *	malloc_usable_size uniformly on every supported platform, so
+ *	a single call suffices here.
+ *
+ * Results:
+ *	The usable size, in bytes, of the allocation at p.
+ *
+ * Side effects:
+ *	None.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -140790,7 +151841,7 @@ th8CosmopolitanMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  */
 
 static Th8_Platform th8CosmopolitanPlatformData = {
-    5,   /* nVersion */
+    1,   /* nVersion */
     0,   /* xInitialize (filled by POSIX merge) */
     0,   /* xFinalize (filled by POSIX merge) */
 
@@ -140919,8 +151970,11 @@ static Th8_Platform th8CosmopolitanPlatformData = {
     /* DNS (filled by POSIX merge) */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -140939,6 +151993,23 @@ static Th8_Platform th8CosmopolitanPlatformData = {
  *	  Th8_Platform plat = *Th8_GetCosmopolitanPlatform();
  *	  Th8_MergePlatform(&plat, Th8_GetPosixPlatform());
  *	  Th8_MergePlatform(&plat, Th8_GetLibcPlatform());
+ *
+ * Why / How:
+ *	Public API entry point for the embedder to obtain the
+ *	Cosmopolitan platform table.  This table only overrides the
+ *	handful of callbacks (xGetExePath, xMemset, xMemorySize)
+ *	where Cosmopolitan diverges from the standard POSIX
+ *	platform; everything else is left as 0 and is expected to be
+ *	filled in by merging with Th8_GetPosixPlatform and
+ *	Th8_GetLibcPlatform via Th8_MergePlatform, in that order, as
+ *	shown above.
+ *
+ * Results:
+ *	Non-NULL pointer to the static th8CosmopolitanPlatformData
+ *	struct.
+ *
+ * Side effects:
+ *	None.
  *
  *----------------------------------------------------------------------
  */
@@ -141060,11 +152131,31 @@ Th8_FaultConfig *th8FaultActiveCfg = NULL;
  */
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8FaultStrEqAscii --
+ *
  *	NUL-terminated byte-equality check used to compare a
  *	filter file name against the current allocation site's
  *	__FILE__ string.  Avoids the <string.h> dependency in
  *	core/fault code (project convention).
+ *
+ * Why / How:
+ *	Compares two NUL-terminated byte strings one byte at a time,
+ *	returning as soon as a mismatch is found or the common NUL
+ *	terminator is reached.  A hand-rolled loop is used instead of
+ *	strcmp() to keep the fault layer free of <string.h>.  Two NULL
+ *	pointers (or the identical pointer) compare equal, and a single
+ *	NULL compares unequal, so callers need not pre-check for NULL.
+ *
+ * Results:
+ *	1 if the two strings are byte-for-byte equal (including two
+ *	NULLs or the same pointer); 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 int
@@ -141086,7 +152177,10 @@ th8FaultStrEqAscii(const char *a, const char *b)
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8FaultPathMatchesBaseName --
+ *
  *	Returns non-zero when zPath ends with the path component
  *	zBase, where the boundary preceding zBase is either a path
  *	separator ('/' or '\\') or the start of the string.  Used so
@@ -141094,6 +152188,23 @@ th8FaultStrEqAscii(const char *a, const char *b)
  *	match an __FILE__ value of "src/plugins/th8_control.c".
  *	An exact match (zPath equals zBase) also returns non-zero.
  *	Both arguments must be non-NULL.
+ *
+ * Why / How:
+ *	Measures both strings, rejects the match if zBase is empty or
+ *	longer than zPath, then compares the trailing nBase bytes of
+ *	zPath against zBase.  A suffix match alone is not enough: the
+ *	byte immediately preceding the matched suffix must be a path
+ *	separator (or the suffix must begin at offset 0), so that
+ *	"control.c" does not spuriously match "th8_control.c".
+ *
+ * Results:
+ *	1 when zBase is a whole trailing path component of zPath (or
+ *	equals zPath); 0 otherwise.
+ *
+ * Side effects:
+ *	None.
+ *
+ *----------------------------------------------------------------------
  */
 
 int
@@ -141129,12 +152240,33 @@ th8FaultPathMatchesBaseName(const char *zPath, const char *zBase)
 }
 
 /*
+ *----------------------------------------------------------------------
+ *
  * th8FaultMatchFilter --
+ *
  *	Return non-zero if the current allocation site (pCfg->zCurFile,
  *	pCfg->nCurLine) matches at least one entry in the filter list.
  *	If the filter list is empty (nFilter == 0), every allocation
  *	matches (back-compat with the count-only mode).  Increments
  *	the matching filter's nHit counter.
+ *
+ * Why / How:
+ *	An empty (or NULL) filter list means "match everything", so the
+ *	filter is transparent unless a test explicitly narrows it.  Each
+ *	filter entry may constrain the file (exact string or basename
+ *	match, via th8FaultStrEqAscii / th8FaultPathMatchesBaseName) and
+ *	an inclusive line range [nLineFrom, nLineTo]; entries whose
+ *	constraints fail are skipped.  The first entry that matches wins
+ *	and its per-entry nHit counter is bumped for test assertions.
+ *
+ * Results:
+ *	1 if the current allocation site matches (or the list is empty);
+ *	0 if a non-empty filter list has no matching entry.
+ *
+ * Side effects:
+ *	Increments the nHit counter of the first matching filter entry.
+ *
+ *----------------------------------------------------------------------
  */
 
 static int
@@ -141198,10 +152330,20 @@ th8FaultMatchFilter(Th8_FaultConfig *pCfg)
  *	`pCfg->nAllocFailCount` so script-side tests can
  *	verify the fault actually fired.
  *
+ * Why / How:
+ *	Non-matching allocations return early via
+ *	th8FaultMatchFilter without touching any counter, so
+ *	the filter stays transparent.  Matching allocations
+ *	advance nAllocCount and compare it against the
+ *	nAllocFailAfter threshold; once past the threshold the
+ *	nAllocFailInterval modulus decides which subsequent
+ *	allocations also fail, producing the one-shot or
+ *	repeating OOM pattern used by stress tests.
+ *
  * Parameters:
  *	pCfg -- live fault config.
  *
- * Returns:
+ * Results:
  *	1 if the caller should treat this allocation as
  *	failed; 0 otherwise.
  *
@@ -141320,15 +152462,15 @@ th8FaultShouldFailAlloc(Th8_FaultConfig *pCfg)
 
 #  define PT_V4(name, T1, T2, T3, T4)                                        \
       static void                                                            \
-      pt_##name(Th8_Interp *i, void *c, T1 a1, T2 a2, T3 a3, T4 a4)          \
+	  pt_##name(Th8_Interp *i, void *c, T1 a1, T2 a2, T3 a3, T4 a4)      \
       {                                                                      \
 	  if (REAL(c)->name) REAL(c)->name(i, RCTX(c), a1, a2, a3, a4);      \
       }
 
 /* (interp, pCtx, a1, a2, a3, a4, a5) -> rettype */
 #  define PT_5(name, R, T1, T2, T3, T4, T5)                                  \
-      static R                                                               \
-      pt_##name(Th8_Interp *i, void *c, T1 a1, T2 a2, T3 a3, T4 a4, T5 a5)   \
+      static R pt_##name(                                                    \
+	  Th8_Interp *i, void *c, T1 a1, T2 a2, T3 a3, T4 a4, T5 a5)         \
       {                                                                      \
 	  return REAL(c)->name                                               \
 	           ? REAL(c)->name(i, RCTX(c), a1, a2, a3, a4, a5)           \
@@ -141669,9 +152811,17 @@ pt_xPanic(Th8_Interp *i, void *c, const char *zMsg, size_t nMsg)
     if (REAL(c)->xPanic) REAL(c)->xPanic(i, RCTX(c), zMsg, nMsg);
 }
 
-/* Diagnostics -- stack backtrace capture (nVersion 5).  Pure passthrough;
+/* Diagnostics -- stack backtrace capture.  Pure passthrough;
  * not fault-injected (a failed capture simply yields fewer frames). */
 PT_3(xStackBackTrace, int, void **, int, int)
+
+/* 64-bit atomics -- pure passthrough; an atomic CAS must not fail. */
+PT_3(
+    xIntCmpXchg64,
+    th8_uint64_t,
+    volatile th8_uint64_t *,
+    th8_uint64_t,
+    th8_uint64_t)
 
 /* Math/entropy -- xMathFunc and xRandomBytes are fault-injecting
  * (wrappers defined below).  Their passthrough behaviour is the
@@ -141974,6 +153124,21 @@ fi_xRandomBytes(Th8_Interp *i, void *c, void *pBuf, size_t nByte)
  *	compounds across the math/expr layer without nulling the
  *	slot (which would short-circuit at C2 instead).
  *
+ * Why / How:
+ *	Keeping the slot non-NULL (unlike th8FaultApplyNullCallbacks)
+ *	forces the callback to be invoked and fail at the return-value
+ *	check rather than being short-circuited by the "slot present"
+ *	guard, so the failure arm downstream of a successful presence
+ *	check becomes reachable for MC/DC.
+ *
+ * Results:
+ *	TH8_ERROR when bFailMathFunc is set or the real callback is
+ *	absent; otherwise the value returned by the real xMathFunc.
+ *
+ * Side effects:
+ *	When delegating, whatever the real xMathFunc does (typically
+ *	writes the computed value through pResult).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -142006,6 +153171,20 @@ fi_xMathFunc(
  *	Th8_GetCwd (pwd_command and friends) without actually
  *	stat-failing the filesystem.
  *
+ * Why / How:
+ *	Synthesizes a getcwd failure at the wrapper boundary so tests
+ *	can exercise the caller's NULL-handling path deterministically,
+ *	without needing to manipulate the real working directory or the
+ *	underlying filesystem.
+ *
+ * Results:
+ *	NULL when bFailGetCwd is set or the real callback is absent;
+ *	otherwise the working-directory string returned by the real
+ *	xGetCwd.
+ *
+ * Side effects:
+ *	When delegating, whatever the real xGetCwd does.
+ *
  *----------------------------------------------------------------------
  */
 
@@ -142029,6 +153208,20 @@ fi_xGetCwd(Th8_Interp *i, void *c)
  *	delegates.  Used to drive clock-failure error arms in
  *	[clock milliseconds] and other Th8_GetTimeMs consumers.
  *
+ * Why / How:
+ *	Synthesizes a clock-read failure at the wrapper boundary so the
+ *	otherwise-rare error arm of time consumers can be exercised
+ *	deterministically, without depending on an actually failing
+ *	platform clock.
+ *
+ * Results:
+ *	TH8_ERROR when bFailTimeMs is set or the real callback is
+ *	absent; otherwise the value returned by the real xTimeMs.
+ *
+ * Side effects:
+ *	When delegating, whatever the real xTimeMs does (writes the
+ *	current time through pMs).
+ *
  *----------------------------------------------------------------------
  */
 
@@ -142051,6 +153244,18 @@ fi_xTimeMs(Th8_Interp *i, void *c, th8_int64_t *pMs)
  *	Returns NULL when bFailGetEnv is set; otherwise delegates.
  *	Used to drive `if (zVal == NULL)` error arms in Th8_GetEnv
  *	consumers (env-array initialization, [info env], etc.).
+ *
+ * Why / How:
+ *	Synthesizes a "variable not found" result at the wrapper
+ *	boundary so consumers' missing-variable arms can be exercised
+ *	deterministically, independent of the real process environment.
+ *
+ * Results:
+ *	NULL when bFailGetEnv is set or the real callback is absent;
+ *	otherwise the value string returned by the real xGetEnv.
+ *
+ * Side effects:
+ *	When delegating, whatever the real xGetEnv does.
  *
  *----------------------------------------------------------------------
  */
@@ -142266,6 +153471,9 @@ th8FaultWireCallbacks(
     pF->xPanic = pR->xPanic ? pt_xPanic : 0;
     pF->xStackBackTrace = pR->xStackBackTrace ? pt_xStackBackTrace : 0;
 
+    /* 64-bit atomics */
+    pF->xIntCmpXchg64 = pR->xIntCmpXchg64 ? pt_xIntCmpXchg64 : 0;
+
     /* Math / entropy -- both xMathFunc and xRandomBytes are
      * fault-injecting (bFailMathFunc / bFailRandomBytes flags). */
     pF->xMathFunc = pR->xMathFunc ? fi_xMathFunc : 0;
@@ -142372,6 +153580,7 @@ static const struct th8FaultSlotEntry th8FaultCallbackSlots[] =
      TH8_FAULT_SLOT(xEmitTrace),
      TH8_FAULT_SLOT(xPanic),
      TH8_FAULT_SLOT(xStackBackTrace),
+     TH8_FAULT_SLOT(xIntCmpXchg64),
      TH8_FAULT_SLOT(xMathFunc),
      TH8_FAULT_SLOT(xRandomBytes),
      TH8_FAULT_SLOT(xNeedMemory)};
@@ -142401,6 +153610,15 @@ static const struct th8FaultSlotEntry th8FaultCallbackSlots[] =
  *	The lookup is linear over a ~67-entry table, which is fine
  *	for the test-only use case.  If this list grows, consider
  *	sorting the table and switching to bsearch.
+ *
+ * Results:
+ *	TH8_OK on success (including when the null-callback list is
+ *	empty or NULL); TH8_ERROR if a requested name matches no known
+ *	slot, in which case *pzBadName (when non-NULL) is set to the
+ *	offending name.
+ *
+ * Side effects:
+ *	Overwrites each matched callback slot in *pF with NULL.
  *
  *----------------------------------------------------------------------
  */
@@ -142962,8 +154180,8 @@ th8EnvKeyValue(
     const char *zValue,
     size_t nValue)
 {
-    char zNameBuf[256];
-    char zValBuf[256];
+    char zNameBuf[TH8_ENV_STACK];
+    char zValBuf[TH8_ENV_STACK];
     char *zNameNul = NULL;
     char *zValNul = NULL;
     int rc = TH8_ERROR;
@@ -143244,7 +154462,7 @@ th8EnvKeyValue(
 	            interp, zKeys, nKeys, &azElem, &anElem, &nCount,
 	            TH8_LIST_NONE) == TH8_OK) {
 		for (j = 0; j < nCount; j++) {
-		    char kBuf[256];
+		    char kBuf[TH8_ENV_STACK];
 		    char *kNul = th8EnvNulTerminate(
 		        interp, azElem[j], anElem[j], kBuf, sizeof(kBuf));
 		    if (kNul) {
@@ -143322,7 +154540,7 @@ th8EnvKeyValue(
 	            interp, zKeys, nKeys, &azElem, &anElem, &nCount,
 	            TH8_LIST_NONE) == TH8_OK) {
 		for (j = 0; j < nCount; j++) {
-		    char kBuf[256];
+		    char kBuf[TH8_ENV_STACK];
 		    char *kNul = th8EnvNulTerminate(
 		        interp, azElem[j], anElem[j], kBuf, sizeof(kBuf));
 		    if (kNul) {
@@ -143680,7 +154898,7 @@ th8EnvKeyValue(
     const char *zValue,
     size_t nValue)
 {
-    WCHAR wNameBuf[256];
+    WCHAR wNameBuf[TH8_ENV_STACK];
     WCHAR *wName = NULL;
     int rc = TH8_ERROR;
 
@@ -143706,7 +154924,7 @@ th8EnvKeyValue(
     }
 
     case TH8_KV_GET: {
-	WCHAR wValBuf[4096];
+	WCHAR wValBuf[TH8_PATH_MAX];
 	DWORD n;
 
 	wName = th8EnvUtf8ToUtf16(
@@ -143749,7 +154967,7 @@ th8EnvKeyValue(
     }
 
     case TH8_KV_SET: {
-	WCHAR wValSetBuf[256];
+	WCHAR wValSetBuf[TH8_ENV_STACK];
 	WCHAR *wVal = NULL;
 
 	wName = th8EnvUtf8ToUtf16(
@@ -143997,7 +155215,7 @@ th8EnvKeyValue(
 	 */
 
 	if (zCollect) {
-	    WCHAR wValSetBuf2[256];
+	    WCHAR wValSetBuf2[TH8_ENV_STACK];
 	    WCHAR *wVal2 = NULL;
 	    char **azElem = NULL;
 	    size_t *anElem = NULL;
@@ -144014,7 +155232,7 @@ th8EnvKeyValue(
 	            interp, zCollect, nCollect, &azElem, &anElem, &nCount,
 	            TH8_LIST_NONE) == TH8_OK) {
 		for (j = 0; j < nCount; j++) {
-		    WCHAR wKBuf[256];
+		    WCHAR wKBuf[TH8_ENV_STACK];
 		    WCHAR *wK = th8EnvUtf8ToUtf16(
 		        interp, azElem[j], anElem[j], wKBuf,
 		        sizeof(wKBuf) / sizeof(WCHAR));
@@ -144075,7 +155293,7 @@ th8EnvKeyValue(
  */
 
 static Th8_Platform th8EnvPlatformData = {
-    5,   /* nVersion */
+    1,   /* nVersion */
     0,
     0,
     0,
@@ -144160,6 +155378,7 @@ static Th8_Platform th8EnvPlatformData = {
     0,
     0,  /* xDnsResolve, xDnsResolveFree */
     0,  /* xStackBackTrace */
+    0,  /* xIntCmpXchg64 */
     0   /* pCtx */
 };
 
@@ -144545,7 +155764,7 @@ th8MimallocMemorySize(Th8_Interp *interp, void *pCtx, void *p)
  */
 
 static Th8_Platform th8MimallocPlatformData = {
-    5,    /* nVersion */
+    1,    /* nVersion */
     th8MimallocInit,  /* xInitialize */
     th8MimallocFinal,  /* xFinalize */
 
@@ -144674,8 +155893,11 @@ static Th8_Platform th8MimallocPlatformData = {
     /* DNS */
     0, 0,  /* xDnsResolve, xDnsResolveFree */
 
-    /* Diagnostics (nVersion 5) -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
+    /* Diagnostics -- the th8_unwind (compiler-runtime) layer supplies xStackBackTrace. */
     0, /* xStackBackTrace */
+
+    /* 64-bit atomics */
+    0, /* xIntCmpXchg64 */
 
     /* Host context */
     0 /* pCtx */
@@ -144808,6 +156030,18 @@ static const unsigned char th8ProtectCanary[8] = {0x77, 0x73, 0x5A, 0x9F,
  *	Linux-specific MADV_DONTDUMP and MADV_WIPEONFORK hardening
  *	are applied when available.  A canary pattern is written at
  *	the start of the data page for corruption detection.
+ *
+ * Results:
+ *	TH8_OK with *pRegion populated on success; TH8_ERROR on a NULL
+ *	pRegion or on VirtualAlloc/mmap failure (a trace message is
+ *	logged).  mlock/VirtualLock failure is non-fatal and still
+ *	returns TH8_OK (degraded, unlocked region).
+ *
+ * Side effects:
+ *	Allocates three pages of virtual memory and installs two
+ *	PROT_NONE/PAGE_NOACCESS guard pages around the data page;
+ *	pins the data page into physical memory (best-effort); writes
+ *	the canary pattern; may emit trace messages.
  *
  *----------------------------------------------------------------------
  */
@@ -144968,6 +156202,17 @@ th8ProtectGetPageSize(void)
  *
  *	Mirror of the Win32 implementation later in this file.
  *
+ * Why / How:
+ *	Sensitive scratch (decrypted plaintext, key material) must not
+ *	leak via swap, core dumps, forked children, or adjacent-buffer
+ *	over/underflow.  A single `mmap` of three contiguous pages
+ *	laid out `[guard][data][guard]` provides bracketing guard
+ *	pages (flipped to `PROT_NONE` so any stray access traps);
+ *	`mlock` keeps the data page out of swap; Linux `madvise`
+ *	flags exclude it from dumps and wipe it on fork.  The best-
+ *	effort hardening steps are non-fatal so the region still works
+ *	(degraded) on kernels lacking a given feature.
+ *
  * Parameters:
  *	interp  -- live interpreter (for trace messages only;
  *		the helper itself does not allocate through
@@ -144976,7 +156221,7 @@ th8ProtectGetPageSize(void)
  *		`pRegion`, `nRegion`, `pPage`, and
  *		`nPageSize` fields are populated.
  *
- * Returns:
+ * Results:
  *	`TH8_OK` on success; `TH8_ERROR` on NULL `pRegion`
  *	or `mmap` failure (trace message logged).
  *

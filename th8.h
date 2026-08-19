@@ -58,11 +58,21 @@
  *      restricted callback limits access, and a custom callback can
  *      implement virtual file systems, sandboxed I/O, or logging.
  *
- *      For resource limits, the embedder may set:
- *        Th8_SetStepLimit     -- bounds total computation
+ *      For resource limits, the embedder may set (each is a COOPERATIVE
+ *      limit checked at TH8's own checkpoints -- see the per-function
+ *      contracts; none is a hard, externally-enforced bound):
+ *        Th8_SetStepLimit     -- bounds counted work-units (not every
+ *                                CPU cycle; unpolled inner loops exist)
  *        Th8_SetResultLimit   -- bounds string/result size
- *        Th8_SetAllocLimit    -- bounds total memory usage
+ *        Th8_SetAllocLimit    -- bounds requested bytes with bounded
+ *                                slack (not exact total RSS)
  *        Th8_SetOverflowCheck -- makes integer overflow an error
+ *        Th8_SetDeadline      -- a cooperative wall-clock checkpoint
+ *                                deadline (a hard bound needs external
+ *                                out-of-process containment)
+ *        Th8_SetTimeLimitMs   -- same, as a relative duration in ms
+ *        Th8_SetSafeLimits    -- applies a hardened profile of the
+ *                                above in one call (for untrusted script)
  *
  * Dedicated to the memory of Miguel Sofer (d. 2016).
  *
@@ -277,6 +287,15 @@ typedef unsigned long long th8_uint64_t;
 #define TH8_UINT64_MAX ((th8_uint64_t)0xffffffffffffffff)
 
 /*
+ * 32-bit signed integer limits, defined here (rather than via <limits.h>
+ * INT_MAX/INT_MIN) so the value is available without pulling in the C
+ * standard headers, including in the freestanding hash-table build.
+ */
+
+#define TH8_INT_MAX ((int)0x7fffffff)
+#define TH8_INT_MIN ((int)(-TH8_INT_MAX - 1))
+
+/*
  * Pointer-width integer conversion macros.
  *
  * NRE callback slots (pData[0..3]) are void* pointers.  When storing
@@ -384,10 +403,74 @@ typedef unsigned long long th8_uint64_t;
 #define TH8_MX_STRLEN         (100 * 1024 * 1024)
 #define TH8_MX_ALLOC          (256 * 1024 * 1024)
 #define TH8_MAX_LIST_ELEMENTS (1000000)
-#define TH8_TAINT_BIT         (0x10000000)
-#define TH8_SENSITIVE_BIT     (0x20000000)
-#define TH8_TAG_BITS          (TH8_TAINT_BIT | TH8_SENSITIVE_BIT)
-#define TH8_NOLEN             ((size_t)-1)
+
+/*
+ * Hard ceiling on the OUTPUT of [string repeat] in bytes
+ * (count * per-copy length), independent of and tighter than the
+ * per-interpreter result limit (TH8K-009).  A single [string repeat]
+ * can otherwise fill up to TH8_MX_STRLEN (100 MiB) in one
+ * uninterruptible doubling loop; capping it at 1 MiB bounds that work
+ * to a few hundred microseconds so the command cannot be used to make
+ * the interpreter unresponsive.
+ */
+
+#define TH8_MX_STRING_REPEAT (1024 * 1024)
+
+/*
+ * Hard ceiling on expression nesting depth (TH8K-019).  The recursive
+ * descent tree-builder (th8ExprMakeTree) and tree evaluator
+ * (th8ExprEval) recurse once per level of parenthesis nesting or
+ * operator-chain length, so without an explicit bound a hostile
+ * expression such as `((((...))))` or `1+1+1+...` would drive native
+ * C-stack recursion until it overflowed.  This limit makes the bound
+ * EXPLICIT and deterministic (rather than depending on host-specific
+ * native stack introspection), and is deliberately generous versus any
+ * hand-written expression.  The tree teardown (th8ExprFree) is iterative
+ * and needs no such limit.  The Th8_Ready() stack guard remains as an
+ * adaptive backstop for the compound case (deep expressions nested
+ * inside deep command recursion) and for hosts with unusually small
+ * stacks.
+ */
+
+#define TH8_MX_EXPR_DEPTH (1000)
+
+/*
+ * Hard ceiling on namespace nesting depth (TH8K-011).  A namespace can
+ * be created to an arbitrary depth in a single command via a deeply
+ * qualified name (e.g. `namespace eval a::a::...::z {}`), which bypasses
+ * the evaluation-depth limit that bounds nested `namespace eval`.  The
+ * teardown routine th8FreeNamespace recurses once per level, so without
+ * an explicit bound such a tree overflows the native C stack when the
+ * interpreter (or the namespace) is deleted.  Bounding the depth at
+ * creation keeps the depth-first teardown bounded too.  Generous versus
+ * any real module hierarchy.
+ */
+
+#define TH8_MX_NS_DEPTH (1000)
+
+/*
+ * Recommended "hardened" runtime resource profile for evaluating
+ * UNTRUSTED script in user-mode embeddings (TH8K-018).  A fresh
+ * interpreter defaults to no allocation and no step limit (0 =
+ * unlimited) because the general embedding case runs trusted script;
+ * an embedder that runs untrusted script should instead opt into a
+ * bounded profile.  These constants are that conservative starting
+ * point -- applied together by Th8_SetSafeLimits() -- chosen to let
+ * ordinary scripts run while cutting off runaway memory, computation,
+ * and result growth.  An embedder may raise or lower any individual
+ * limit afterwards with the per-limit setters.  (These are runtime
+ * limits layered UNDER the hard compile-time ceilings TH8_MX_STRLEN /
+ * TH8_MX_ALLOC, which always apply.)
+ */
+
+#define TH8_SAFE_ALLOC_LIMIT  (16 * 1024 * 1024) /* 16 MiB live bytes */
+#define TH8_SAFE_STEP_LIMIT   (1000000)          /* 1,000,000 steps   */
+#define TH8_SAFE_RESULT_LIMIT (1 * 1024 * 1024)  /* 1 MiB result      */
+
+#define TH8_TAINT_BIT     (0x10000000)
+#define TH8_SENSITIVE_BIT (0x20000000)
+#define TH8_TAG_BITS      (TH8_TAINT_BIT | TH8_SENSITIVE_BIT)
+#define TH8_NOLEN         ((size_t)-1)
 
 #define TH8_LEN(X) ((size_t)((X) & TH8_LEN_MASK))
 
@@ -698,11 +781,17 @@ typedef struct Th8_Platform Th8_Platform;
  *	is an array of `nRecord` answer-record byte arrays;
  *	pLen is the matching array of lengths (in bytes).  For
  *	A records the length is always 4; for AAAA always 16.
- *	bogus is non-zero iff DNSSEC validation rejected the
- *	answer as untrustworthy.
+ *	bogus is non-zero iff DNSSEC validation REJECTED the
+ *	answer as untrustworthy.  secure is non-zero iff DNSSEC
+ *	validation POSITIVELY validated the answer (signed and
+ *	verified).  An insecure/unsigned answer -- or one produced
+ *	when no trust anchor was available -- has BOTH secure == 0
+ *	and bogus == 0, so a caller that requires end-to-end
+ *	authenticity must check `secure`, not merely `!bogus`.
  */
 typedef struct Th8_DnsResult {
     int bogus;
+    int secure;
     int nRecord;
     const unsigned char **pData;
     const size_t *pLen;
@@ -710,6 +799,17 @@ typedef struct Th8_DnsResult {
 
 #define TH8_DNS_TYPE_A    (1)
 #define TH8_DNS_TYPE_AAAA (28)
+
+/*
+ * TH8_PLATFORM_VERSION -- the current Th8_Platform ABI version.  A
+ * platform table must set nVersion to this value; Th8_Initialize and
+ * Th8_CreateInterp reject any platform whose nVersion does not match
+ * (see the platform-validation path).  Pre-RTM there is a single ABI
+ * version; bump this and extend the validator when the struct layout
+ * changes in an incompatible way.
+ */
+
+#define TH8_PLATFORM_VERSION (1)
 
 struct Th8_Platform {
     th8_int64_t nVersion; /* Struct version (must be first). */
@@ -807,15 +907,38 @@ struct Th8_Platform {
 
     /*
      * xNeedMemory --
-     *	Second-chance allocator.  Called when xMalloc returns NULL
-     *	and the interpreter is in a recoverable state.  The embedder
-     *	may free caches, compact memory, or try an alternative
-     *	allocator.  If a valid block is returned, it MUST be at
-     *	least nByte bytes and MUST be freeable via xFree.  May
-     *	return NULL (allocation truly failed).  Optional: if NULL,
-     *	normal OOM handling applies.
+     *	Second-chance allocator.  Called by the TH8 allocation core
+     *	(Th8_SafeAlloc) when the normal path returns NULL -- whether
+     *	because the platform allocator failed OR because the
+     *	per-interpreter memory limit (Th8_SetAllocLimit) rejected the
+     *	request.  The embedder may free caches, compact memory, or try
+     *	an alternative allocator, then attempt the request.
+     *
+     *	Return NULL, or a block of at least nByte bytes freeable via
+     *	xFree.  Optional: if NULL, normal OOM handling applies.
+     *
+     *	IMPORTANT (memory accounting): the returned block is used AS-IS
+     *	-- the core does NOT re-zero it and does NOT separately account
+     *	it against the interpreter's memory limit.  A returned block is
+     *	therefore expected to be a fully zero-filled, limit-checked,
+     *	accounted TH8 allocation.  The supported way to guarantee this
+     *	is to satisfy the request through a TH8 allocation entry point
+     *	(the built-in callback delegates to the same limit-checked core
+     *	the normal path uses).  A callback that instead returns a raw
+     *	block from a private reserve is opting that block OUT of the
+     *	interpreter memory limit and accounting -- a deliberate embedder
+     *	choice, not the default.
+     *
+     *	bPanic / zFile / nLine mirror the core allocator so a delegating
+     *	callback can preserve panic-on-failure semantics and the
+     *	debug/fault call-site.
      */
-    void *(*xNeedMemory)(Th8_Interp *interp, size_t nByte);
+    void *(*xNeedMemory)(
+        Th8_Interp *interp,
+        size_t nByte,
+        int bPanic,
+        const char *zFile,
+        int nLine);
 
     /*
      *------------------------------------------------------------------
@@ -1816,7 +1939,7 @@ struct Th8_Platform {
 
     /*
      *------------------------------------------------------------------
-     * Diagnostics (added in nVersion 5)
+     * Diagnostics
      *------------------------------------------------------------------
      */
 
@@ -1840,6 +1963,31 @@ struct Th8_Platform {
         void **apFrames,
         int nMaxFrames,
         int nSkip);
+
+    /*
+     *------------------------------------------------------------------
+     * 64-bit atomics
+     *------------------------------------------------------------------
+     */
+
+    /*
+     * xIntCmpXchg64 --
+     *	64-bit atomic compare-and-exchange.  Atomically compares
+     *	*pTarget with iComparand; if equal, stores iExchange in
+     *	*pTarget.  Returns the original value of *pTarget.  This is
+     *	the 64-bit sibling of xIntCmpXchg; unlike that 32-bit flag
+     *	primitive, it is wide enough to hold a thread id, and is
+     *	used to read and publish Th8_Interp.threadId -- the owning
+     *	thread that enforces the single-threaded-per-interpreter
+     *	affinity contract.  If NULL, a non-atomic operation is
+     *	performed (single-threaded assumption).
+     */
+    th8_uint64_t (*xIntCmpXchg64)(
+        Th8_Interp *interp,
+        void *pCtx,
+        volatile th8_uint64_t *pTarget,
+        th8_uint64_t iExchange,
+        th8_uint64_t iComparand);
 
     /*
      *------------------------------------------------------------------
@@ -2076,10 +2224,12 @@ typedef int (*Th8_MathFuncProc)(
  *		return code that becomes the input to the next continuation.
  *
  *	Th8_SubCommand --
- *		Entry in a sub-command dispatch table.  zName is the
- *		sub-command name (NUL-terminated) and xProc is its
- *		implementation.  Pass an array of these to
- *		Th8_CallSubCommand for ensemble-style dispatch.
+ *		Entry in a sub-command catalogue.  zName is the sub-command
+ *		name (NUL-terminated) and xProc is its implementation.  A
+ *		NULL-terminated array of these describes an ensemble's
+ *		built-in sub-commands; they are installed into the ensemble
+ *		command's per-interpreter sub-command hash at registration
+ *		(see Th8_CreateSubCommand).
  *
  *----------------------------------------------------------------------
  */
@@ -2210,11 +2360,14 @@ typedef int (*Th8_DebugProc)(
  *		frames to the outermost Th8_Eval caller.
  *
  *	TH8_CANCEL_SIGNAL --
- *		The zMsg string is static (or otherwise long-lived)
- *		and must NOT be copied or freed.  When this flag is
- *		set, Th8_CancelEval stores the pointer directly.
- *		This makes the call async-signal-safe (no malloc).
- *		Without this flag, zMsg is copied via Th8_Malloc.
+ *		The cancellation originates in a signal handler, so the
+ *		call must be async-signal-safe.  Th8_CancelEval publishes
+ *		ONLY the atomic cancellation request (no allocation) and
+ *		ignores zMsg; when the interpreter reports the cancellation
+ *		and no other message is present, it uses a fixed
+ *		"eval canceled via signal" text.  Without this flag a
+ *		non-NULL zMsg is copied (even across threads) and reported
+ *		verbatim.
  *
  *----------------------------------------------------------------------
  */
@@ -2437,6 +2590,24 @@ TH8_API int Th8_IntCmpXchg(
     int iExchange,
     int iComparand);
 
+/*
+ * Th8_Int64CmpXchg --
+ *	64-bit atomic compare-and-exchange via the platform's
+ *	xIntCmpXchg64 callback.  Compares *pTarget with iComparand; if
+ *	equal, stores iExchange in *pTarget.  Returns the original
+ *	value of *pTarget.  Falls back to a non-atomic operation if the
+ *	callback is NULL (single-threaded assumption).  This is the
+ *	64-bit sibling of Th8_IntCmpXchg; it exists to read and publish
+ *	the owning-thread id (see Th8_GetInterpThreadId) atomically.
+ *
+ *	THREAD SAFETY: callable from any thread.
+ */
+TH8_API th8_uint64_t Th8_Int64CmpXchg(
+    Th8_Interp *interp,
+    volatile th8_uint64_t *pTarget,
+    th8_uint64_t iExchange,
+    th8_uint64_t iComparand);
+
 /* ====================================================================
  * Section: Interpreter Lifecycle
  * ==================================================================== */
@@ -2490,7 +2661,12 @@ TH8_API Th8_Interp *Th8_CreateInterp(Th8_Platform *pPlatform);
  *	TH8_RESTORE_NONE      -- do nothing (no-op).
  *	TH8_RESTORE_ALL       -- both commands and variables.
  *
- *	Returns TH8_OK.
+ *	Returns TH8_OK on success.  Returns TH8_ERROR if interp is NULL,
+ *	or if a requested re-registration (TH8_RESTORE_COMMANDS, via
+ *	Th8_RegisterLanguage) or global re-initialization
+ *	(TH8_RESTORE_VARIABLES, via the internal global initializer)
+ *	fails -- for example under allocation failure.  On failure the
+ *	built-in state may be only partially restored.
  */
 TH8_API int Th8_RestoreInterp(Th8_Interp *interp, int flags);
 
@@ -2530,8 +2706,23 @@ TH8_API int Th8_Ready(Th8_Interp *interp);
  *	provide an error message (pass TH8_NOLEN if zMsg is NUL-terminated).
  *	flags may include TH8_CANCEL_UNWIND to prevent [catch] from
  *	intercepting the cancellation, ensuring it propagates to the
- *	outermost Th8_Eval caller.  Safe to call from a signal handler
- *	or another thread.  Returns TH8_OK.
+ *	outermost Th8_Eval caller.  Returns TH8_OK.
+ *
+ *	Thread safety (TH8K-008): safe to call from a signal handler or ANY
+ *	thread, concurrently with the owning thread and with other cancellers.
+ *	The cancel bit and flags are published as ONE indivisible atomic word,
+ *	so a cancel and its flags are never seen torn.  A foreign thread never
+ *	touches the owner's multi-field message state or its per-interpreter
+ *	memory accounting.  A TH8_CANCEL_SIGNAL cancel publishes only that
+ *	atomic word (no allocation, no message) and the owner reports a fixed
+ *	"eval canceled via signal" text.  A foreign NON-signal cancel MAY hand
+ *	off a copied message: it is placed in a self-describing buffer and
+ *	swapped in through a single atomic pointer exchange, which the owning
+ *	thread adopts at its next Th8_Ready/poll (a message already installed on
+ *	the owner wins -- first-writer-wins; with no message the owner falls
+ *	back to "eval canceled").  Publication is lock-free and never stalls the
+ *	evaluator.  A foreign non-signal caller that passes a message MUST have
+ *	registered its thread with Th8_ThreadInit (it copies the message).
  */
 TH8_API int
 Th8_CancelEval(Th8_Interp *interp, const char *zMsg, size_t nMsg, int flags);
@@ -3126,6 +3317,70 @@ TH8_API int Th8_CreateCommand(
     Th8_CommandProc xProc,
     void *pContext,
     void (*xDel)(Th8_Interp *, void *),
+    th8_uint64_t *pToken);
+
+/*
+ * Th8_CreateSubCommand --
+ *	Register (or replace) a sub-command of a command.  zCmdName names an
+ *	existing command (a built-in like "string", or one the embedder
+ *	created); zSubName is the sub-command (e.g. "toupper").  The first
+ *	sub-command gives the command a sub-command OVERLAY: the core then
+ *	dispatches "cmd sub ..." to the sub-command's xProc (which receives the
+ *	FULL argv: argv[0]=cmd, argv[1]=sub) when argv[1] names a registered
+ *	sub-command.  Anything else falls back to the command's own handler; a
+ *	pure ensemble (a command created with a NULL handler) instead reports
+ *	the standard "unknown subcommand ... must be ..." error.  So adding a
+ *	sub-command to a plain command like [set] does NOT break [set x 5] --
+ *	only "set <registered-sub> ..." is intercepted.  xProc/pContext/xDel
+ *	mirror Th8_CreateCommand; if the sub-command already exists it is
+ *	replaced (its xDel is called).  A unique token is written to *pToken (if
+ *	non-NULL) for later Th8_DeleteSubCommand / Th8_GetSubCommandInfo.
+ *	Returns TH8_OK, or TH8_ERROR for a bad argument, an unknown parent
+ *	command, or out of memory (in which case nothing is registered).
+ */
+TH8_API int Th8_CreateSubCommand(
+    Th8_Interp *interp,
+    const char *zCmdName,
+    const char *zSubName,
+    Th8_CommandProc xProc,
+    void *pContext,
+    void (*xDel)(Th8_Interp *, void *),
+    th8_uint64_t *pToken);
+
+/*
+ * Th8_DeleteSubCommand --
+ *	Delete a sub-command by its token (from Th8_CreateSubCommand or
+ *	Th8_GetSubCommandInfo).  O(1) via the interpreter's sub-command token
+ *	index; runs the sub-command's xDel.  When the last sub-command of a
+ *	command is removed, the command reverts to a plain command (or a bare
+ *	ensemble shell if it had no handler).  Returns TH8_OK if the token
+ *	matched, or TH8_ERROR if there is no such sub-command token.
+ */
+TH8_API int Th8_DeleteSubCommand(Th8_Interp *interp, th8_uint64_t token);
+
+/*
+ * Th8_GetSubCommandInfo --
+ *	Query a sub-command's current binding: fill any of the OUT parameters
+ *	(all may be NULL) with the registered xProc, pContext, xDel, and token.
+ *	The captured xProc/pContext are directly callable, which supports two
+ *	patterns: save-and-restore around a temporary replacement (capture,
+ *	install a replacement with Th8_CreateSubCommand, later restore the
+ *	captured binding); and sub-classing/wrapping (install a wrapper whose
+ *	pContext holds the captured binding and which calls xProc(interp,
+ *	pContext, argc, argv, argl) for pre-/post-processing around the original
+ *	implementation).  Returns TH8_OK if the sub-command exists, or TH8_ERROR
+ *	(with a message) if the command is unknown, is not an ensemble, or has
+ *	no such sub-command.
+ */
+TH8_API int Th8_GetSubCommandInfo(
+    Th8_Interp *interp,
+    const char *zCmdName,
+    size_t nCmd,
+    const char *zSubName,
+    size_t nSub,
+    Th8_CommandProc *pxProc,
+    void **ppContext,
+    void (**pxDel)(Th8_Interp *, void *),
     th8_uint64_t *pToken);
 
 /*
@@ -3968,8 +4223,10 @@ TH8_API void Th8_SetStepCount(Th8_Interp *interp, th8_int64_t nCount);
 
 /*
  * Th8_SetResultLimit --
- *	Set the maximum byte size of any interpreter result.  Pass 0
- *	to disable (the default limit is TH8_MX_STRLEN).
+ *	Set the maximum byte size of any interpreter result.  Pass 0 to
+ *	select the built-in default cap of TH8_MX_STRLEN (100 MiB); 0
+ *	does NOT disable the limit -- unlike Th8_SetAllocLimit(0), a
+ *	result larger than TH8_MX_STRLEN is still rejected (TH8K-020).
  */
 TH8_API void Th8_SetResultLimit(Th8_Interp *interp, size_t nLimit);
 
@@ -4116,13 +4373,78 @@ TH8_API int Th8_GetOverflowCheck(Th8_Interp *interp);
 
 /*
  * Th8_SetAllocLimit --
- *	Set a per-interpreter memory allocation ceiling in bytes.
- *	When the limit is reached, Th8_Malloc calls xPanic.
- *	Set to 0 for unlimited (default).
+ *	Set a per-interpreter memory allocation limit in bytes.  Every
+ *	allocation whose REQUESTED size would not fit in the remaining
+ *	headroom is rejected (Th8_Malloc calls xPanic; Th8_AttemptMalloc /
+ *	Th8_SafeAlloc return NULL).  The second-chance xNeedMemory recovery
+ *	is subject to the same limit -- it cannot allocate past it.  Set to
+ *	0 for unlimited (default).
+ *
+ *	Accounting bounds REQUESTED bytes.  Because a real allocator may
+ *	round a block's usable size UP, the tracked total (Th8_GetAllocBytes)
+ *	can momentarily sit above nLimit by at most one allocation's rounding
+ *	-- the safe direction: the next request is checked against the
+ *	stricter total and the overshoot self-corrects when the block is
+ *	freed.  The counter is never driven BELOW true usage.  It is a
+ *	bounded-slack requested-bytes limit, not a hard usable-bytes ceiling.
  *
  *	For sandbox use, a reasonable limit is 16-64 MB.
  */
 TH8_API void Th8_SetAllocLimit(Th8_Interp *interp, size_t nLimit);
+
+/*
+ * Th8_SetSafeLimits --
+ *	Apply the recommended hardened resource profile for evaluating
+ *	untrusted script in one call: the allocation, step, and result
+ *	limits are set to TH8_SAFE_ALLOC_LIMIT, TH8_SAFE_STEP_LIMIT, and
+ *	TH8_SAFE_RESULT_LIMIT respectively (TH8K-018).  A fresh
+ *	interpreter has no allocation or step limit by default; an
+ *	embedder that runs untrusted script should call this (or set the
+ *	individual limits) before evaluating it.  Individual limits may
+ *	be overridden afterwards with the per-limit setters.  No-op if
+ *	interp is NULL.
+ */
+TH8_API void Th8_SetSafeLimits(Th8_Interp *interp);
+
+/*
+ * Th8_SetDeadline --
+ *	Set an absolute monotonic-microsecond deadline (in the same
+ *	timebase as Th8_GetTimeUs), or 0 to remove it.  This is a
+ *	COOPERATIVE CHECKPOINT deadline, not a hard real-time bound:
+ *	th8Step samples the clock at periodic step boundaries (not on
+ *	every step) and stops the evaluation with "time limit exceeded"
+ *	at the first checkpoint at or after the deadline.  It therefore
+ *	bounds elapsed time only to within one inter-checkpoint interval
+ *	plus the running time of the current step -- a single long work
+ *	unit (e.g. one large [string repeat] or a [lsort] comparator) or
+ *	a blocking platform callback can run past the deadline until the
+ *	next checkpoint.  A hard wall-clock guarantee requires an
+ *	out-of-process supervisor or other preemptive containment outside
+ *	the interpreter.  If the platform provides no clock the deadline
+ *	never fires (TH8K-010).
+ */
+TH8_API void Th8_SetDeadline(Th8_Interp *interp, th8_int64_t nDeadlineUs);
+
+/*
+ * Th8_GetDeadline --
+ *	Return the interpreter's absolute monotonic-microsecond deadline,
+ *	or 0 if none is set (TH8K-010).
+ */
+TH8_API th8_int64_t Th8_GetDeadline(Th8_Interp *interp);
+
+/*
+ * Th8_SetTimeLimitMs --
+ *	Arm the cooperative checkpoint deadline nMs milliseconds from now
+ *	(a relative-duration convenience over Th8_SetDeadline): reads the
+ *	monotonic clock and sets the absolute deadline to now + nMs.  As
+ *	with Th8_SetDeadline this is a cooperative checkpoint, not a hard
+ *	real-time bound -- see that function for the overshoot semantics
+ *	and the requirement for external containment to get a hard bound.
+ *	A value of 0 or less clears the deadline.  Returns TH8_OK, or
+ *	TH8_ERROR if interp is NULL or the clock could not be read while
+ *	arming a positive limit (TH8K-010).
+ */
+TH8_API int Th8_SetTimeLimitMs(Th8_Interp *interp, th8_int64_t nMs);
 
 /*
  * Th8_GetAllocLimit --
@@ -4135,6 +4457,14 @@ TH8_API size_t Th8_GetAllocLimit(Th8_Interp *interp);
  *	Returns the current total bytes allocated by this interp.
  */
 TH8_API size_t Th8_GetAllocBytes(Th8_Interp *interp);
+
+/*
+ * Th8_GetAllocPeak --
+ *	Returns the high-water mark of Th8_GetAllocBytes over this
+ *	interp's life -- the maximum transient memory it demanded,
+ *	which persists after blocks are freed (0 = brand-new interp).
+ */
+TH8_API size_t Th8_GetAllocPeak(Th8_Interp *interp);
 
 /* ====================================================================
  * Section: Binary Loading
@@ -4612,23 +4942,6 @@ TH8_API int Th8_ListAppendArray(
 TH8_API int Th8_WrongNumArgs(Th8_Interp *interp, const char *zMsg);
 
 /*
- * Th8_CallSubCommand --
- *	Dispatch to a sub-command.  argv[1] is matched against the zName
- *	fields of the aSub array (NULL-terminated).  If found, the
- *	corresponding xProc is called with the same arguments.  If not
- *	found, an error listing the valid sub-commands is generated.
- *	Returns the return code from the dispatched sub-command, or
- *	TH8_ERROR on mismatch.
- */
-TH8_API int Th8_CallSubCommand(
-    Th8_Interp *interp,
-    void *ctx,
-    int argc,
-    const char **argv,
-    size_t *argl,
-    const Th8_SubCommand *aSub);
-
-/*
  * Th8_ReportTaint --
  *	If zStr (nStr bytes) is tainted (TH8_TAINT_BIT set in nStr),
  *	emit a diagnostic message through xOutputError identifying the
@@ -4885,7 +5198,9 @@ typedef struct Th8_HashEntry Th8_HashEntry;
 
 struct Th8_Hash {
     Th8_HashEntry *aBucket[TH8_HASH_SIZE];
-    int nNextOrder; /* Next insertion-order counter. */
+    th8_int64_t nNextOrder; /* Next insertion-order counter (64-bit so the
+                             * lifetime insert count cannot realistically
+                             * saturate; see TH8K-016). */
 };
 
 struct Th8_HashEntry {
@@ -4894,7 +5209,8 @@ struct Th8_HashEntry {
     char *zKey; /* Key string (owned). */
     size_t nKey; /* Byte length of key. */
     Th8_HashEntry *pNext; /* Internal use only. */
-    int nInsertOrder; /* Insertion sequence number. */
+    th8_int64_t
+        nInsertOrder; /* Insertion sequence number (64-bit; TH8K-016). */
 };
 
 TH8_API Th8_Hash *Th8_HashNew(Th8_Interp *interp);
@@ -4904,7 +5220,7 @@ TH8_API void Th8_HashIterate(
     Th8_Hash *pHash,
     int (*xCallback)(Th8_HashEntry *, void *),
     void *pCtx);
-TH8_API void Th8_HashIterateOrdered(
+TH8_API int Th8_HashIterateOrdered(
     Th8_Interp *interp,
     Th8_Hash *pHash,
     int (*xCallback)(Th8_HashEntry *, void *),
@@ -5132,11 +5448,34 @@ TH8_API int Th8_GetParentPid(Th8_Interp *interp);
 
 /*
  * Th8_GetThreadId --
- *	Return the current thread ID via the platform's xGetThreadId
- *	callback.  Returns 0 if the callback is NULL or the host does
- *	not support it.
+ *	Return the CURRENT (calling) thread ID via the platform's
+ *	xGetThreadId callback.  Returns 0 if the callback is NULL or the
+ *	host does not support it.
+ *
+ *	THREAD SAFETY: callable from any thread.  It reports the caller's
+ *	own thread, reads only immutable interpreter state (the platform
+ *	pointer), and does NOT require the interpreter's owning thread.
+ *	This is one of the few APIs exempt from the single-threaded-per-
+ *	interpreter affinity contract (see also Th8_GetInterpThreadId).
  */
 TH8_API th8_uint64_t Th8_GetThreadId(Th8_Interp *interp);
+
+/*
+ * Th8_GetInterpThreadId --
+ *	Return the ID of the thread that OWNS the interpreter (the thread
+ *	that created it via Th8_CreateInterp).  Read atomically via the
+ *	64-bit interlocked compare-exchange.  Returns 0 if the owning
+ *	thread was never captured (the platform has no xGetThreadId).
+ *
+ *	Compare with Th8_GetThreadId, which returns the CALLER's thread:
+ *	when the two differ, the caller is on a foreign thread and the
+ *	affinity contract forbids most other API calls on this interp.
+ *
+ *	THREAD SAFETY: callable from any thread.  It performs only an
+ *	atomic read and is exempt from the affinity contract; this is
+ *	precisely how a foreign thread can safely discover the owner.
+ */
+TH8_API th8_uint64_t Th8_GetInterpThreadId(Th8_Interp *interp);
 
 /*
  * Th8_GetEnv --
@@ -5590,22 +5929,22 @@ struct Th8_FaultFilter {
 #  define TH8_OSSL_OP_V_DVINIT      10 /* verify: EVP_DigestVerifyInit */
 #  define TH8_OSSL_OP_V_DVUPDATE    11 /* verify: EVP_DigestVerifyUpdate */
 /* --- RSA sign path (th8RsaSign) --- */
-#  define TH8_OSSL_OP_S_BN_N    12 /* sign: BN_bin2bn (modulus) */
-#  define TH8_OSSL_OP_S_BN_E    13 /* sign: BN_new (pub exp) */
-#  define TH8_OSSL_OP_S_BN_D    14 /* sign: BN_bin2bn (priv exp) */
-#  define TH8_OSSL_OP_S_BN_P    15 /* sign: BN_bin2bn (prime1) */
-#  define TH8_OSSL_OP_S_BN_Q    16 /* sign: BN_bin2bn (prime2) */
-#  define TH8_OSSL_OP_S_BLD     17 /* sign: OSSL_PARAM_BLD_new */
-#  define TH8_OSSL_OP_S_PUSH_N  18 /* sign: push_BN N */
-#  define TH8_OSSL_OP_S_PUSH_E  19 /* sign: push_BN E */
-#  define TH8_OSSL_OP_S_PUSH_D  20 /* sign: push_BN D */
-#  define TH8_OSSL_OP_S_PUSH_P  21 /* sign: push_BN FACTOR1 */
-#  define TH8_OSSL_OP_S_PUSH_Q  22 /* sign: push_BN FACTOR2 */
-#  define TH8_OSSL_OP_S_PUSH_DP 23 /* sign: push_BN EXPONENT1 */
-#  define TH8_OSSL_OP_S_PUSH_DQ 24 /* sign: push_BN EXPONENT2 */
-#  define TH8_OSSL_OP_S_PUSH_QI 25 /* sign: push_BN COEFFICIENT */
-#  define TH8_OSSL_OP_S_TOPARAM 26 /* sign: OSSL_PARAM_BLD_to_param */
-#  define TH8_OSSL_OP_S_CTX     27 /* sign: EVP_PKEY_CTX_new_from_name */
+#  define TH8_OSSL_OP_S_BN_N          12 /* sign: BN_bin2bn (modulus) */
+#  define TH8_OSSL_OP_S_BN_E          13 /* sign: BN_new (pub exp) */
+#  define TH8_OSSL_OP_S_BN_D          14 /* sign: BN_bin2bn (priv exp) */
+#  define TH8_OSSL_OP_S_BN_P          15 /* sign: BN_bin2bn (prime1) */
+#  define TH8_OSSL_OP_S_BN_Q          16 /* sign: BN_bin2bn (prime2) */
+#  define TH8_OSSL_OP_S_BLD           17 /* sign: OSSL_PARAM_BLD_new */
+#  define TH8_OSSL_OP_S_PUSH_N        18 /* sign: push_BN N */
+#  define TH8_OSSL_OP_S_PUSH_E        19 /* sign: push_BN E */
+#  define TH8_OSSL_OP_S_PUSH_D        20 /* sign: push_BN D */
+#  define TH8_OSSL_OP_S_PUSH_P        21 /* sign: push_BN FACTOR1 */
+#  define TH8_OSSL_OP_S_PUSH_Q        22 /* sign: push_BN FACTOR2 */
+#  define TH8_OSSL_OP_S_PUSH_DP       23 /* sign: push_BN EXPONENT1 */
+#  define TH8_OSSL_OP_S_PUSH_DQ       24 /* sign: push_BN EXPONENT2 */
+#  define TH8_OSSL_OP_S_PUSH_QI       25 /* sign: push_BN COEFFICIENT */
+#  define TH8_OSSL_OP_S_TOPARAM       26 /* sign: OSSL_PARAM_BLD_to_param */
+#  define TH8_OSSL_OP_S_CTX           27 /* sign: EVP_PKEY_CTX_new_from_name */
 #  define TH8_OSSL_OP_S_FROMDATA_INIT 28 /* sign: EVP_PKEY_fromdata_init */
 #  define TH8_OSSL_OP_S_FROMDATA      29 /* sign: EVP_PKEY_fromdata */
 #  define TH8_OSSL_OP_S_MDCTX         30 /* sign: EVP_MD_CTX_new */
@@ -5625,7 +5964,7 @@ struct Th8_FaultFilter {
 #  define TH8_POSIX_OP_GETDATA_OPEN  0 /* th8PosixGetData: open() */
 #  define TH8_POSIX_OP_GETDATA_FSTAT 1 /* th8PosixGetData: fstat() */
 #  define TH8_POSIX_OP_GETDATA_READ  2 /* th8PosixGetData: read() */
-#  define TH8_POSIX_OP_RANDOM_READ 3 /* th8PosixRandomBytes: read(urandom) */
+#  define TH8_POSIX_OP_RANDOM_READ   3 /* th8PosixRandomBytes: read(urandom) */
 
 typedef struct Th8_FaultConfig Th8_FaultConfig;
 struct Th8_FaultConfig {
@@ -5852,16 +6191,114 @@ TH8_API size_t Th8_FaultCtxSize(void);
  *	Register the built-in TH8 language commands ([if], [while],
  *	[proc], [set], [expr], etc.) with the interpreter.  Must be
  *	called once after Th8_CreateInterp to make the interpreter
- *	usable as a Tcl-like scripting engine.  Returns TH8_OK.
+ *	usable as a Tcl-like scripting engine.
+ *
+ *	Returns TH8_OK on success.  Returns TH8_ERROR if any command,
+ *	plugin, or math-function registration fails (for example under
+ *	allocation failure); on failure the interpreter is left with a
+ *	partially registered language and should be discarded rather
+ *	than used.
  */
 TH8_API int Th8_RegisterLanguage(Th8_Interp *interp);
 
 /*
+ * Named command subsets (TH8K-025) -- an allowlist mechanism.  Where
+ * Th8_RegisterLanguage installs the whole language surface, Th8_RegisterSubsets
+ * installs only the chosen subsets, so an embedder can withhold
+ * Turing-completeness (the "looping"/"procedures" subsets) and grant only a safe
+ * slice to untrusted scripts.  Availability is by ABSENCE: an entity is usable
+ * iff it was registered, so there is no per-invocation permission check.
+ *
+ * A subset is a set of typed members.  A member is one of:
+ */
+#define TH8_SUBSET_PLUGIN                                                    \
+    1 /* all commands of a named plugin (+ its \
+                              * ensembles' sub-commands), membership sourced \
+                              * from the plugin's own table -- no drift. */
+#define TH8_SUBSET_COMMAND 2 /* one command by name. */
+#define TH8_SUBSET_FUNCTION                                                  \
+    3 /* one [expr] math function by name, or "*" for all built-in math \
+       * functions. */
+#define TH8_SUBSET_SUBCOMMAND                                                \
+    4 /* one sub-command of an ensemble (zEnsemble \
+                                 * names the parent command). */
+
+/*
+ * Th8_SubsetMemberDef --
+ *	One member of a built-in subset: a TYPED NAME resolved at registration
+ *	against the authoritative table (plugin command tables, the math-function
+ *	table, the ensemble sub-command catalogues) -- never a copied payload, so
+ *	the catalogue cannot drift from the real command surface.
+ */
+typedef struct Th8_SubsetMemberDef {
+    int eType; /* TH8_SUBSET_{PLUGIN,COMMAND,FUNCTION,SUBCOMMAND}. */
+    const char
+        *zEnsemble; /* TH8_SUBSET_SUBCOMMAND: parent ensemble; else 0. */
+    const char *zName; /* member name (plugin/command/function/sub). */
+} Th8_SubsetMemberDef;
+
+/*
+ * Th8_SubsetDef --
+ *	A named built-in subset: a version, a name, and its member manifest.
+ */
+typedef struct Th8_SubsetDef {
+    th8_int64_t nVersion; /* Struct version (must be 1). */
+    const char *zName; /* Subset name, e.g. "strings". */
+    const Th8_SubsetMemberDef *aMember; /* Members, or 0 for a plugin subset \
+                                         * whose membership is its table. */
+    int nMember; /* Member count (0 for a plugin subset). */
+} Th8_SubsetDef;
+
+/*
+ * Th8_RegisterSubsets --
+ *	Register the named subsets (an allowlist) into interp.  Additive,
+ *	idempotent, and order-independent: a member named by more than one
+ *	subset, or already present, is registered once.  ALL subset names are
+ *	resolved up front, so an unknown subset name registers NOTHING and
+ *	returns TH8_ERROR with a diagnostic result.  On a later allocation
+ *	failure the language is left partially registered and the caller MUST
+ *	discard the interpreter (same contract as Th8_RegisterLanguage) -- a
+ *	partial allowlist must never be run.  Registers the essential syntax
+ *	(the {*} expansion operator); does NOT set ::auto_path (that needs
+ *	commands a subset may withhold).
+ */
+TH8_API int Th8_RegisterSubsets(
+    Th8_Interp *interp,
+    const char *const *azNames,
+    int nNames);
+
+/*
+ * Th8_ListSubsets --
+ *	Set the interpreter result to a well-formed list of the subset names
+ *	valid for Th8_RegisterSubsets (the catalogue), so allowlist code can
+ *	validate its configuration.  Returns TH8_OK.
+ */
+TH8_API int Th8_ListSubsets(Th8_Interp *interp);
+
+/*
+ * Th8_GetSubsetMembers --
+ *	Set the interpreter result to a list of the resolved member names of one
+ *	subset -- an audit of exactly what that subset grants (each element is
+ *	"<type> <name>", with sub-commands as "subcommand <ensemble> <name>").
+ *	Resolving also validates the manifest, so a stale member fails here.
+ *	Returns TH8_ERROR for an unknown subset name.
+ */
+TH8_API int Th8_GetSubsetMembers(Th8_Interp *interp, const char *zName);
+
+/*
  * Th8_ResetSecurityArray --
- *	Set all elements of the ::th8_security array to "none".
+ *	Set all seven elements of the ::th8_security array to "none".
+ *	Returns TH8_OK when every element was reset, or TH8_ERROR on the
+ *	first allocation failure.  On TH8_ERROR the array may be left
+ *	PARTIALLY reset (some elements "none", others unchanged), so the
+ *	security state is indeterminate: a caller MUST treat a TH8_ERROR
+ *	as fatal for the current evaluation (discard the interpreter or
+ *	reject the eval) rather than exposing the partial array to a
+ *	script.  Every production caller does exactly that, so a partial
+ *	array is never observed by running script code.
  */
 #if defined(TH8_ENABLE_VARIABLES)
-TH8_API void Th8_ResetSecurityArray(Th8_Interp *interp);
+TH8_API int Th8_ResetSecurityArray(Th8_Interp *interp);
 #endif
 
 /*
